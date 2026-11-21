@@ -1,0 +1,2 @@
+# test-only: schema checks in world-kernel/test_city_m1a.py
+jsonschema>=4

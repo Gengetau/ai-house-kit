@@ -1,0 +1,13 @@
+ai-house-kit
+Copyright 2026 Gengetau
+
+This product includes software developed by Gengetau and contributors,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+docs/city/bridge-v1.schema.json is derived from bot-game-mcp
+(https://github.com/Gengetau/bot-game-mcp), Copyright (c) 2026 Gengetau,
+licensed under the MIT License.
+
+The example world content under world-catalog/worldcatalog/life1/ and
+world-kernel/recordings/ is licensed under the Creative Commons
+Attribution 4.0 International License (CC BY 4.0).

@@ -1,0 +1,128 @@
+"""Outbox, fake channels and receipts of P1a (v1.1 §7/§12).
+
+A delivery is written in the same transaction as the fact that asks for it; sending happens outside any
+transaction. A timeout is "unknown", never "failed and safe to resend": it waits for reconciliation by
+delivery_id. Receipts are taken by delivery_id even from an older runtime_epoch, and each (status, ref) is
+kept once. In P1a only system template notices exist and every channel is fake.
+"""
+import json
+
+from .store import dumps
+
+TEMPLATES = {
+    "phone_buzz": "手机震了一下",  # a notification arrived; never the message body
+    "timer_done": "计时器响了",
+}
+
+
+class NotSent(Exception):
+    """The channel refused before anything left (provably not delivered); safe to try again."""
+
+
+def request_delivery(store, event_id, channel, template, to):
+    """Call inside the kernel transaction that commits the event. Returns the delivery id."""
+    if template not in TEMPLATES:
+        raise ValueError("only system template notices in P1a")
+    delivery_id = f"dlv-{event_id}-{channel}-{to}"
+    now = store.clock.now()
+    store.db.execute("INSERT OR IGNORE INTO outbox(delivery_id,event_id,channel,payload,state,created_at,updated_at,"
+                     "runtime_epoch) VALUES(?,?,?,?,?,?,?,?)",
+                     (delivery_id, event_id, channel, dumps({"template": template, "to": to}), "pending", now, now,
+                      store.epoch or 0))
+    return delivery_id
+
+
+class FakeChannel:
+    """Scriptable stand-in for a bridge/phone adapter. plan: list of outcomes for successive sends:
+    "ok", "timeout_after_send", "timeout_before_send", "refuse"."""
+
+    idempotent = False
+
+    def __init__(self, plan=None):
+        self.plan, self.sent = list(plan or []), {}
+
+    def send(self, delivery_id, payload):
+        outcome = self.plan.pop(0) if self.plan else "ok"
+        if outcome == "refuse":
+            raise NotSent("refused")
+        if outcome == "timeout_before_send":
+            raise TimeoutError("no answer")
+        self.sent.setdefault(delivery_id, []).append(payload)
+        if outcome == "timeout_after_send":
+            raise TimeoutError("no answer")
+        return f"ext-{delivery_id}-{len(self.sent[delivery_id])}"
+
+    def lookup(self, delivery_id):
+        """External reference if the channel has it, else None."""
+        n = len(self.sent.get(delivery_id, []))
+        return f"ext-{delivery_id}-{n}" if n else None
+
+
+class Dispatcher:
+    def __init__(self, store, channels):
+        self.s, self.channels = store, channels
+
+    def _receipt(self, db, delivery_id, status, ref, epoch):
+        db.execute("INSERT OR IGNORE INTO receipts(receipt_id,delivery_id,status,external_ref,received_at,runtime_epoch)"
+                   " VALUES(?,?,?,?,?,?)", (f"rcp-{delivery_id}-{status}-{ref}", delivery_id, status, ref,
+                                            self.s.clock.now(), epoch))
+
+    def run_once(self):
+        """Send every pending delivery once. Returns {delivery_id: new state}."""
+        out = {}
+        with self.s.read() as db:
+            rows = db.execute("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at").fetchall()
+        for r in rows:
+            with self.s.tx() as db:
+                cur = db.execute("UPDATE outbox SET state='sending', attempts=attempts+1, updated_at=? WHERE delivery_id=?"
+                                 " AND state='pending'", (self.s.clock.now(), r["delivery_id"]))
+                if not cur.rowcount:
+                    continue
+            ch = self.channels[r["channel"]]
+            try:
+                ref = ch.send(r["delivery_id"], json.loads(r["payload"]))
+                state = "sent"
+            except NotSent:
+                ref, state = None, "pending"
+            except TimeoutError:
+                ref, state = None, "unknown"
+            with self.s.tx() as db:
+                db.execute("UPDATE outbox SET state=?, external_ref=COALESCE(?,external_ref), updated_at=?"
+                           " WHERE delivery_id=?", (state, ref, self.s.clock.now(), r["delivery_id"]))
+                if ref:
+                    self._receipt(db, r["delivery_id"], "delivered", ref, self.s.epoch or 0)
+            out[r["delivery_id"]] = state
+        return out
+
+    def reconcile(self):
+        """Ask the channel about every unknown delivery; resend only where the channel is idempotent."""
+        out = {}
+        with self.s.read() as db:
+            rows = db.execute("SELECT * FROM outbox WHERE state IN ('unknown','sending')").fetchall()
+        for r in rows:
+            ch = self.channels[r["channel"]]
+            ref = ch.lookup(r["delivery_id"])
+            with self.s.tx() as db:
+                if ref:
+                    db.execute("UPDATE outbox SET state='sent', external_ref=?, updated_at=? WHERE delivery_id=?",
+                               (ref, self.s.clock.now(), r["delivery_id"]))
+                    self._receipt(db, r["delivery_id"], "delivered", ref, self.s.epoch or 0)
+                    out[r["delivery_id"]] = "sent"
+                elif ch.idempotent:
+                    db.execute("UPDATE outbox SET state='pending', updated_at=? WHERE delivery_id=?",
+                               (self.s.clock.now(), r["delivery_id"]))
+                    out[r["delivery_id"]] = "pending"
+                else:
+                    out[r["delivery_id"]] = "unknown"  # needs a person; never a blind resend
+        return out
+
+    def receive(self, delivery_id, status, ref, epoch):
+        """An adapter's receipt (delivered/read/...). Old epochs are fine; duplicates are dropped."""
+        with self.s.tx() as db:
+            if not db.execute("SELECT 1 FROM outbox WHERE delivery_id=?", (delivery_id,)).fetchone():
+                return False
+            self._receipt(db, delivery_id, status, ref, epoch)
+            if status == "delivered":
+                db.execute("UPDATE outbox SET state='sent', external_ref=COALESCE(external_ref,?), updated_at=?"
+                           " WHERE delivery_id=? AND state!='sent'", (ref, self.s.clock.now(), delivery_id))
+            return True

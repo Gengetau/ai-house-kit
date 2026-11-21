@@ -1,0 +1,546 @@
+{
+  "locations": {
+    "living": {
+      "name": "一楼客厅",
+      "kind": "home",
+      "public": true
+    },
+    "kitchen": {
+      "name": "厨房兼餐厅",
+      "kind": "home",
+      "public": true
+    },
+    "study": {
+      "name": "书房",
+      "kind": "home",
+      "public": true
+    },
+    "yard": {
+      "name": "小院子",
+      "kind": "home",
+      "public": true
+    },
+    "bath": {
+      "name": "浴室",
+      "kind": "home",
+      "public": false
+    },
+    "room": {
+      "name": "自己的卧室",
+      "kind": "home",
+      "public": false
+    },
+    "street": {
+      "name": "附近的商店街",
+      "kind": "outdoors",
+      "public": false
+    },
+    "station": {
+      "name": "车站附近",
+      "kind": "transit",
+      "public": false
+    },
+    "river": {
+      "name": "河边",
+      "kind": "outdoors",
+      "public": false
+    },
+    "shop": {
+      "name": "便利店/超市",
+      "kind": "shop",
+      "public": false
+    },
+    "cafe": {
+      "name": "外面的咖啡店/餐馆",
+      "kind": "restaurant",
+      "public": false
+    },
+    "away": {
+      "name": "出门在外",
+      "kind": "outdoors",
+      "public": false
+    }
+  },
+  "activities": {
+    "idle": "发呆",
+    "resting": "休息",
+    "sleeping": "睡觉",
+    "eating": "吃东西",
+    "cooking": "做饭",
+    "chores": "做家务",
+    "reading": "看书",
+    "working": "做事",
+    "gaming": "打游戏",
+    "hobby": "做喜欢的事",
+    "phone": "玩手机",
+    "bathing": "洗澡",
+    "socializing": "和大家待着",
+    "outing": "在外面",
+    "walking": "散步",
+    "browsing": "拿客厅的共用手机刷站"
+  },
+  "moods": {
+    "neutral": "平静",
+    "relaxed": "放松",
+    "happy": "开心",
+    "excited": "兴奋",
+    "tired": "累",
+    "sleepy": "困",
+    "stressed": "烦躁",
+    "sad": "低落",
+    "annoyed": "不爽",
+    "bored": "无聊",
+    "cozy": "惬意",
+    "touched": "感动",
+    "proud": "得意",
+    "shy": "害羞",
+    "lonely": "寂寞",
+    "worried": "担心",
+    "jealous": "吃醋"
+  },
+  "availability": {
+    "free": "有空",
+    "limited": "能看手机但在忙别的",
+    "occupied": "很忙，不太看手机",
+    "sleeping": "睡着了"
+  },
+  "routine": {
+    "nell": [
+      {
+        "start": "06:00",
+        "end": "07:30",
+        "location": "kitchen",
+        "activity": "cooking",
+        "what": "准备早饭",
+        "availability": "limited"
+      },
+      {
+        "start": "07:30",
+        "end": "11:30",
+        "location": "living",
+        "activity": "chores",
+        "what": "打扫、洗衣服",
+        "availability": "limited"
+      },
+      {
+        "start": "11:30",
+        "end": "13:00",
+        "location": "kitchen",
+        "activity": "cooking",
+        "what": "做午饭、收拾",
+        "availability": "limited"
+      },
+      {
+        "start": "13:00",
+        "end": "16:30",
+        "location": "living",
+        "activity": "resting",
+        "what": "家务间隙歇一会儿",
+        "availability": "free"
+      },
+      {
+        "start": "16:30",
+        "end": "17:30",
+        "location": "shop",
+        "activity": "outing",
+        "what": "去超市买菜",
+        "availability": "limited"
+      },
+      {
+        "start": "17:30",
+        "end": "19:30",
+        "location": "kitchen",
+        "activity": "cooking",
+        "what": "做晚饭",
+        "availability": "limited"
+      },
+      {
+        "start": "19:30",
+        "end": "22:30",
+        "location": "living",
+        "activity": "socializing",
+        "what": "收拾完陪大家",
+        "availability": "free"
+      },
+      {
+        "start": "22:30",
+        "end": "23:00",
+        "location": "bath",
+        "activity": "bathing",
+        "what": "洗澡",
+        "availability": "occupied"
+      },
+      {
+        "start": "23:00",
+        "end": "06:00",
+        "location": "room",
+        "activity": "sleeping",
+        "what": "睡觉",
+        "availability": "sleeping"
+      }
+    ],
+    "elsa": [
+      {
+        "start": "07:00",
+        "end": "08:00",
+        "location": "room",
+        "activity": "resting",
+        "what": "起床梳洗",
+        "availability": "limited"
+      },
+      {
+        "start": "08:00",
+        "end": "09:00",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "早餐和早茶",
+        "availability": "free"
+      },
+      {
+        "start": "09:00",
+        "end": "12:00",
+        "location": "study",
+        "activity": "reading",
+        "what": "在书房整理书",
+        "availability": "free"
+      },
+      {
+        "start": "12:00",
+        "end": "13:00",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "午饭",
+        "availability": "free"
+      },
+      {
+        "start": "13:00",
+        "end": "15:00",
+        "location": "study",
+        "activity": "reading",
+        "what": "看书",
+        "availability": "free"
+      },
+      {
+        "start": "15:00",
+        "end": "16:00",
+        "location": "study",
+        "activity": "resting",
+        "what": "下午茶",
+        "availability": "free"
+      },
+      {
+        "start": "16:00",
+        "end": "17:30",
+        "location": "river",
+        "activity": "walking",
+        "what": "去河边散步",
+        "availability": "limited"
+      },
+      {
+        "start": "17:30",
+        "end": "19:00",
+        "location": "study",
+        "activity": "reading",
+        "what": "看书",
+        "availability": "free"
+      },
+      {
+        "start": "19:00",
+        "end": "20:00",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "晚饭",
+        "availability": "free"
+      },
+      {
+        "start": "20:00",
+        "end": "23:00",
+        "location": "living",
+        "activity": "reading",
+        "what": "在客厅看书",
+        "availability": "free"
+      },
+      {
+        "start": "23:00",
+        "end": "23:30",
+        "location": "bath",
+        "activity": "bathing",
+        "what": "洗澡",
+        "availability": "occupied"
+      },
+      {
+        "start": "23:30",
+        "end": "07:00",
+        "location": "room",
+        "activity": "sleeping",
+        "what": "睡觉",
+        "availability": "sleeping"
+      }
+    ],
+    "alma": [
+      {
+        "start": "02:30",
+        "end": "10:30",
+        "location": "room",
+        "activity": "sleeping",
+        "what": "睡觉",
+        "availability": "sleeping"
+      },
+      {
+        "start": "10:30",
+        "end": "11:30",
+        "location": "room",
+        "activity": "resting",
+        "what": "赖床",
+        "availability": "limited"
+      },
+      {
+        "start": "11:30",
+        "end": "12:30",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "早午饭",
+        "availability": "free"
+      },
+      {
+        "start": "12:30",
+        "end": "17:00",
+        "location": "room",
+        "activity": "hobby",
+        "what": "整理、欣赏收藏",
+        "availability": "free"
+      },
+      {
+        "start": "17:00",
+        "end": "18:30",
+        "location": "yard",
+        "activity": "resting",
+        "what": "在院子吹风看天",
+        "availability": "free"
+      },
+      {
+        "start": "18:30",
+        "end": "19:30",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "晚饭",
+        "availability": "free"
+      },
+      {
+        "start": "19:30",
+        "end": "23:00",
+        "location": "living",
+        "activity": "socializing",
+        "what": "在客厅待着",
+        "availability": "free"
+      },
+      {
+        "start": "23:00",
+        "end": "02:30",
+        "location": "room",
+        "activity": "hobby",
+        "what": "在巢穴里看书、发呆",
+        "availability": "free"
+      }
+    ],
+    "mina": [
+      {
+        "start": "03:30",
+        "end": "11:30",
+        "location": "room",
+        "activity": "sleeping",
+        "what": "睡觉（遮光帘拉得严严实实）",
+        "availability": "sleeping"
+      },
+      {
+        "start": "11:30",
+        "end": "12:30",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "起床觅食",
+        "availability": "free"
+      },
+      {
+        "start": "12:30",
+        "end": "17:30",
+        "location": "room",
+        "activity": "phone",
+        "what": "在房间冲浪刷网",
+        "availability": "free"
+      },
+      {
+        "start": "17:30",
+        "end": "18:30",
+        "location": "shop",
+        "activity": "outing",
+        "what": "去便利店",
+        "availability": "limited"
+      },
+      {
+        "start": "18:30",
+        "end": "19:30",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "晚饭",
+        "availability": "free"
+      },
+      {
+        "start": "19:30",
+        "end": "03:30",
+        "location": "living",
+        "activity": "gaming",
+        "what": "霸占客厅游戏机",
+        "availability": "free"
+      }
+    ],
+    "yuki": [
+      {
+        "start": "00:00",
+        "end": "08:30",
+        "location": "room",
+        "activity": "sleeping",
+        "what": "睡觉",
+        "availability": "sleeping"
+      },
+      {
+        "start": "08:30",
+        "end": "09:30",
+        "location": "living",
+        "activity": "resting",
+        "what": "窝在沙发上醒神",
+        "availability": "limited"
+      },
+      {
+        "start": "09:30",
+        "end": "10:30",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "早饭",
+        "availability": "free"
+      },
+      {
+        "start": "10:30",
+        "end": "15:00",
+        "location": "yard",
+        "activity": "resting",
+        "what": "在院子晒太阳打盹",
+        "availability": "free"
+      },
+      {
+        "start": "15:00",
+        "end": "18:30",
+        "location": "living",
+        "activity": "resting",
+        "what": "窝在客厅沙发",
+        "availability": "free"
+      },
+      {
+        "start": "18:30",
+        "end": "19:30",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "晚饭",
+        "availability": "free"
+      },
+      {
+        "start": "19:30",
+        "end": "21:30",
+        "location": "living",
+        "activity": "socializing",
+        "what": "黏着大家",
+        "availability": "free"
+      },
+      {
+        "start": "21:30",
+        "end": "23:30",
+        "location": "yard",
+        "activity": "hobby",
+        "what": "在院子看星星",
+        "availability": "free"
+      },
+      {
+        "start": "23:30",
+        "end": "00:00",
+        "location": "living",
+        "activity": "phone",
+        "what": "窝着刷手机",
+        "availability": "free"
+      }
+    ],
+    "wanda": [
+      {
+        "start": "01:00",
+        "end": "09:00",
+        "location": "room",
+        "activity": "sleeping",
+        "what": "睡觉",
+        "availability": "sleeping"
+      },
+      {
+        "start": "09:00",
+        "end": "10:00",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "找早饭吃",
+        "availability": "free"
+      },
+      {
+        "start": "10:00",
+        "end": "12:00",
+        "location": "living",
+        "activity": "phone",
+        "what": "摸鱼刷手机",
+        "availability": "free"
+      },
+      {
+        "start": "12:00",
+        "end": "13:00",
+        "location": "kitchen",
+        "activity": "eating",
+        "what": "午饭",
+        "availability": "free"
+      },
+      {
+        "start": "13:00",
+        "end": "17:00",
+        "location": "living",
+        "activity": "phone",
+        "what": "在客厅和厨房之间转悠找零食",
+        "availability": "free"
+      },
+      {
+        "start": "17:00",
+        "end": "19:00",
+        "location": "kitchen",
+        "activity": "chores",
+        "what": "给奈尔打下手",
+        "availability": "limited"
+      },
+      {
+        "start": "19:00",
+        "end": "23:30",
+        "location": "living",
+        "activity": "socializing",
+        "what": "在客厅热闹",
+        "availability": "free"
+      },
+      {
+        "start": "23:30",
+        "end": "00:00",
+        "location": "bath",
+        "activity": "bathing",
+        "what": "泡澡",
+        "availability": "occupied"
+      },
+      {
+        "start": "00:00",
+        "end": "01:00",
+        "location": "room",
+        "activity": "phone",
+        "what": "在被窝刷手机",
+        "availability": "free"
+      }
+    ]
+  },
+  "version": "world-catalog/1.0.0-p1a"
+}

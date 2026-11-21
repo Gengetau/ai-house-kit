@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-house-kit"
+version = "0.1.0"
+description = "A dependency-free world kernel for simulating AI characters living together in one house"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Gengetau" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["jsonschema>=4"]
+
+[project.urls]
+Source = "https://github.com/Gengetau/ai-house-kit"
+
+[tool.setuptools]
+package-dir = { "worldkernel" = "world-kernel/worldkernel", "worldcatalog" = "world-catalog/worldcatalog" }
+packages = ["worldkernel", "worldcatalog"]
+
+[tool.setuptools.package-data]
+worldcatalog = ["*.json", "life1/*.json", "life1/people/*.json", "life1/garment_images/*.png", "profiles/*.json"]

@@ -1,0 +1,62 @@
+{
+ "actors": {
+  "alma": {
+   "activity": "idle",
+   "availability": "free",
+   "bubbles": [],
+   "location": "living"
+  },
+  "elsa": {
+   "activity": "idle",
+   "availability": "free",
+   "bubbles": [],
+   "location": "living"
+  },
+  "mina": {
+   "activity": "idle",
+   "availability": "free",
+   "bubbles": [],
+   "location": "living"
+  },
+  "nell": {
+   "activity": "idle",
+   "availability": "free",
+   "bubbles": [],
+   "location": "kitchen"
+  },
+  "wanda": {
+   "activity": "idle",
+   "availability": "free",
+   "bubbles": [],
+   "location": "kitchen"
+  },
+  "yuki": {
+   "activity": "idle",
+   "availability": "free",
+   "bubbles": [],
+   "location": "exit_rooms"
+  }
+ },
+ "cursor": "synthetic-kitchen-night|night-1|game|21",
+ "not_simulated": [],
+ "owner": {
+  "location": "kitchen",
+  "state": "present"
+ },
+ "scenes": [
+  {
+   "expires_at": 1792837800.0,
+   "guide_id": "guide-dinner-1792836000",
+   "location": "kitchen",
+   "participants": [],
+   "state": "offered"
+  }
+ ],
+ "schema_version": 1,
+ "server_time": 1792836600.0,
+ "synthetic": true,
+ "view_policy": "game_view/p1a-1",
+ "view_revision": 21,
+ "vocab_version": "world-catalog/1.0.0-p1a",
+ "world_id": "synthetic-kitchen-night"
+}

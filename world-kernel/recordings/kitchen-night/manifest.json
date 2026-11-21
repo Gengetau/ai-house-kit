@@ -1,0 +1,24 @@
+{
+ "files": {
+  "r1_final.json": "b02ecc10e9e479867168a773d96b726d55c2077652eff4bea2a16949a44c8b01",
+  "r1_initial.json": "231ec3b6d1175cb9a1d33853d4486da8b346938f70f73856a03aafe69199b4be",
+  "r1_mid.json": "d8a662b56ca64e1205878636ea5117ff264b377d60c4808137fcdb01f324e91e",
+  "r2_pages.jsonl": "85177349ba73731b65063ebcf7dfd76c2d2aa9d77244cd24741dde2757cf08dd",
+  "timeline.md": "60e12d634dc11f2ad4f892e5b737f0f8a2720c06a5445d1be05c5c03b4819115"
+ },
+ "kernel_events": 76,
+ "model_calls": 6,
+ "paid_calls": 0,
+ "protocol": "kitchen-night/1",
+ "r2_events": 71,
+ "r2_pages": 2,
+ "schema_version": 1,
+ "seed": 51,
+ "source_ref": null,
+ "stream_epoch": "night-1",
+ "synthetic": true,
+ "verify": "ok",
+ "view_policy": "game_view/p1a-1",
+ "vocab_version": "world-catalog/1.0.0-p1a",
+ "world_id": "synthetic-kitchen-night"
+}

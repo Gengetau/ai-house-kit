@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "profile": "p1b-shadow",
+  "vocab_version": "world-catalog/1.1.0-p1b-shadow",
+  "status": "review",
+  "provenance": {
+    "base": "catalog.json world-catalog/1.0.0-p1a (unchanged; this file only adds a profile on top of it)",
+    "why": "expand the catalog after the first live shadow day (3 places, no activities, no ready food)",
+    "scope": "live shadow only (WORLD_KERNEL=shadow); P1a tests, recordings and cases keep the p1a profile"
+  },
+  "action_types": ["move", "wait", "rest", "check", "cook", "eat", "say", "sleep", "begin_activity"],
+  "action_overrides": {
+    "sleep": {"prerequisites": ["private_rest_location"]},
+    "begin_activity": {
+      "duration_rule": {"activity": true},
+      "prerequisites": ["activity_location_allowed"],
+      "phase": "P1b",
+      "parameter_status": "p1b_shadow",
+      "argument_schema": {"activity": "activity_key", "seconds?": "positive_seconds"}
+    }
+  },
+  "activities": {
+    "reading": {"where": ["study", "living", "own_room"]},
+    "working": {"where": ["study", "own_room"]},
+    "gaming": {"where": ["living"], "variant": "solo", "note": "solo variant of catalog.json: needs the living-room game_console, one player at a time; party games stay with"},
+    "hobby": {"where": ["study", "living", "yard", "own_room"]},
+    "phone": {"where": ["kitchen", "living", "study", "yard", "own_room"], "note": "idle phone use; reading QQ stays outside the kernel"},
+    "chores": {"where": ["kitchen", "living", "yard"]},
+    "bathing": {"where": ["bath"], "hold": ["bathtub"]},
+    "outing": {"where": ["away"]}
+  },
+  "rooms": ["kitchen", "living", "study", "yard", "bath"],
+  "bedrooms": ["nell", "elsa", "alma", "mina", "yuki", "wanda"],
+  "leave_points": {"away": {"public_location": "away", "presentation": "offscreen", "reason": "outside_not_simulated"}},
+  "routes": [
+    {"from": "living", "to": "kitchen", "seconds": 8},
+    {"from": "living", "to": "study", "seconds": 10},
+    {"from": "living", "to": "yard", "seconds": 12},
+    {"from": "living", "to": "bath", "seconds": 10},
+    {"from": "living", "to": "bedrooms", "seconds": 15},
+    {"from": "living", "to": "away", "seconds": 60}
+  ],
+  "items": {
+    "bread": {"kind": "food", "edible": true, "label": "面包"},
+    "onigiri": {"kind": "food", "edible": true, "label": "饭团"},
+    "fruit": {"kind": "food", "edible": true, "label": "水果"},
+    "bathtub": {"kind": "anchor", "edible": false, "label": "浴缸"},
+    "game_console": {"kind": "anchor", "edible": false, "label": "客厅的游戏机"}
+  },
+  "map_status": "synthetic_house_not_surveyed_geometry"
+}

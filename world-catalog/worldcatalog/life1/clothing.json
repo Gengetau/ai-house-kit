@@ -1,0 +1,3 @@
+{"categories": ["top", "bottom", "dress", "outer", "shoes", "accessory", "sleepwear", "loungewear", "sportswear", "swimwear", "yukata"],
+ "occasions": ["home", "out", "formal", "sport", "sleep", "onsen"],
+ "weather": {"umbrella_when": "rain", "outer_below_c": 15}}

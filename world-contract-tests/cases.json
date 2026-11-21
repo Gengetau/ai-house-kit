@@ -1,0 +1,3876 @@
+{
+  "protocol": "nell-world-cases-v1",
+  "synthetic": true,
+  "baseline": "NELL-LIVING-WORLD-v1.1-20261023",
+  "task": 52,
+  "casepack_version": 2,
+  "scope": "P1a synthetic-only registered w7-fast.1 catalogue",
+  "cases": [
+    {
+      "id": "G01",
+      "category": "guide",
+      "title": "双方拒绝引导，不补参与者",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "offer",
+          "guide_id": "dinner"
+        },
+        {
+          "at": 1,
+          "op": "model_decision",
+          "actor": "nell",
+          "choice": "decline_guide",
+          "guide_id": "dinner"
+        },
+        {
+          "at": 1,
+          "op": "model_decision",
+          "actor": "wanda",
+          "choice": "decline_guide",
+          "guide_id": "dinner"
+        },
+        {
+          "at": 2,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/views/game/participants",
+          "op": "eq",
+          "value": []
+        },
+        {
+          "checkpoint": "done",
+          "path": "/events",
+          "op": "count_where",
+          "where": {
+            "/kind": "guide_offered"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/summaries",
+          "op": "len_eq",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "G02",
+      "category": "guide",
+      "title": "部分采纳不等于另一人入场",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "offer",
+          "guide_id": "dinner"
+        },
+        {
+          "at": 1,
+          "op": "model_decision",
+          "actor": "nell",
+          "choice": "accept_guide",
+          "guide_id": "dinner"
+        },
+        {
+          "at": 1,
+          "op": "model_decision",
+          "actor": "wanda",
+          "choice": "decline_guide",
+          "guide_id": "dinner"
+        },
+        {
+          "at": 2,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/views/game/guide_state",
+          "op": "eq",
+          "value": "partially_used"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/game/participants",
+          "op": "eq",
+          "value": [
+            "nell"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "R01",
+      "category": "resource",
+      "title": "同刻争抢最后一份成品食物，按输入次序裁定",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "eat-nell",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          }
+        },
+        {
+          "at": 0,
+          "op": "command",
+          "id": "eat-wanda",
+          "actor": "wanda",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          }
+        },
+        {
+          "at": 3,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/inventory/cake",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/eat-nell/status",
+          "op": "eq",
+          "value": "succeeded"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/eat-wanda/status",
+          "op": "eq",
+          "value": "failed"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "count_where",
+          "where": {
+            "/kind": "consume",
+            "/resource": "cake"
+          },
+          "value": 1
+        }
+      ]
+    },
+    {
+      "id": "R02",
+      "category": "resource",
+      "title": "本人代次不变也要拒绝失效库存计划",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "model_begin",
+          "job": "late-nell",
+          "actor": "nell",
+          "generation": 1,
+          "plan": {
+            "id": "late-eat",
+            "action": "eat",
+            "args": {
+              "item": "cake",
+              "resource_id": "cake"
+            }
+          }
+        },
+        {
+          "at": 1,
+          "op": "fixture_adjust",
+          "inventory": {
+            "cake": 0
+          },
+          "preserve_generation": "nell"
+        },
+        {
+          "at": 5,
+          "op": "model_return",
+          "job": "late-nell"
+        },
+        {
+          "at": 8,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/actors/nell/generation",
+          "op": "eq",
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/inventory/cake",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/late-eat/status",
+          "op": "eq",
+          "value": "failed"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "len_eq",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "I01",
+      "category": "interrupt_phone",
+      "title": "做饭安全点之后才能看假信箱",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "cook",
+          "actor": "nell",
+          "action": "cook",
+          "args": {
+            "recipe": "rice"
+          }
+        },
+        {
+          "at": 1,
+          "op": "owner_talk",
+          "id": "owner-hello",
+          "text": "请先看这里"
+        },
+        {
+          "at": 1,
+          "op": "phone_receive",
+          "actor": "nell",
+          "message_id": "dm1",
+          "scope": "owner_private",
+          "text": "canary-I01"
+        },
+        {
+          "at": 2,
+          "op": "checkpoint",
+          "name": "busy"
+        },
+        {
+          "at": 11,
+          "op": "model_decision",
+          "actor": "nell",
+          "choice": "read_phone",
+          "args": {
+            "message_id": "dm1"
+          }
+        },
+        {
+          "at": 12,
+          "op": "checkpoint",
+          "name": "read"
+        }
+      ],
+      "checkpoints": [
+        "busy",
+        "read"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "busy",
+          "path": "/actors/nell/activity",
+          "op": "eq",
+          "value": "cooking"
+        },
+        {
+          "checkpoint": "busy",
+          "path": "/actors/nell/location",
+          "op": "eq",
+          "value": "kitchen"
+        },
+        {
+          "checkpoint": "busy",
+          "path": "/contexts/nell",
+          "op": "not_contains",
+          "value": "canary-I01"
+        },
+        {
+          "checkpoint": "busy",
+          "path": "/events",
+          "op": "count_where",
+          "where": {
+            "/kind": "owner_input_received"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "read",
+          "path": "/commands/cook/status",
+          "op": "eq",
+          "value": "succeeded"
+        },
+        {
+          "checkpoint": "read",
+          "path": "/contexts/nell",
+          "op": "contains",
+          "value": "canary-I01"
+        },
+        {
+          "checkpoint": "read",
+          "path": "/outputs/game",
+          "op": "not_contains",
+          "value": "canary-I01"
+        },
+        {
+          "checkpoint": "read",
+          "path": "/actors/nell/location",
+          "op": "eq",
+          "value": "kitchen"
+        }
+      ]
+    },
+    {
+      "id": "P01",
+      "category": "disclosure",
+      "title": "知识域与披露域双重校验：owner_private",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "observe",
+          "actor": "nell",
+          "source": "secret-P01",
+          "scope": "owner_private",
+          "text": "canary-P01-私聊"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "nell",
+          "audience": "owner_private",
+          "save_as": "nell_authorized"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "wanda",
+          "audience": "public",
+          "save_as": "wanda_public"
+        },
+        {
+          "at": 2,
+          "op": "generate_outputs",
+          "audiences": [
+            "public",
+            "game",
+            "script",
+            "shared_summary",
+            "nell_authorized"
+          ]
+        },
+        {
+          "at": 3,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/contexts/nell_authorized",
+          "op": "contains",
+          "value": "canary-P01-私聊"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/contexts/wanda_public",
+          "op": "not_contains",
+          "value": "canary-P01-私聊"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/public",
+          "op": "not_contains",
+          "value": "canary-P01-私聊"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/game",
+          "op": "not_contains",
+          "value": "canary-P01-私聊"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/script",
+          "op": "not_contains",
+          "value": "canary-P01-私聊"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/shared_summary",
+          "op": "not_contains",
+          "value": "canary-P01-私聊"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/nell_authorized",
+          "op": "contains",
+          "value": "canary-P01-私聊"
+        }
+      ]
+    },
+    {
+      "id": "P02",
+      "category": "disclosure",
+      "title": "知识域与披露域双重校验：dm:nell,wanda",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "observe",
+          "actor": "nell",
+          "source": "secret-P02",
+          "scope": "dm:nell,wanda",
+          "text": "canary-P02-双人"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "nell",
+          "audience": "dm:nell,wanda",
+          "save_as": "nell_authorized"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "wanda",
+          "audience": "public",
+          "save_as": "wanda_public"
+        },
+        {
+          "at": 2,
+          "op": "generate_outputs",
+          "audiences": [
+            "public",
+            "game",
+            "script",
+            "shared_summary",
+            "nell_authorized"
+          ]
+        },
+        {
+          "at": 3,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/contexts/nell_authorized",
+          "op": "contains",
+          "value": "canary-P02-双人"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/contexts/wanda_public",
+          "op": "not_contains",
+          "value": "canary-P02-双人"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/public",
+          "op": "not_contains",
+          "value": "canary-P02-双人"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/game",
+          "op": "not_contains",
+          "value": "canary-P02-双人"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/script",
+          "op": "not_contains",
+          "value": "canary-P02-双人"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/shared_summary",
+          "op": "not_contains",
+          "value": "canary-P02-双人"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/nell_authorized",
+          "op": "contains",
+          "value": "canary-P02-双人"
+        }
+      ]
+    },
+    {
+      "id": "P03",
+      "category": "disclosure",
+      "title": "知识域与披露域双重校验：table:game1:seat1",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "observe",
+          "actor": "nell",
+          "source": "secret-P03",
+          "scope": "table:game1:seat1",
+          "text": "canary-P03-手牌"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "nell",
+          "audience": "table:game1:seat1",
+          "save_as": "nell_authorized"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "wanda",
+          "audience": "public",
+          "save_as": "wanda_public"
+        },
+        {
+          "at": 2,
+          "op": "generate_outputs",
+          "audiences": [
+            "public",
+            "game",
+            "script",
+            "shared_summary",
+            "nell_authorized"
+          ]
+        },
+        {
+          "at": 3,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/contexts/nell_authorized",
+          "op": "contains",
+          "value": "canary-P03-手牌"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/contexts/wanda_public",
+          "op": "not_contains",
+          "value": "canary-P03-手牌"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/public",
+          "op": "not_contains",
+          "value": "canary-P03-手牌"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/game",
+          "op": "not_contains",
+          "value": "canary-P03-手牌"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/script",
+          "op": "not_contains",
+          "value": "canary-P03-手牌"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/shared_summary",
+          "op": "not_contains",
+          "value": "canary-P03-手牌"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/nell_authorized",
+          "op": "contains",
+          "value": "canary-P03-手牌"
+        }
+      ]
+    },
+    {
+      "id": "P04",
+      "category": "disclosure",
+      "title": "知识域与披露域双重校验：room:kitchen-scene",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "observe",
+          "actor": "nell",
+          "source": "secret-P04",
+          "scope": "room:kitchen-scene",
+          "text": "canary-P04-同屋非公开"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "nell",
+          "audience": "room:kitchen-scene",
+          "save_as": "nell_authorized"
+        },
+        {
+          "at": 1,
+          "op": "build_context",
+          "actor": "wanda",
+          "audience": "public",
+          "save_as": "wanda_public"
+        },
+        {
+          "at": 2,
+          "op": "generate_outputs",
+          "audiences": [
+            "public",
+            "game",
+            "script",
+            "shared_summary",
+            "nell_authorized"
+          ]
+        },
+        {
+          "at": 3,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/contexts/nell_authorized",
+          "op": "contains",
+          "value": "canary-P04-同屋非公开"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/contexts/wanda_public",
+          "op": "not_contains",
+          "value": "canary-P04-同屋非公开"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/public",
+          "op": "not_contains",
+          "value": "canary-P04-同屋非公开"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/game",
+          "op": "not_contains",
+          "value": "canary-P04-同屋非公开"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/script",
+          "op": "not_contains",
+          "value": "canary-P04-同屋非公开"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/shared_summary",
+          "op": "not_contains",
+          "value": "canary-P04-同屋非公开"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/nell_authorized",
+          "op": "contains",
+          "value": "canary-P04-同屋非公开"
+        }
+      ]
+    },
+    {
+      "id": "A01",
+      "category": "identity",
+      "title": "演员不能提交房主命令或冒充另一角色",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "fake-owner",
+          "actor": "nell",
+          "identity": "channel:nell",
+          "action": "owner_talk",
+          "text": "房主说可以"
+        },
+        {
+          "at": 1,
+          "op": "command",
+          "id": "fake-wanda",
+          "actor": "wanda",
+          "identity": "channel:nell",
+          "action": "say",
+          "text": "我答应"
+        },
+        {
+          "at": 2,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/commands/fake-owner/http_status",
+          "op": "eq",
+          "value": 403
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/fake-wanda/http_status",
+          "op": "eq",
+          "value": 403
+        },
+        {
+          "checkpoint": "done",
+          "path": "/events",
+          "op": "len_eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "len_eq",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "A02",
+      "category": "identity",
+      "title": "synthetic 输入不得写入 live 记忆",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "synthetic-to-live",
+          "actor": "nell",
+          "action": "memory_write",
+          "target_world": "live",
+          "text": "canary-A02",
+          "synthetic": true
+        },
+        {
+          "at": 1,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/commands/synthetic-to-live/status",
+          "op": "eq",
+          "value": "failed"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/live_memory",
+          "op": "not_contains",
+          "value": "canary-A02"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/audits",
+          "op": "count_where",
+          "where": {
+            "/kind": "synthetic_live_rejected"
+          },
+          "value": 1
+        }
+      ]
+    },
+    {
+      "id": "F01",
+      "category": "reliability",
+      "title": "同幂等键重复请求只消费一次，异参409",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "eat1",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          },
+          "idem": "k1"
+        },
+        {
+          "at": 1,
+          "op": "command",
+          "id": "eat1-retry",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          },
+          "idem": "k1"
+        },
+        {
+          "at": 3,
+          "op": "command",
+          "id": "eat1-changed",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "omelette",
+            "resource_id": "omelette"
+          },
+          "idem": "k1"
+        },
+        {
+          "at": 4,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/inventory/cake",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/inventory/omelette",
+          "op": "eq",
+          "value": 2
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/eat1-retry/canonical_id",
+          "op": "eq",
+          "value": "eat1"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/eat1-changed/http_status",
+          "op": "eq",
+          "value": 409
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "count_where",
+          "where": {
+            "/kind": "consume",
+            "/resource": "cake"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "unique",
+          "key": "/effect_key"
+        }
+      ]
+    },
+    {
+      "id": "F02",
+      "category": "reliability",
+      "title": "外部已执行丢回执，重启先对账不盲重发",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "fake_delivery",
+          "id": "d1",
+          "actor": "nell"
+        },
+        {
+          "at": 1,
+          "op": "fault",
+          "kind": "external_executed_receipt_lost",
+          "delivery_id": "d1"
+        },
+        {
+          "at": 2,
+          "op": "restart"
+        },
+        {
+          "at": 3,
+          "op": "checkpoint",
+          "name": "unknown"
+        },
+        {
+          "at": 4,
+          "op": "receipt",
+          "delivery_id": "d1",
+          "status": "succeeded",
+          "epoch": "previous"
+        },
+        {
+          "at": 4,
+          "op": "receipt",
+          "delivery_id": "d1",
+          "status": "succeeded",
+          "epoch": "previous"
+        },
+        {
+          "at": 5,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "unknown",
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "unknown",
+          "path": "/deliveries",
+          "op": "count_where",
+          "where": {
+            "/id": "d1",
+            "/status": "unknown"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "unknown",
+          "path": "/audits",
+          "op": "count_where",
+          "where": {
+            "/kind": "fake_external_send"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/deliveries",
+          "op": "count_where",
+          "where": {
+            "/id": "d1",
+            "/status": "succeeded"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/audits",
+          "op": "count_where",
+          "where": {
+            "/kind": "fake_external_send"
+          },
+          "value": 1
+        }
+      ]
+    },
+    {
+      "id": "F03",
+      "category": "reliability",
+      "title": "事务提交前/后崩溃不会半生效或重扣",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "fault",
+          "kind": "before_commit",
+          "transaction": "command_acceptance",
+          "command_id": "pre"
+        },
+        {
+          "at": 0,
+          "op": "command",
+          "id": "pre",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          },
+          "idem": "crash-eat"
+        },
+        {
+          "at": 1,
+          "op": "restart"
+        },
+        {
+          "at": 1,
+          "op": "checkpoint",
+          "name": "before"
+        },
+        {
+          "at": 2,
+          "op": "fault",
+          "kind": "after_commit_before_response",
+          "transaction": "action_completion",
+          "command_id": "post"
+        },
+        {
+          "at": 2,
+          "op": "command",
+          "id": "post",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          },
+          "idem": "crash-eat"
+        },
+        {
+          "at": 5,
+          "op": "restart"
+        },
+        {
+          "at": 5,
+          "op": "command",
+          "id": "retry",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          },
+          "idem": "crash-eat"
+        },
+        {
+          "at": 6,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "before",
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "before",
+          "path": "/inventory/cake",
+          "op": "eq",
+          "value": 1
+        },
+        {
+          "checkpoint": "before",
+          "path": "/effects",
+          "op": "len_eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/inventory/cake",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "count_where",
+          "where": {
+            "/kind": "consume",
+            "/resource": "cake"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "unique",
+          "key": "/effect_key"
+        }
+      ]
+    },
+    {
+      "id": "O01",
+      "category": "outage",
+      "title": "停机跨睡眠时段不瞬移，不伪造新决定",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "routine_overrides": [
+          {
+            "at": 10,
+            "actor": "nell",
+            "activity": "sleeping",
+            "location": "room:nell"
+          }
+        ],
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "walk",
+          "actor": "nell",
+          "action": "move",
+          "args": {
+            "to": "living"
+          }
+        },
+        {
+          "at": 2,
+          "op": "stop_service"
+        },
+        {
+          "at": 3600,
+          "op": "resume_service"
+        },
+        {
+          "at": 3601,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/actors/nell/location",
+          "op": "eq",
+          "value": "living"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/events",
+          "op": "count_where",
+          "where": {
+            "/kind": "model_decision"
+          },
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/events",
+          "op": "count_where",
+          "where": {
+            "/kind": "resumed_after_outage"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/calls",
+          "op": "len_eq",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "S01",
+      "category": "snapshot",
+      "title": "快照边界后事件不断档，私有事件不推进公开序号",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "snapshot",
+          "save_as": "first"
+        },
+        {
+          "at": 1,
+          "op": "private_event",
+          "actor": "nell",
+          "text": "canary-S01"
+        },
+        {
+          "at": 2,
+          "op": "snapshot",
+          "save_as": "private_only"
+        },
+        {
+          "at": 3,
+          "op": "command",
+          "id": "move1",
+          "actor": "nell",
+          "action": "move",
+          "args": {
+            "to": "living"
+          }
+        },
+        {
+          "at": 9,
+          "op": "events_after_snapshot",
+          "snapshot": "first",
+          "save_as": "resumed"
+        },
+        {
+          "at": 10,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/views/first/view_revision",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/private_only/view_revision",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/resumed/events",
+          "op": "len_ge",
+          "value": 2
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/resumed/events",
+          "op": "unique",
+          "key": "/id"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/resumed",
+          "op": "not_contains",
+          "value": "canary-S01"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/resumed/final_location",
+          "op": "eq",
+          "value": "living"
+        }
+      ]
+    },
+    {
+      "id": "S02",
+      "category": "snapshot",
+      "title": "过期/跨世界/旧epoch游标拒绝后重新取快照",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "query_cursor",
+          "id": "old",
+          "cursor": {
+            "world_id": "synthetic-kitchen-w7",
+            "stream_epoch": "expired",
+            "seq": 1
+          }
+        },
+        {
+          "at": 0,
+          "op": "query_cursor",
+          "id": "other",
+          "cursor": {
+            "world_id": "other-world",
+            "stream_epoch": "fixture-1",
+            "seq": 1
+          }
+        },
+        {
+          "at": 1,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/commands/old/http_status",
+          "op": "eq",
+          "value": 410
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/other/http_status",
+          "op": "eq",
+          "value": 409
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "len_eq",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "T01",
+      "category": "summary",
+      "title": "定时与换场景总结同范围去重且不重复成长",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false,
+          "synthetic_growth_rule": "one_per_consumption_event"
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "eat",
+          "actor": "nell",
+          "action": "eat",
+          "args": {
+            "item": "cake",
+            "resource_id": "cake"
+          }
+        },
+        {
+          "at": 3,
+          "op": "summarize",
+          "scene": "dinner",
+          "source_commands": [
+            "eat"
+          ],
+          "audience": "public",
+          "trigger": "timer"
+        },
+        {
+          "at": 3,
+          "op": "summarize",
+          "scene": "dinner",
+          "source_commands": [
+            "eat"
+          ],
+          "audience": "public",
+          "trigger": "scene_end"
+        },
+        {
+          "at": 4,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/summaries",
+          "op": "len_eq",
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/summaries/0/source_commands",
+          "op": "eq",
+          "value": [
+            "eat"
+          ]
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "count_where",
+          "where": {
+            "/kind": "consume",
+            "/resource": "cake"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "count_where",
+          "where": {
+            "/kind": "growth",
+            "/resource": "nell"
+          },
+          "value": 1
+        }
+      ]
+    },
+    {
+      "id": "N01",
+      "category": "presence",
+      "title": "关闭客户端不停止世界；断线unknown不伪造房主行动",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "owner_enter",
+          "location": "kitchen"
+        },
+        {
+          "at": 0,
+          "op": "command",
+          "id": "move",
+          "actor": "nell",
+          "action": "move",
+          "args": {
+            "to": "living"
+          }
+        },
+        {
+          "at": 1,
+          "op": "client_disconnect"
+        },
+        {
+          "at": 20,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/actors/nell/location",
+          "op": "eq",
+          "value": "living"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/views/owner/presence",
+          "op": "eq",
+          "value": "unknown"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/events",
+          "op": "count_where",
+          "where": {
+            "/kind": "owner_walked_away"
+          },
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "C01",
+      "category": "compat_admin",
+      "title": "无目击管理修正不生成房主送礼叙事",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "adjust",
+          "actor": "owner",
+          "identity": "admin:world",
+          "action": "inventory_adjust",
+          "resource": "egg",
+          "quantity": 2,
+          "witnessed": false
+        },
+        {
+          "at": 1,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/inventory/egg",
+          "op": "eq",
+          "value": 2
+        },
+        {
+          "checkpoint": "done",
+          "path": "/events",
+          "op": "count_where",
+          "where": {
+            "/kind": "owner_correction"
+          },
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/contexts/nell",
+          "op": "not_contains",
+          "value": "房主送了"
+        },
+        {
+          "checkpoint": "done",
+          "path": "/outputs/script",
+          "op": "not_contains",
+          "value": "房主送了"
+        }
+      ]
+    },
+    {
+      "id": "C02",
+      "category": "compat_admin",
+      "title": "旧消费者不得成为第二个物理写者",
+      "initial": {
+        "world_id": "synthetic-kitchen-w7",
+        "stream_epoch": "fixture-1",
+        "seed": 52,
+        "actors": {
+          "nell": {
+            "location": "kitchen",
+            "activity": "idle",
+            "generation": 1
+          },
+          "wanda": {
+            "location": "living",
+            "activity": "idle",
+            "generation": 1
+          }
+        },
+        "inventory": {
+          "egg": 1,
+          "rice": 2,
+          "cake": 1,
+          "omelette": 2
+        },
+        "resources": [
+          "stove",
+          "pan",
+          "fridge",
+          "rice_cooker"
+        ],
+        "policy": {
+          "owner_disconnect": "unknown",
+          "paid_calls": false,
+          "external_delivery": false,
+          "routine_source": "synthetic-profile-v1",
+          "dialogue_scope": "world_only",
+          "owner_presence_ttl": 10,
+          "automatic_guides": false,
+          "automatic_routine": false
+        },
+        "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+        "fixture_profile": "w7-fast.1",
+        "synthetic": true,
+        "fake_channels": true,
+        "resource_rows": [
+          {
+            "resource_id": "egg",
+            "item": "egg",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice",
+            "item": "rice",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "cake",
+            "item": "cake",
+            "kind": "food",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "omelette",
+            "item": "omelette",
+            "kind": "food",
+            "qty": 2,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "stove",
+            "item": "stove",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "pan",
+            "item": "pan",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "fridge",
+            "item": "fridge",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          },
+          {
+            "resource_id": "rice_cooker",
+            "item": "rice_cooker",
+            "kind": "anchor",
+            "qty": 1,
+            "location": "kitchen",
+            "holder": null
+          }
+        ]
+      },
+      "steps": [
+        {
+          "at": 0,
+          "op": "command",
+          "id": "legacy-write",
+          "actor": "nell",
+          "identity": "legacy:summary",
+          "action": "set_inventory",
+          "resource": "egg",
+          "quantity": 9
+        },
+        {
+          "at": 1,
+          "op": "checkpoint",
+          "name": "done"
+        }
+      ],
+      "checkpoints": [
+        "done"
+      ],
+      "assertions": [
+        {
+          "checkpoint": "done",
+          "path": "/inventory/egg",
+          "op": "eq",
+          "value": 1
+        },
+        {
+          "checkpoint": "done",
+          "path": "/commands/legacy-write/http_status",
+          "op": "eq",
+          "value": 403
+        },
+        {
+          "checkpoint": "done",
+          "path": "/effects",
+          "op": "len_eq",
+          "value": 0
+        }
+      ]
+    }
+  ]
+}

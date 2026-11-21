@@ -1,0 +1,9 @@
+{"outfit": "今天穿着{items}",
+ "ate": "{slot}吃了{cook}做的{dish}",
+ "ate_out": "{slot}在{place}吃了{dish}",
+ "ate_with": "和{people}一起",
+ "went": "{when}去了{place}",
+ "plan": "{when}打算{what}",
+ "doing": {"cooking": "在厨房做{dish}", "outing": "在{place}", "bathing": "在泡澡", "sleeping": "在睡觉", "moving": "在去{place}的路上"},
+ "facts": {"wake": ["{actor}刚起床没多久，正在醒神。", "{actor}起床了，今天从{activity}开始。"], "sleep": ["{actor}已经睡下了。", "这个点了，{actor}在自己房间休息。"], "cook": ["{actor}正在厨房做{dish}。", "厨房那边是{actor}在忙，今晚做{dish}。"], "cooked": ["{actor}把{dish}做好了。", "{dish}出锅了，是{actor}做的。"], "eat": ["{actor}正在吃{dish}。", "{actor}和{people}一起吃着{dish}。"], "ate": ["{actor}今天吃过{dish}。", "{actor}的这一餐是{dish}，在{place}吃的。"], "invite": ["{actor}去问{people}要不要一起{activity}。", "{actor}约了{people}:{activity}。"], "invite_accepted": ["{people}答应了，{activity}定了。", "{people}说好，{activity}照计划来。"], "invite_expired": ["{actor}没等到{people}的回复，这次就算了。", "{people}那边没回音，{actor}先去忙别的了。"], "invite_declined": ["{people}这次没空，{actor}表示理解。", "{people}说下次吧，{actor}也没勉强。"], "out": ["{actor}出门去{place}了。", "{actor}这会儿在{place}。"], "back": ["{actor}从{place}回来了。", "{actor}刚到家。"], "bought": ["{actor}在{place}买了{item}。", "{actor}拎着{item}回来了，花了{price_yen}円。"], "outfit": ["{actor}换上了{items}。", "{actor}今天穿的是{items}。"], "plan": ["{actor}打算{activity}。", "{actor}计划去{place}{activity}。"], "work": ["{actor}在{place}忙自己的事。", "{actor}正专注地{activity}。"], "rest": ["{actor}在{place}歇着。", "{actor}在{place}放空，什么都没干。"], "bath": ["{actor}去洗澡了。", "{actor}在泡澡。"]},
+ "source": {"facts": "新设", "rest": "起步占位（维护者 11-02）"}}

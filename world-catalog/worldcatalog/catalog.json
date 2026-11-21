@@ -1,0 +1,1617 @@
+{
+  "schema_version": 1,
+  "vocab_version": "world-catalog/1.0.0-p1a",
+  "status": "review",
+  "scope": "P1a synthetic; P2 entries are contracts, not enabled actions",
+  "provenance": {
+    "baseline": "NELL-LIVING-WORLD-v1.1-20261023",
+    "task": 50,
+    "kernel_reference_commit": "0b27f6c18870134603c29d616079f874d4ec4c4d",
+    "legacy_file": "docs/world-vocab.json"
+  },
+  "units": {
+    "duration": "seconds",
+    "rate": "points_per_minute_offset_to_base",
+    "once": "points_once_on_success"
+  },
+  "vocabulary": {
+    "locations": {
+      "living": {
+        "name": "一楼客厅",
+        "kind": "home",
+        "public": true
+      },
+      "kitchen": {
+        "name": "厨房兼餐厅",
+        "kind": "home",
+        "public": true
+      },
+      "study": {
+        "name": "书房",
+        "kind": "home",
+        "public": true
+      },
+      "yard": {
+        "name": "小院子",
+        "kind": "home",
+        "public": true
+      },
+      "bath": {
+        "name": "浴室",
+        "kind": "home",
+        "public": false
+      },
+      "room": {
+        "name": "自己的卧室",
+        "kind": "home",
+        "public": false
+      },
+      "street": {
+        "name": "附近的商店街",
+        "kind": "outdoors",
+        "public": false
+      },
+      "station": {
+        "name": "车站附近",
+        "kind": "transit",
+        "public": false
+      },
+      "river": {
+        "name": "河边",
+        "kind": "outdoors",
+        "public": false
+      },
+      "shop": {
+        "name": "便利店/超市",
+        "kind": "shop",
+        "public": false
+      },
+      "cafe": {
+        "name": "外面的咖啡店/餐馆",
+        "kind": "restaurant",
+        "public": false
+      },
+      "away": {
+        "name": "出门在外",
+        "kind": "outdoors",
+        "public": false
+      }
+    },
+    "activities": {
+      "idle": "发呆",
+      "resting": "休息",
+      "sleeping": "睡觉",
+      "eating": "吃东西",
+      "cooking": "做饭",
+      "chores": "做家务",
+      "reading": "看书",
+      "working": "做事",
+      "gaming": "打游戏",
+      "hobby": "做喜欢的事",
+      "phone": "玩手机",
+      "bathing": "洗澡",
+      "socializing": "和大家待着",
+      "outing": "在外面",
+      "walking": "散步",
+      "browsing": "拿客厅的共用手机刷站"
+    },
+    "moods": {
+      "neutral": "平静",
+      "relaxed": "放松",
+      "happy": "开心",
+      "excited": "兴奋",
+      "tired": "累",
+      "sleepy": "困",
+      "stressed": "烦躁",
+      "sad": "低落",
+      "annoyed": "不爽",
+      "bored": "无聊",
+      "cozy": "惬意",
+      "touched": "感动",
+      "proud": "得意",
+      "shy": "害羞",
+      "lonely": "寂寞",
+      "worried": "担心",
+      "jealous": "吃醋"
+    },
+    "availability": {
+      "free": "有空",
+      "limited": "能看手机但在忙别的",
+      "occupied": "很忙，不太看手机",
+      "sleeping": "睡着了"
+    },
+    "routine": {
+      "nell": [
+        {
+          "start": "06:00",
+          "end": "07:30",
+          "location": "kitchen",
+          "activity": "cooking",
+          "what": "准备早饭",
+          "availability": "limited"
+        },
+        {
+          "start": "07:30",
+          "end": "11:30",
+          "location": "living",
+          "activity": "chores",
+          "what": "打扫、洗衣服",
+          "availability": "limited"
+        },
+        {
+          "start": "11:30",
+          "end": "13:00",
+          "location": "kitchen",
+          "activity": "cooking",
+          "what": "做午饭、收拾",
+          "availability": "limited"
+        },
+        {
+          "start": "13:00",
+          "end": "16:30",
+          "location": "living",
+          "activity": "resting",
+          "what": "家务间隙歇一会儿",
+          "availability": "free"
+        },
+        {
+          "start": "16:30",
+          "end": "17:30",
+          "location": "shop",
+          "activity": "outing",
+          "what": "去超市买菜",
+          "availability": "limited"
+        },
+        {
+          "start": "17:30",
+          "end": "19:30",
+          "location": "kitchen",
+          "activity": "cooking",
+          "what": "做晚饭",
+          "availability": "limited"
+        },
+        {
+          "start": "19:30",
+          "end": "22:30",
+          "location": "living",
+          "activity": "socializing",
+          "what": "收拾完陪大家",
+          "availability": "free"
+        },
+        {
+          "start": "22:30",
+          "end": "23:00",
+          "location": "bath",
+          "activity": "bathing",
+          "what": "洗澡",
+          "availability": "occupied"
+        },
+        {
+          "start": "23:00",
+          "end": "06:00",
+          "location": "room",
+          "activity": "sleeping",
+          "what": "睡觉",
+          "availability": "sleeping"
+        }
+      ],
+      "elsa": [
+        {
+          "start": "07:00",
+          "end": "08:00",
+          "location": "room",
+          "activity": "resting",
+          "what": "起床梳洗",
+          "availability": "limited"
+        },
+        {
+          "start": "08:00",
+          "end": "09:00",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "早餐和早茶",
+          "availability": "free"
+        },
+        {
+          "start": "09:00",
+          "end": "12:00",
+          "location": "study",
+          "activity": "reading",
+          "what": "在书房整理书",
+          "availability": "free"
+        },
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "午饭",
+          "availability": "free"
+        },
+        {
+          "start": "13:00",
+          "end": "15:00",
+          "location": "study",
+          "activity": "reading",
+          "what": "看书",
+          "availability": "free"
+        },
+        {
+          "start": "15:00",
+          "end": "16:00",
+          "location": "study",
+          "activity": "resting",
+          "what": "下午茶",
+          "availability": "free"
+        },
+        {
+          "start": "16:00",
+          "end": "17:30",
+          "location": "river",
+          "activity": "walking",
+          "what": "去河边散步",
+          "availability": "limited"
+        },
+        {
+          "start": "17:30",
+          "end": "19:00",
+          "location": "study",
+          "activity": "reading",
+          "what": "看书",
+          "availability": "free"
+        },
+        {
+          "start": "19:00",
+          "end": "20:00",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "晚饭",
+          "availability": "free"
+        },
+        {
+          "start": "20:00",
+          "end": "23:00",
+          "location": "living",
+          "activity": "reading",
+          "what": "在客厅看书",
+          "availability": "free"
+        },
+        {
+          "start": "23:00",
+          "end": "23:30",
+          "location": "bath",
+          "activity": "bathing",
+          "what": "洗澡",
+          "availability": "occupied"
+        },
+        {
+          "start": "23:30",
+          "end": "07:00",
+          "location": "room",
+          "activity": "sleeping",
+          "what": "睡觉",
+          "availability": "sleeping"
+        }
+      ],
+      "alma": [
+        {
+          "start": "02:30",
+          "end": "10:30",
+          "location": "room",
+          "activity": "sleeping",
+          "what": "睡觉",
+          "availability": "sleeping"
+        },
+        {
+          "start": "10:30",
+          "end": "11:30",
+          "location": "room",
+          "activity": "resting",
+          "what": "赖床",
+          "availability": "limited"
+        },
+        {
+          "start": "11:30",
+          "end": "12:30",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "早午饭",
+          "availability": "free"
+        },
+        {
+          "start": "12:30",
+          "end": "17:00",
+          "location": "room",
+          "activity": "hobby",
+          "what": "整理、欣赏收藏",
+          "availability": "free"
+        },
+        {
+          "start": "17:00",
+          "end": "18:30",
+          "location": "yard",
+          "activity": "resting",
+          "what": "在院子吹风看天",
+          "availability": "free"
+        },
+        {
+          "start": "18:30",
+          "end": "19:30",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "晚饭",
+          "availability": "free"
+        },
+        {
+          "start": "19:30",
+          "end": "23:00",
+          "location": "living",
+          "activity": "socializing",
+          "what": "在客厅待着",
+          "availability": "free"
+        },
+        {
+          "start": "23:00",
+          "end": "02:30",
+          "location": "room",
+          "activity": "hobby",
+          "what": "在巢穴里看书、发呆",
+          "availability": "free"
+        }
+      ],
+      "mina": [
+        {
+          "start": "03:30",
+          "end": "11:30",
+          "location": "room",
+          "activity": "sleeping",
+          "what": "睡觉（遮光帘拉得严严实实）",
+          "availability": "sleeping"
+        },
+        {
+          "start": "11:30",
+          "end": "12:30",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "起床觅食",
+          "availability": "free"
+        },
+        {
+          "start": "12:30",
+          "end": "17:30",
+          "location": "room",
+          "activity": "phone",
+          "what": "在房间冲浪刷网",
+          "availability": "free"
+        },
+        {
+          "start": "17:30",
+          "end": "18:30",
+          "location": "shop",
+          "activity": "outing",
+          "what": "去便利店",
+          "availability": "limited"
+        },
+        {
+          "start": "18:30",
+          "end": "19:30",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "晚饭",
+          "availability": "free"
+        },
+        {
+          "start": "19:30",
+          "end": "03:30",
+          "location": "living",
+          "activity": "gaming",
+          "what": "霸占客厅游戏机",
+          "availability": "free"
+        }
+      ],
+      "yuki": [
+        {
+          "start": "00:00",
+          "end": "08:30",
+          "location": "room",
+          "activity": "sleeping",
+          "what": "睡觉",
+          "availability": "sleeping"
+        },
+        {
+          "start": "08:30",
+          "end": "09:30",
+          "location": "living",
+          "activity": "resting",
+          "what": "窝在沙发上醒神",
+          "availability": "limited"
+        },
+        {
+          "start": "09:30",
+          "end": "10:30",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "早饭",
+          "availability": "free"
+        },
+        {
+          "start": "10:30",
+          "end": "15:00",
+          "location": "yard",
+          "activity": "resting",
+          "what": "在院子晒太阳打盹",
+          "availability": "free"
+        },
+        {
+          "start": "15:00",
+          "end": "18:30",
+          "location": "living",
+          "activity": "resting",
+          "what": "窝在客厅沙发",
+          "availability": "free"
+        },
+        {
+          "start": "18:30",
+          "end": "19:30",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "晚饭",
+          "availability": "free"
+        },
+        {
+          "start": "19:30",
+          "end": "21:30",
+          "location": "living",
+          "activity": "socializing",
+          "what": "黏着大家",
+          "availability": "free"
+        },
+        {
+          "start": "21:30",
+          "end": "23:30",
+          "location": "yard",
+          "activity": "hobby",
+          "what": "在院子看星星",
+          "availability": "free"
+        },
+        {
+          "start": "23:30",
+          "end": "00:00",
+          "location": "living",
+          "activity": "phone",
+          "what": "窝着刷手机",
+          "availability": "free"
+        }
+      ],
+      "wanda": [
+        {
+          "start": "01:00",
+          "end": "09:00",
+          "location": "room",
+          "activity": "sleeping",
+          "what": "睡觉",
+          "availability": "sleeping"
+        },
+        {
+          "start": "09:00",
+          "end": "10:00",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "找早饭吃",
+          "availability": "free"
+        },
+        {
+          "start": "10:00",
+          "end": "12:00",
+          "location": "living",
+          "activity": "phone",
+          "what": "摸鱼刷手机",
+          "availability": "free"
+        },
+        {
+          "start": "12:00",
+          "end": "13:00",
+          "location": "kitchen",
+          "activity": "eating",
+          "what": "午饭",
+          "availability": "free"
+        },
+        {
+          "start": "13:00",
+          "end": "17:00",
+          "location": "living",
+          "activity": "phone",
+          "what": "在客厅和厨房之间转悠找零食",
+          "availability": "free"
+        },
+        {
+          "start": "17:00",
+          "end": "19:00",
+          "location": "kitchen",
+          "activity": "chores",
+          "what": "给奈尔打下手",
+          "availability": "limited"
+        },
+        {
+          "start": "19:00",
+          "end": "23:30",
+          "location": "living",
+          "activity": "socializing",
+          "what": "在客厅热闹",
+          "availability": "free"
+        },
+        {
+          "start": "23:30",
+          "end": "00:00",
+          "location": "bath",
+          "activity": "bathing",
+          "what": "泡澡",
+          "availability": "occupied"
+        },
+        {
+          "start": "00:00",
+          "end": "01:00",
+          "location": "room",
+          "activity": "phone",
+          "what": "在被窝刷手机",
+          "availability": "free"
+        }
+      ]
+    }
+  },
+  "activities": {
+    "idle": {
+      "label": "发呆",
+      "phase": "P1a",
+      "mode": "simulated",
+      "action_types": [
+        "wait"
+      ],
+      "duration_rule": {
+        "default_seconds": 300,
+        "min_seconds": 1,
+        "max_seconds": 1800,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [],
+      "effects": {},
+      "interrupt_policy": "now",
+      "availability": "free",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "resting": {
+      "label": "休息",
+      "phase": "P1a",
+      "mode": "simulated",
+      "action_types": [
+        "rest"
+      ],
+      "duration_rule": {
+        "default_seconds": 1200,
+        "min_seconds": 1,
+        "max_seconds": 3600,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [],
+      "effects": {
+        "rate": {
+          "energy": 0.5
+        }
+      },
+      "interrupt_policy": "now",
+      "availability": "free",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "sleeping": {
+      "label": "睡觉",
+      "phase": "P1a",
+      "mode": "simulated",
+      "action_types": [
+        "sleep"
+      ],
+      "duration_rule": {
+        "default_seconds": 28800,
+        "min_seconds": 1,
+        "max_seconds": 36000,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "private_rest_location"
+      ],
+      "effects": {
+        "rate": {
+          "energy": 0.3
+        }
+      },
+      "interrupt_policy": "now",
+      "availability": "sleeping",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "eating": {
+      "label": "吃东西",
+      "phase": "P1a",
+      "mode": "simulated",
+      "action_types": [
+        "eat"
+      ],
+      "duration_rule": {
+        "default_seconds": 600,
+        "min_seconds": 600,
+        "max_seconds": 600,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "edible_ready_food",
+        "holds_or_at_resource"
+      ],
+      "effects": {
+        "once": {
+          "hunger": -60
+        }
+      },
+      "interrupt_policy": "at_end",
+      "availability": "free",
+      "resource_requirements": [
+        "edible_food"
+      ],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "cooking": {
+      "label": "做饭",
+      "phase": "P1a",
+      "mode": "simulated",
+      "action_types": [
+        "cook"
+      ],
+      "duration_rule": {
+        "default_seconds": 600,
+        "min_seconds": 1,
+        "max_seconds": 7200,
+        "resolver": "recipe"
+      },
+      "prerequisites": [
+        "at_location:kitchen",
+        "recipe_and_anchors_available"
+      ],
+      "effects": {
+        "rate": {
+          "energy": -0.2
+        }
+      },
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [
+        "recipe"
+      ],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "chores": {
+      "label": "做家务",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 1200,
+        "min_seconds": 60,
+        "max_seconds": 3600,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "activity_location_allowed"
+      ],
+      "effects": {
+        "rate": {
+          "energy": -0.1
+        }
+      },
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "reading": {
+      "label": "看书",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 1800,
+        "min_seconds": 60,
+        "max_seconds": 7200,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "reading_material_accessible"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "availability": "free",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "working": {
+      "label": "做事",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 1800,
+        "min_seconds": 60,
+        "max_seconds": 7200,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "work_resource_accessible"
+      ],
+      "effects": {
+        "rate": {
+          "energy": -0.1
+        }
+      },
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "gaming": {
+      "label": "打游戏",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity",
+        "join_party"
+      ],
+      "duration_rule": {
+        "default_seconds": 1800,
+        "min_seconds": 1,
+        "max_seconds": 14400,
+        "resolver": "mode_specific"
+      },
+      "prerequisites": [
+        "game_mode_selected"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate",
+      "variants": {
+        "solo": {
+          "action_type": "begin_activity",
+          "prerequisites": [
+            "game_resource_accessible"
+          ],
+          "resource_requirements": [
+            "game_console"
+          ],
+          "execution": "kernel"
+        },
+        "party": {
+          "action_type": "join_party",
+          "prerequisites": [
+            "invitation_accepted",
+            "party_engine_receipt"
+          ],
+          "resource_requirements": [
+            "seat"
+          ],
+          "execution": "engine42"
+        }
+      }
+    },
+    "hobby": {
+      "label": "做喜欢的事",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 1800,
+        "min_seconds": 60,
+        "max_seconds": 7200,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "hobby_resource_accessible"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "availability": "free",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "phone": {
+      "label": "玩手机",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "read_phone",
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 60,
+        "min_seconds": 1,
+        "max_seconds": 600,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "message_in_actor_mailbox",
+        "reading_permitted"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "availability": "limited",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "bathing": {
+      "label": "洗澡",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 1200,
+        "min_seconds": 60,
+        "max_seconds": 3600,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "at_location:bath",
+        "bath_exclusive"
+      ],
+      "effects": {
+        "rate": {
+          "energy": 0.1
+        }
+      },
+      "interrupt_policy": "at_end",
+      "availability": "occupied",
+      "resource_requirements": [
+        "bath"
+      ],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "socializing": {
+      "label": "和大家待着",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity"
+      ],
+      "duration_rule": {
+        "default_seconds": 600,
+        "min_seconds": 1,
+        "max_seconds": 3600,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "participant_self_opt_in",
+        "participants_present"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "availability": "free",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "outing": {
+      "label": "在外面",
+      "phase": "P2",
+      "mode": "abstract",
+      "action_types": [
+        "begin_activity",
+        "buy"
+      ],
+      "duration_rule": {
+        "default_seconds": 1800,
+        "min_seconds": 60,
+        "max_seconds": 14400,
+        "resolver": "bounded_parameter"
+      },
+      "prerequisites": [
+        "at_outdoor_location"
+      ],
+      "effects": {
+        "rate": {
+          "energy": -0.05
+        }
+      },
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "walking": {
+      "label": "散步",
+      "phase": "P1a",
+      "mode": "simulated",
+      "action_types": [
+        "move"
+      ],
+      "duration_rule": {
+        "default_seconds": 8,
+        "min_seconds": 1,
+        "max_seconds": 3600,
+        "resolver": "route"
+      },
+      "prerequisites": [
+        "route_exists"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    },
+    "browsing": {
+      "label": "拿客厅的共用手机刷站",
+      "phase": "P2",
+      "mode": "external",
+      "action_types": [
+        "browse"
+      ],
+      "duration_rule": {
+        "default_seconds": 1200,
+        "min_seconds": 1,
+        "max_seconds": 1800,
+        "resolver": "external_lifecycle"
+      },
+      "prerequisites": [
+        "phone_executor_claim",
+        "tool_policy_allows"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "availability": "limited",
+      "resource_requirements": [
+        "shared_phone"
+      ],
+      "effect_origin": "kernel_or_verified_executor",
+      "parameter_status": "trial_candidate"
+    }
+  },
+  "actions": {
+    "move": {
+      "activity": "walking",
+      "duration_rule": {
+        "route": true
+      },
+      "prerequisites": [
+        "route_exists"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "to": "location"
+      }
+    },
+    "wait": {
+      "activity": "idle",
+      "duration_rule": {
+        "arg": "seconds",
+        "max": 1800
+      },
+      "prerequisites": [],
+      "effects": {},
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "seconds": "positive_seconds"
+      }
+    },
+    "rest": {
+      "activity": "resting",
+      "duration_rule": {
+        "arg": "seconds",
+        "max": 3600
+      },
+      "prerequisites": [],
+      "effects": {
+        "rate": {
+          "energy": 0.5
+        }
+      },
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "seconds": "positive_seconds"
+      }
+    },
+    "check": {
+      "activity": "idle",
+      "duration_rule": {
+        "fixed": 5
+      },
+      "prerequisites": [
+        "at_resource"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "resource_id": "resource_id"
+      }
+    },
+    "cook": {
+      "activity": "cooking",
+      "duration_rule": {
+        "recipe": true
+      },
+      "prerequisites": [
+        "at_location:kitchen"
+      ],
+      "effects": {
+        "rate": {
+          "energy": -0.2
+        }
+      },
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "recipe"
+      ],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "recipe": "recipe_id"
+      }
+    },
+    "eat": {
+      "activity": "eating",
+      "duration_rule": {
+        "fixed": 600
+      },
+      "prerequisites": [
+        "holds_or_at_resource"
+      ],
+      "effects": {
+        "once": {
+          "hunger": -60
+        }
+      },
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "arg:item"
+      ],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "item": "edible_item",
+        "resource_id?": "resource_id"
+      }
+    },
+    "say": {
+      "activity": null,
+      "duration_rule": {
+        "instant": true
+      },
+      "prerequisites": [],
+      "effects": {},
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": false,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "text": "text_1_500",
+        "to?": "actor_id"
+      }
+    },
+    "sleep": {
+      "activity": "sleeping",
+      "duration_rule": {
+        "arg": "seconds",
+        "max": 36000
+      },
+      "prerequisites": [
+        "at_location:exit_rooms"
+      ],
+      "effects": {
+        "rate": {
+          "energy": 0.3
+        }
+      },
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": true,
+      "phase": "P1a",
+      "execution": "kernel",
+      "parameter_status": "p1a_reference_compatible",
+      "argument_schema": {
+        "seconds": "positive_seconds"
+      }
+    },
+    "take": {
+      "activity": "chores",
+      "duration_rule": {
+        "fixed": 3
+      },
+      "prerequisites": [
+        "at_resource",
+        "holder_empty",
+        "resource_transfer_allowed"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "arg:resource_id"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "put": {
+      "activity": "chores",
+      "duration_rule": {
+        "fixed": 3
+      },
+      "prerequisites": [
+        "held_by_actor",
+        "destination_reachable"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "arg:resource_id"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "invite": {
+      "activity": null,
+      "duration_rule": {
+        "instant": true
+      },
+      "prerequisites": [
+        "recipient_exists",
+        "scope_allows_invitation"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": false,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "respond_invite": {
+      "activity": null,
+      "duration_rule": {
+        "instant": true
+      },
+      "prerequisites": [
+        "actor_is_recipient",
+        "invitation_pending",
+        "not_expired"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": false,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "read_phone": {
+      "activity": "phone",
+      "duration_rule": {
+        "arg": "seconds",
+        "max": 600
+      },
+      "prerequisites": [
+        "message_in_actor_mailbox",
+        "reading_permitted"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "actor_phone"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "buy": {
+      "activity": "outing",
+      "duration_rule": {
+        "arg": "seconds",
+        "max": 3600
+      },
+      "prerequisites": [
+        "at_location:shop",
+        "simulated_stock_and_budget",
+        "approved_simulation_only"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "purchase_list"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "receive_gift": {
+      "activity": null,
+      "duration_rule": {
+        "instant": true
+      },
+      "prerequisites": [
+        "verified_gift_source",
+        "recipient_is_actor"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": false,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "owner_place_item": {
+      "activity": null,
+      "duration_rule": {
+        "instant": true
+      },
+      "prerequisites": [
+        "principal_admin_world",
+        "correction_reason",
+        "perception_policy"
+      ],
+      "effects": {},
+      "interrupt_policy": "now",
+      "resource_requirements": [],
+      "body": false,
+      "phase": "P2",
+      "execution": "owner_correction",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "begin_activity": {
+      "activity": null,
+      "duration_rule": {
+        "activity": true
+      },
+      "prerequisites": [
+        "activity_phase_enabled",
+        "activity_prerequisites"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "activity_requirements"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "kernel",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "join_party": {
+      "activity": "gaming",
+      "duration_rule": {
+        "external": true
+      },
+      "prerequisites": [
+        "invitation_accepted",
+        "engine42_receipt",
+        "seat_identity_scope"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "seat"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "engine42",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    },
+    "browse": {
+      "activity": "browsing",
+      "duration_rule": {
+        "external": true
+      },
+      "prerequisites": [
+        "verified_claim",
+        "tool_policy_allows"
+      ],
+      "effects": {},
+      "interrupt_policy": "at_end",
+      "resource_requirements": [
+        "shared_phone"
+      ],
+      "body": true,
+      "phase": "P2",
+      "execution": "browse_executor",
+      "parameter_status": "deferred_contract",
+      "argument_schema": {
+        "handler_defined": "requires_P2_contract"
+      }
+    }
+  },
+  "items": {
+    "egg": {
+      "kind": "food",
+      "edible": false,
+      "unit": "piece",
+      "integer_quantity": true
+    },
+    "tofu": {
+      "kind": "food",
+      "edible": false,
+      "unit": "portion"
+    },
+    "miso": {
+      "kind": "food",
+      "edible": false,
+      "unit": "portion"
+    },
+    "rice": {
+      "kind": "food",
+      "edible": false,
+      "unit": "portion"
+    },
+    "cake": {
+      "kind": "food",
+      "edible": true,
+      "unit": "portion"
+    },
+    "omelette": {
+      "kind": "food",
+      "edible": true,
+      "unit": "portion"
+    },
+    "miso_soup": {
+      "kind": "food",
+      "edible": true,
+      "unit": "portion"
+    },
+    "cooked_rice": {
+      "kind": "food",
+      "edible": true,
+      "unit": "portion"
+    },
+    "stove": {
+      "kind": "anchor",
+      "edible": false,
+      "unit": "piece",
+      "exclusive": true
+    },
+    "pan": {
+      "kind": "anchor",
+      "edible": false,
+      "unit": "piece",
+      "exclusive": true
+    },
+    "pot": {
+      "kind": "anchor",
+      "edible": false,
+      "unit": "piece",
+      "exclusive": true
+    },
+    "rice_cooker": {
+      "kind": "anchor",
+      "edible": false,
+      "unit": "piece",
+      "exclusive": true
+    },
+    "fridge": {
+      "kind": "anchor",
+      "edible": false,
+      "unit": "piece",
+      "exclusive": true
+    },
+    "bowl": {
+      "kind": "anchor",
+      "edible": false,
+      "unit": "piece",
+      "exclusive": true
+    }
+  },
+  "recipes": {
+    "omelette": {
+      "seconds": 600,
+      "consume": {
+        "egg": 2
+      },
+      "hold": [
+        "stove",
+        "pan"
+      ],
+      "makes": {
+        "omelette": 1
+      }
+    },
+    "miso_soup": {
+      "seconds": 900,
+      "consume": {
+        "tofu": 1,
+        "miso": 1
+      },
+      "hold": [
+        "stove",
+        "pot"
+      ],
+      "makes": {
+        "miso_soup": 2
+      }
+    },
+    "rice": {
+      "seconds": 1800,
+      "consume": {
+        "rice": 1
+      },
+      "hold": [
+        "rice_cooker"
+      ],
+      "makes": {
+        "cooked_rice": 3
+      }
+    }
+  },
+  "body": {
+    "keys": [
+      "energy",
+      "hunger"
+    ],
+    "range": [
+      0.0,
+      100.0
+    ],
+    "base_drift_per_minute": {
+      "energy": -0.05,
+      "hunger": 0.1
+    },
+    "meaning": {
+      "energy": "higher_is_more_energy",
+      "hunger": "higher_is_hungrier"
+    },
+    "integrator": "world_kernel_only",
+    "once_effect_key": "action_id:body",
+    "phase": "P1a"
+  },
+  "p1a": {
+    "action_types": [
+      "move",
+      "wait",
+      "rest",
+      "check",
+      "cook",
+      "eat",
+      "say",
+      "sleep"
+    ],
+    "locations": {
+      "kitchen": {
+        "kind": "room"
+      },
+      "living": {
+        "kind": "room"
+      },
+      "exit_rooms": {
+        "kind": "leave_point"
+      }
+    },
+    "routes": [
+      {
+        "from": "kitchen",
+        "to": "living",
+        "seconds": 8,
+        "bidirectional": true
+      },
+      {
+        "from": "living",
+        "to": "exit_rooms",
+        "seconds": 12,
+        "bidirectional": true
+      }
+    ],
+    "internal_locations": {
+      "exit_rooms": {
+        "public_location": null,
+        "presentation": "offscreen",
+        "reason": "bedrooms_not_simulated"
+      }
+    },
+    "map_status": "synthetic_fixture_not_surveyed_geometry"
+  },
+  "aliases": {
+    "inspect": "check",
+    "prepare_food": "cook",
+    "move_to": "move"
+  },
+  "enforcement_contract": {
+    "guard": "worldcatalog.catalog.guard_request",
+    "stages": [
+      "accept",
+      "start",
+      "complete"
+    ],
+    "kernel_gaps_at_reference": [
+      "check at_resource prerequisite is metadata-only in reference _prereq; call guard before completing inspection",
+      "eat resource_id must match item/kind/edible; reference _find(rid=...) does not verify item"
+    ]
+  }
+}

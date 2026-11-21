@@ -1,0 +1,10 @@
+{
+  "profile": "w7-fast.1",
+  "base_version": "world-catalog/1.0.0-p1a",
+  "vocab_version": "world-catalog/1.0.0-p1a+w7-fast.1",
+  "constraints": {"synthetic": true, "fake_channels": true, "paid_calls": false},
+  "eat_seconds": 2,
+  "rice_seconds": 10,
+  "kitchen_living_seconds": 5,
+  "read_phone_seconds": 1
+}

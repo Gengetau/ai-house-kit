@@ -1,0 +1,385 @@
+{
+  "shelf": "未分类",
+  "assets": {
+    "shelf_01_collegiate_knit": {
+      "kind": "bundle",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "学院风奶油麻花针织开衫与驼色格纹百褶裙套装",
+      "image_path": "shelf_01_collegiate_knit.png",
+      "grants": [
+        {
+          "id": "shelf_cream_knit_cardigan",
+          "label": "奶油白麻花针织开衫配酒红领结衬衫",
+          "category": "top",
+          "color": "cream",
+          "material": "knit",
+          "temp_c": [
+            12,
+            24
+          ],
+          "occasions": [
+            "out",
+            "home"
+          ],
+          "like": 5
+        },
+        {
+          "id": "shelf_camel_plaid_midi",
+          "label": "驼色格纹百褶中长裙配焦糖乐福鞋",
+          "category": "bottom",
+          "color": "camel",
+          "material": "wool",
+          "temp_c": [
+            10,
+            24
+          ],
+          "occasions": [
+            "out",
+            "home"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_02_sailor_breeze": {
+      "kind": "bundle",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "海盐蓝水手领衬衫与白色A字短裙帆布鞋套装",
+      "image_path": "shelf_02_sailor_breeze.png",
+      "grants": [
+        {
+          "id": "shelf_sailor_blouse",
+          "label": "海盐蓝水手领短袖衬衫",
+          "category": "top",
+          "color": "white_blue",
+          "material": "cotton",
+          "temp_c": [
+            18,
+            32
+          ],
+          "occasions": [
+            "out",
+            "home"
+          ],
+          "like": 4
+        },
+        {
+          "id": "shelf_white_aline_skirt",
+          "label": "纯白A字短裙配浅蓝帆布鞋",
+          "category": "bottom",
+          "color": "white",
+          "material": "cotton",
+          "temp_c": [
+            18,
+            32
+          ],
+          "occasions": [
+            "out",
+            "home"
+          ],
+          "like": 4
+        }
+      ]
+    },
+    "shelf_03_cozy_hoodie_denim": {
+      "kind": "bundle",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "樱花粉连帽卫衣配浅蓝牛仔背带裙与小白鞋套装",
+      "image_path": "shelf_03_cozy_hoodie_denim.png",
+      "grants": [
+        {
+          "id": "shelf_sakura_hoodie",
+          "label": "樱花粉宽松连帽卫衣",
+          "category": "top",
+          "color": "pink",
+          "material": "cotton",
+          "temp_c": [
+            12,
+            23
+          ],
+          "occasions": [
+            "out",
+            "home",
+            "sport"
+          ],
+          "like": 4
+        },
+        {
+          "id": "shelf_denim_overall_skirt",
+          "label": "浅蓝水洗牛仔背带中裙配白板鞋",
+          "category": "bottom",
+          "color": "light_blue",
+          "material": "denim",
+          "temp_c": [
+            12,
+            25
+          ],
+          "occasions": [
+            "out",
+            "home"
+          ],
+          "like": 4
+        }
+      ]
+    },
+    "shelf_04_matcha_lounge_set": {
+      "kind": "onepiece_set",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "鼠尾草绿华夫格家居服配米白阔腿裤与绒毛拖鞋套装",
+      "image_path": "shelf_04_matcha_lounge_set.png",
+      "grants": [
+        {
+          "id": "shelf_matcha_waffle_lounge",
+          "label": "鼠尾草绿华夫格针织家居套装",
+          "category": "loungewear",
+          "color": "sage_green",
+          "material": "knit",
+          "temp_c": [
+            14,
+            26
+          ],
+          "occasions": [
+            "home"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_05_midnight_star_gown": {
+      "kind": "onepiece_set",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "午夜深蓝渐变星纱抹胸晚礼服配星月腰链与水晶高跟鞋",
+      "image_path": "shelf_05_midnight_star_gown.png",
+      "grants": [
+        {
+          "id": "shelf_midnight_star_gown",
+          "label": "午夜深蓝星纱抹胸晚礼服套装",
+          "category": "dress",
+          "color": "midnight_blue",
+          "material": "tulle",
+          "temp_c": [
+            15,
+            28
+          ],
+          "occasions": [
+            "formal",
+            "out"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_06_champagne_tea_dress": {
+      "kind": "onepiece_set",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "香槟玫瑰法式方领雪纺茶歇裙配珍珠腰带与玛丽珍鞋",
+      "image_path": "shelf_06_champagne_tea_dress.png",
+      "grants": [
+        {
+          "id": "shelf_champagne_tea_dress",
+          "label": "香槟玫瑰法式方领雪纺茶歇连衣裙",
+          "category": "dress",
+          "color": "champagne",
+          "material": "chiffon",
+          "temp_c": [
+            16,
+            29
+          ],
+          "occasions": [
+            "out",
+            "formal"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_07_crimson_velvet_dress": {
+      "kind": "onepiece_set",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "复古酒红丝绒吊带礼服裙配黑金蕾丝披肩与丝绒高跟鞋",
+      "image_path": "shelf_07_crimson_velvet_dress.png",
+      "grants": [
+        {
+          "id": "shelf_crimson_velvet_dress",
+          "label": "复古酒红丝绒礼服裙配黑蕾丝披肩",
+          "category": "dress",
+          "color": "burgundy",
+          "material": "velvet",
+          "temp_c": [
+            12,
+            24
+          ],
+          "occasions": [
+            "formal"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_08_sakura_yukata_set": {
+      "kind": "onepiece_set",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "朝霞淡紫白樱花火浴衣配银粉兵儿带与木屐套装",
+      "image_path": "shelf_08_sakura_yukata_set.png",
+      "grants": [
+        {
+          "id": "shelf_sakura_lavender_yukata",
+          "label": "朝霞淡紫白樱浴衣套装",
+          "category": "yukata",
+          "color": "lavender",
+          "material": "cotton",
+          "temp_c": [
+            16,
+            30
+          ],
+          "occasions": [
+            "out",
+            "onsen"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_09_mist_wool_coat": {
+      "kind": "single",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "雾银灰双排扣羊毛长款修身风衣大衣配深紫羊绒围巾",
+      "image_path": "shelf_09_mist_wool_coat.png",
+      "grants": [
+        {
+          "id": "shelf_mist_wool_coat",
+          "label": "雾银灰双排扣羊毛长款大衣配深紫围巾",
+          "category": "outer",
+          "color": "silver_grey",
+          "material": "wool",
+          "temp_c": [
+            2,
+            16
+          ],
+          "occasions": [
+            "out"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_10_camel_duffle_coat": {
+      "kind": "single",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "暖驼色牛角扣连帽呢子大衣",
+      "image_path": "shelf_10_camel_duffle_coat.png",
+      "grants": [
+        {
+          "id": "shelf_camel_duffle_coat",
+          "label": "暖驼色牛角扣连帽呢子大衣",
+          "category": "outer",
+          "color": "camel",
+          "material": "wool",
+          "temp_c": [
+            3,
+            17
+          ],
+          "occasions": [
+            "out"
+          ],
+          "like": 5
+        }
+      ]
+    },
+    "shelf_11_black_leather_jacket": {
+      "kind": "single",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "炭黑短款机车皮夹克",
+      "image_path": "shelf_11_black_leather_jacket.png",
+      "grants": [
+        {
+          "id": "shelf_black_moto_jacket",
+          "label": "炭黑短款银拉链机车皮夹克",
+          "category": "outer",
+          "color": "black",
+          "material": "leather",
+          "temp_c": [
+            8,
+            20
+          ],
+          "occasions": [
+            "out"
+          ],
+          "like": 4
+        }
+      ]
+    },
+    "shelf_12_ivory_fleece_cardigan": {
+      "kind": "single",
+      "shelf": "未分类",
+      "status": "active",
+      "owners": [
+        "*"
+      ],
+      "label": "奶白羊羔绒连帽拉链防风外套",
+      "image_path": "shelf_12_ivory_fleece_cardigan.png",
+      "grants": [
+        {
+          "id": "shelf_ivory_sherpa_jacket",
+          "label": "奶白羊羔绒连帽拉链外套",
+          "category": "outer",
+          "color": "ivory",
+          "material": "fleece",
+          "temp_c": [
+            5,
+            18
+          ],
+          "occasions": [
+            "home",
+            "out"
+          ],
+          "like": 5
+        }
+      ]
+    }
+  }
+}
