@@ -1461,8 +1461,19 @@ class HouseDaemon:
             out.update(self.model_router.status_view())
         return out
 
-    def get_usage_summary(self, *, days: int = 7) -> Dict[str, Any]:
-        return self.model_router.get_usage_summary(days=days, now=self.clock.now())
+    def get_usage_summary(
+        self,
+        *,
+        days: int = 7,
+        period: Optional[str] = None,
+        recent_limit: int = 30,
+    ) -> Dict[str, Any]:
+        return self.model_router.get_usage_summary(
+            days=days,
+            period=period,
+            recent_limit=recent_limit,
+            now=self.clock.now(),
+        )
 
     def _apply_llm_config(self, spec: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
         base_url = str(
@@ -2224,7 +2235,12 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     days = int((qs.get("days") or ["7"])[0])
                 except (TypeError, ValueError):
                     days = 7
-                self._send_json(daemon.get_usage_summary(days=days))
+                try:
+                    recent_limit = int((qs.get("recent_limit") or ["30"])[0])
+                except (TypeError, ValueError):
+                    recent_limit = 30
+                period = (qs.get("period") or [None])[0]
+                self._send_json(daemon.get_usage_summary(days=days, period=period, recent_limit=recent_limit))
                 return
             if parsed.path == "/api/state":
                 if not self._need(parsed, "read"):
