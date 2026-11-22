@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import http.client
 import http.server
 import io
 import json
+import os
+import socket
 import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -21,8 +26,9 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
 
 from ai_house import cli
 from ai_house.chat_agent import LLMAPIError, RoommateChatAgent
-from ai_house.daemon import HouseDaemon, OffsetWallClock
+from ai_house.daemon import HouseDaemon, OffsetWallClock, make_http_server
 from ai_house.memory import _openai_json_extractor
+from worldkernel import vocab_life1
 from worldkernel.store import VirtualClock
 
 JST = dt.timezone(dt.timedelta(hours=9))
@@ -377,6 +383,172 @@ class Stage0ModelCompatTests(unittest.TestCase):
         self.assertIn("[REDACTED]", live["detail"])
         self.assertNotIn(secret_key, live["detail"])
         self.assertNotIn("sk-mockLeak99887766", live["detail"])
+
+
+class Stage0CliAndHealthTests(unittest.TestCase):
+    def test_init_prints_abs_path_and_token_and_token_subcommand_reads_it(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env_path = Path(tmp.name) / ".env"
+        data_dir = Path(tmp.name) / "rt"
+
+        out_init = io.StringIO()
+        with contextlib.redirect_stdout(out_init):
+            rc_init = cli.main(["init", "--env-file", str(env_path), "--data-dir", str(data_dir)])
+        self.assertEqual(rc_init, 0)
+        init_txt = out_init.getvalue()
+        self.assertIn(str(env_path.resolve()), init_txt)
+        self.assertIn("AI_HOUSE_OWNER_TOKEN", init_txt)
+
+        env_lines = env_path.read_text(encoding="utf-8")
+        expected_tok = ""
+        for line in env_lines.splitlines():
+            if line.startswith("AI_HOUSE_OWNER_TOKEN="):
+                expected_tok = line.split("=", 1)[1].strip()
+                break
+        self.assertTrue(expected_tok)
+        self.assertIn(expected_tok, init_txt)
+
+        out_tok = io.StringIO()
+        with (
+            mock.patch.dict("os.environ", {"AI_HOUSE_OWNER_TOKEN": ""}, clear=False),
+            contextlib.redirect_stdout(out_tok),
+        ):
+            rc_tok = cli.main(["token", "--env-file", str(env_path)])
+        self.assertEqual(rc_tok, 0)
+        self.assertIn(str(env_path.resolve()), out_tok.getvalue())
+        self.assertIn(expected_tok, out_tok.getvalue())
+
+        out_json = io.StringIO()
+        with (
+            mock.patch.dict("os.environ", {"AI_HOUSE_OWNER_TOKEN": ""}, clear=False),
+            contextlib.redirect_stdout(out_json),
+        ):
+            rc_json = cli.main(["token", "--env-file", str(env_path), "--json"])
+        self.assertEqual(rc_json, 0)
+        doc = json.loads(out_json.getvalue())
+        self.assertTrue(doc["ok"])
+        self.assertEqual(doc["owner_token"], expected_tok)
+        self.assertEqual(doc["env_file"], str(env_path.resolve()))
+        self.assertEqual(doc["source"], "dotenv")
+
+        missing_env = Path(tmp.name) / "missing.env"
+        err_missing = io.StringIO()
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            contextlib.redirect_stderr(err_missing),
+        ):
+            rc_missing = cli.main(["token", "--env-file", str(missing_env)])
+        self.assertEqual(rc_missing, 1)
+        self.assertIn("AI_HOUSE_OWNER_TOKEN", err_missing.getvalue())
+
+    def test_pack_aliases_life1_and_missing_pack_lists_available(self):
+        v1 = vocab_life1.load_pack("life1")
+        v2 = vocab_life1.load_pack("default")
+        self.assertEqual(v1.MANIFEST.get("profile"), v2.MANIFEST.get("profile"))
+        self.assertTrue(v1.ROSTER)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env_path = Path(tmp.name) / "life1.env"
+        data_dir = Path(tmp.name) / "rt"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["init", "--pack", "life1", "--env-file", str(env_path), "--data-dir", str(data_dir)])
+        self.assertEqual(rc, 0)
+        self.assertIn("AI_HOUSE_PACK_DIR=life1", env_path.read_text(encoding="utf-8"))
+
+        with self.assertRaises(FileNotFoundError) as ctx:
+            vocab_life1.load_pack("missing-pack-xyz")
+        msg = str(ctx.exception)
+        self.assertIn("life1", msg)
+        self.assertIn("indie-studio-3", msg)
+
+    def test_up_port_in_use_friendly_error_and_subcommand_help(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        self.addCleanup(sock.close)
+        busy_port = sock.getsockname()[1]
+
+        missing_env = Path(tmp.name) / "none.env"
+        data_dir = Path(tmp.name) / "rt"
+        err_buf = io.StringIO()
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"AI_HOUSE_OWNER_TOKEN": "", "AI_HOUSE_PACK_DIR": "", "AI_HOUSE_HOST": "", "AI_HOUSE_PORT": ""},
+                clear=False,
+            ),
+            contextlib.redirect_stderr(err_buf),
+        ):
+            rc = cli.main([
+                "up",
+                "--host", "127.0.0.1",
+                "--port", str(busy_port),
+                "--data-dir", str(data_dir),
+                "--env-file", str(missing_env),
+            ])
+        self.assertEqual(rc, 2)
+        self.assertIn("已被占用", err_buf.getvalue())
+
+        for subcmd in ("up", "init", "token", "doctor", "plugins", "pack-check"):
+            help_buf = io.StringIO()
+            with (
+                contextlib.redirect_stdout(help_buf),
+                self.assertRaises(SystemExit) as sysexit,
+            ):
+                cli.main([subcmd, "--help"])
+            self.assertEqual(sysexit.exception.code, 0)
+            help_txt = help_buf.getvalue()
+            has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in help_txt)
+            self.assertTrue(has_cjk, f"missing Chinese help text for {subcmd}")
+
+    def test_health_endpoint_unauthenticated_and_loopback_host_guarded(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        d_auth = HouseDaemon(
+            Path(tmp.name) / "rt_auth",
+            allow_onboarding=True,
+            env={"AI_HOUSE_OWNER_TOKEN": "tok-health-test-123456"},
+        )
+        self.addCleanup(d_auth.close)
+        srv_auth = make_http_server(d_auth, host="127.0.0.1", port=0)
+        self.addCleanup(srv_auth.server_close)
+        self.addCleanup(srv_auth.shutdown)
+        threading.Thread(target=srv_auth.serve_forever, daemon=True).start()
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{srv_auth.server_port}/api/health", timeout=3) as r:
+            self.assertEqual(r.status, 200)
+            h = json.loads(r.read().decode("utf-8"))
+        self.assertTrue(h["ok"])
+        self.assertEqual(h["service"], "ai-house")
+        self.assertTrue(h["needs_onboarding"])
+
+        with self.assertRaises(urllib.error.HTTPError) as unauth:
+            urllib.request.urlopen(f"http://127.0.0.1:{srv_auth.server_port}/api/state", timeout=3)
+        self.assertEqual(unauth.exception.code, 401)
+        unauth.exception.close()
+
+        d_open = HouseDaemon(Path(tmp.name) / "rt_open", allow_onboarding=True, env={})
+        self.addCleanup(d_open.close)
+        srv_open = make_http_server(d_open, host="127.0.0.1", port=0)
+        self.addCleanup(srv_open.server_close)
+        self.addCleanup(srv_open.shutdown)
+        threading.Thread(target=srv_open.serve_forever, daemon=True).start()
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{srv_open.server_port}/api/health", timeout=3) as r2:
+            self.assertEqual(r2.status, 200)
+
+        conn = http.client.HTTPConnection("127.0.0.1", srv_open.server_port, timeout=3)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/api/health", headers={"Host": "evil.example.com"})
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 403)
 
 
 if __name__ == "__main__":

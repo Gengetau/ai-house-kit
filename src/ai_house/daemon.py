@@ -29,6 +29,7 @@ from worldkernel.intents_lite import IntentsLite
 from worldkernel.life_model import FakeLifeModel, LiveLifeModel
 from worldkernel.store import VirtualClock, WallClock
 
+from . import __version__
 from .auth import AuthPolicy, check_bind, host_is_loopback, mcp_tier, origin_is_loopback, tier_for_channel
 from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_compatible_chat
 from .chat_guard import ReplyGuard
@@ -1546,6 +1547,14 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 self.end_headers()
                 self.wfile.write(raw)
                 return
+            if parsed.path == "/api/health":
+                self._send_json({
+                    "ok": True,
+                    "service": "ai-house",
+                    "version": __version__,
+                    "needs_onboarding": bool(daemon.needs_onboarding),
+                })
+                return
             if parsed.path == "/api/chat/roster":
                 # Names only (no state, no messages): any valid token may ask, so a private-tier token can pick a roommate.
                 if not policy.authenticated(self._token(parsed)):
@@ -1827,4 +1836,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
 
-    return ThreadingHTTPServer((host, int(port)), Handler)
+    class _HouseHTTPServer(ThreadingHTTPServer):
+        # POSIX needs SO_REUSEADDR to rebind past TIME_WAIT; on WinSock SO_REUSEADDR allows
+        # two active listeners to double-bind the same port silently instead of raising 10048.
+        allow_reuse_address = os.name != "nt"
+
+    return _HouseHTTPServer((host, int(port)), Handler)

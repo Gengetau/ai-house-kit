@@ -640,7 +640,7 @@ def load_pack(pack_dir=None):
     """Load any life1-compatible WorldPack directory into a self-contained vocabulary namespace."""
     from types import SimpleNamespace
     raw = str(pack_dir).strip() if pack_dir else os.environ.get("AI_HOUSE_PACK_DIR", "").strip()
-    if not raw:
+    if not raw or raw.lower() in ("life1", "sakuraoka", "default"):
         pdir = DIR
     else:
         pdir = Path(raw)
@@ -658,7 +658,26 @@ def load_pack(pack_dir=None):
             if found is not None:
                 pdir = found
     if not pdir.exists():
-        raise FileNotFoundError(f"WorldPack directory not found: {pdir}")
+        avail = ["life1"]
+        search_roots = [
+            Path.cwd() / "packs",
+            Path(__file__).resolve().parents[2] / "src" / "ai_house" / "bundled_packs",
+        ]
+        try:
+            import importlib.resources as _res
+            search_roots.append(Path(str(_res.files("ai_house") / "bundled_packs")))
+        except Exception:
+            pass
+        found_extra = []
+        for root in search_roots:
+            if root.is_dir():
+                for sub in root.iterdir():
+                    if sub.is_dir() and (sub / "manifest.json").is_file() and sub.name not in avail:
+                        found_extra.append(sub.name)
+        avail.extend(sorted(set(found_extra)))
+        raise FileNotFoundError(
+            f"WorldPack directory not found: {pdir} (available built-in packs: {', '.join(avail)})"
+        )
 
     def read_json(stem, default=None):
         fp = pdir / f"{stem}.json"
