@@ -267,8 +267,10 @@ export async function render(view, route, ctx){
     return el('section', {class: 'card mt'},
       el('div', {class: 'chead'},
         el('h2', {}, icon('sparkle'), '大模型 API 接入配置'),
-        el('span', {class: 'chip ' + (state.llm_mode === 'live_api' ? 'ok' : '')},
-          state.llm_mode === 'live_api' ? `在线：${state.model_name}` : '当前：零密钥离线演示')),
+        el('div', {class: 'acts'},
+          el('a', {class: 'btn sm', href: '#/usage'}, icon('activity'), '用量账本'),
+          el('span', {class: 'chip ' + (state.llm_mode === 'live_api' ? 'ok' : '')},
+            state.llm_mode === 'live_api' ? `在线：${state.model_name}` : '当前：零密钥离线演示'))),
       llmForm);
   }
 
@@ -311,6 +313,7 @@ export async function render(view, route, ctx){
                 onclick: () => { ctx?.setTheme?.(k); draw(); },
               }, icon(ic), lb))),
           el('div', {class: 'row wrap', style: 'gap:8px'},
+            el('a', {class: 'btn sm', href: '#/usage'}, icon('activity'), '模型用量账本'),
             el('a', {class: 'btn sm', href: '/chat', target: '_blank', rel: 'noopener'}, icon('msg'), '独立聊天页 (/chat)'),
             el('button', {type: 'button', class: 'btn sm danger', onclick: () => ctx?.logout?.()}, icon('lock'), '锁门并清除当前钥匙')))),
 

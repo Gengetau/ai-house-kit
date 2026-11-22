@@ -3,7 +3,7 @@ import {$, el, put, api, icon, toast, go, leaveOk, setDirty, setLogoutHandler, s
   ava, currentActor, setCurrentActor, hasTier, isPrivateOnly, isOnboarding, setOnboarding, store, LoginNeeded} from './core.js';
 import {RESIDENTS, byActor, setResidentsFromState, setResidentsFromRoster} from './residents.js';
 
-const PAGES = {home: 'home', house: 'house', people: 'people', days: 'days', keep: 'keep', ops: 'ops', settings: 'settings', setup: 'setup'};
+const PAGES = {home: 'home', house: 'house', people: 'people', days: 'days', keep: 'keep', ops: 'ops', usage: 'usage', settings: 'settings', setup: 'setup'};
 const PEOPLE_TABS = [['now', '此刻', 'sun'], ['wardrobe', '衣柜', 'box'], ['profile', '档案', 'book'], ['chat', '对话', 'msg']];
 const THEMES = [['light', '浅色', 'sun'], ['dark', '深色', 'moon'], ['auto', '自动', 'sun']];
 
@@ -92,6 +92,7 @@ function drawNav(){
       whos,
       !privOnly ? navBtn(['days', '日子', 'calendar', '#/days'], page === 'days') : null,
       !privOnly ? navBtn(['keep', '珍藏', 'bookOpen', '#/keep'], page === 'keep') : null,
+      !privOnly ? navBtn(['usage', '用量', 'activity', '#/usage'], page === 'usage') : null,
       !privOnly ? navBtn(['ops', '管家', 'gear', '#/ops'], page === 'ops') : null,
       hasTier('owner') && !privOnly ? navBtn(['settings', '插件设置', 'shield', '#/settings'], page === 'settings') : null,
     ],
@@ -120,7 +121,7 @@ function drawNav(){
         ].map(([k, label, ic, hash, sheet]) =>
           el('button', {
             type: 'button',
-            class: ((k === 'home' && isHome) || (k === 'admin' && page === 'ops') || page === k) ? 'on' : '',
+            class: ((k === 'home' && isHome) || (k === 'admin' && (page === 'ops' || page === 'usage' || page === 'settings')) || page === k) ? 'on' : '',
             'aria-label': label,
             onclick: () => sheet ? openSheet(sheet) : (closeAll(), go(hash)),
           }, icon(ic), el('span', {}, label))));
@@ -158,6 +159,7 @@ function openSheet(which){
       !isPrivateOnly() ? [
         el('div', {class: 'nav-sec'}, '管家'),
         navBtn(['ops', '控制与 MCP', 'gear', '#/ops'], page === 'ops'),
+        navBtn(['usage', '模型用量账本', 'activity', '#/usage'], page === 'usage'),
         hasTier('owner') ? navBtn(['settings', '插件配置中心', 'shield', '#/settings'], page === 'settings') : null,
         navBtn(['house', '走进像素小屋', 'home', '#/house'], page === 'house'),
       ] : null,

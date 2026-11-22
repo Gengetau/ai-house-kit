@@ -619,19 +619,51 @@ class ModelRouter:
                     ),
                 )
 
-    def get_usage_summary(self, *, days: int = 7, now: Optional[float] = None) -> Dict[str, Any]:
-        """Aggregate LLM calls and tokens from `usage.db` across the trailing `days` window."""
-        clean_days = max(1, min(int(days or 7), 90))
+    def get_usage_summary(
+        self,
+        *,
+        days: int = 7,
+        period: Optional[str] = None,
+        recent_limit: int = 30,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Aggregate LLM calls and tokens from `usage.db` across a trailing window or named period."""
         ref_ts = float(now) if now is not None else self._now()
-        cutoff = ref_ts - clean_days * 86400.0
+        clean_period = str(period or "").strip().lower() or None
+        clean_recent = max(1, min(int(recent_limit or 30), 200))
+        if clean_period == "today":
+            today_jst = dt.datetime.fromtimestamp(ref_ts, JST).date().isoformat()
+            where_sql = "day_jst=?"
+            where_arg: Any = today_jst
+            clean_days = 1
+        elif clean_period == "all":
+            where_sql = "ts>=?"
+            where_arg = 0.0
+            clean_days = 90
+        elif clean_period == "30d":
+            where_sql = "ts>=?"
+            where_arg = ref_ts - 30 * 86400.0
+            clean_days = 30
+        elif clean_period == "7d":
+            where_sql = "ts>=?"
+            where_arg = ref_ts - 7 * 86400.0
+            clean_days = 7
+        else:
+            clean_days = max(1, min(int(days or 7), 90))
+            where_sql = "ts>=?"
+            where_arg = ref_ts - clean_days * 86400.0
+            clean_period = f"{clean_days}d"
+
         empty = {
             "ok": True,
             "days": clean_days,
+            "period": clean_period,
             "totals": {"calls": 0, "ok_calls": 0, "failed_calls": 0, "fallback_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "by_day": [],
             "by_purpose": [],
             "by_actor": [],
             "by_model": [],
+            "recent": [],
         }
         if self._usage_db is None or not self._usage_db.is_file():
             return empty
@@ -642,45 +674,68 @@ class ModelRouter:
                 "SELECT COUNT(*) AS calls, SUM(ok) AS ok_calls, SUM(1 - ok) AS failed_calls, "
                 "SUM(fallback_used) AS fallback_calls, COALESCE(SUM(prompt_tokens), 0) AS pt, "
                 "COALESCE(SUM(completion_tokens), 0) AS ct, COALESCE(SUM(total_tokens), 0) AS tt "
-                "FROM llm_usage WHERE ts>=?",
-                (cutoff,),
+                f"FROM llm_usage WHERE {where_sql}",
+                (where_arg,),
             ).fetchone()
             by_day = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT day_jst AS day, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
-                    "FROM llm_usage WHERE ts>=? GROUP BY day_jst ORDER BY day_jst DESC",
-                    (cutoff,),
+                    "SELECT day_jst AS day, COUNT(*) AS calls, COALESCE(SUM(1 - ok), 0) AS failed_calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                    "COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    f"FROM llm_usage WHERE {where_sql} GROUP BY day_jst ORDER BY day_jst DESC",
+                    (where_arg,),
                 ).fetchall()
             ]
             by_purpose = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT purpose, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
-                    "FROM llm_usage WHERE ts>=? GROUP BY purpose ORDER BY total_tokens DESC, purpose ASC",
-                    (cutoff,),
+                    "SELECT purpose, COUNT(*) AS calls, COALESCE(SUM(1 - ok), 0) AS failed_calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                    "COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    f"FROM llm_usage WHERE {where_sql} GROUP BY purpose ORDER BY total_tokens DESC, purpose ASC",
+                    (where_arg,),
                 ).fetchall()
             ]
             by_actor = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT actor, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
-                    "FROM llm_usage WHERE ts>=? AND actor!='' GROUP BY actor ORDER BY total_tokens DESC, actor ASC",
-                    (cutoff,),
+                    "SELECT actor, COUNT(*) AS calls, COALESCE(SUM(1 - ok), 0) AS failed_calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                    "COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    f"FROM llm_usage WHERE {where_sql} AND actor!='' GROUP BY actor ORDER BY total_tokens DESC, actor ASC",
+                    (where_arg,),
                 ).fetchall()
             ]
             by_model = [
                 dict(r)
                 for r in c.execute(
-                    "SELECT model, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
-                    "FROM llm_usage WHERE ts>=? GROUP BY model ORDER BY total_tokens DESC, model ASC",
-                    (cutoff,),
+                    "SELECT model, MAX(base_url_host) AS base_url_host, COUNT(*) AS calls, "
+                    "COALESCE(SUM(1 - ok), 0) AS failed_calls, "
+                    "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+                    "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                    "COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    f"FROM llm_usage WHERE {where_sql} GROUP BY model ORDER BY total_tokens DESC, model ASC",
+                    (where_arg,),
+                ).fetchall()
+            ]
+            recent = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT ts, day_jst, purpose, actor, model, base_url_host, "
+                    "prompt_tokens, completion_tokens, total_tokens, latency_ms, ok, fallback_used, error_code "
+                    f"FROM llm_usage WHERE {where_sql} ORDER BY ts DESC, id DESC LIMIT ?",
+                    (where_arg, clean_recent),
                 ).fetchall()
             ]
 
         return {
             "ok": True,
             "days": clean_days,
+            "period": clean_period,
             "totals": {
                 "calls": int(tot["calls"] or 0),
                 "ok_calls": int(tot["ok_calls"] or 0),
@@ -694,6 +749,7 @@ class ModelRouter:
             "by_purpose": by_purpose,
             "by_actor": by_actor,
             "by_model": by_model,
+            "recent": recent,
         }
 
     def _call_single_endpoint(
