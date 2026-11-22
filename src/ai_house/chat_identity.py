@@ -11,6 +11,9 @@ from dataclasses import dataclass
 
 OWNER = "owner"
 MEMBER = "member"
+RESIDENT = "resident"
+VISITOR = "visitor"
+BOT = "bot"
 
 _NAME_BAD = re.compile(r"[\[\]|<>{}`【】［］｜\r\n\t]")
 _NAME_TAGS = re.compile(r"管理员|房主|主人|室友|系统|已验证|\bowner\b|\badmin\b|\bbot\b|\bsystem\b", re.I)
@@ -35,15 +38,26 @@ class Speaker:
     role: str
     name: str
     uid: str = ""
+    identity_id: str = ""
 
     @property
     def is_owner(self) -> bool:
         return self.role == OWNER
 
     @property
+    def is_bot(self) -> bool:
+        return self.role == BOT
+
+    @property
     def label(self) -> str:
         """How the roommate's prompt refers to this person."""
-        return "房主" if self.is_owner else f"群友「{self.name}」"
+        if self.is_owner:
+            return "房主"
+        if self.is_bot:
+            return f"其他机器人「{self.name}」"
+        if self.role == RESIDENT:
+            return f"室友「{self.name}」"
+        return f"群友「{self.name}」"
 
 
 def one_line(text: object) -> str:
@@ -58,10 +72,15 @@ def quote_untrusted(text: object) -> str:
     return t.replace("刚刚说：", "刚刚说:").replace("房主:", "房主 :").replace("房主：", "房主 :")
 
 
-def owner_speaker(name: object = "房主", uid: str = "") -> Speaker:
+def owner_speaker(name: object = "房主", uid: str = "", identity_id: str = "user:owner") -> Speaker:
     n = str(name or "").strip()
-    return Speaker(OWNER, "房主" if n in ("", "房主") else clean_name(n, "房主"), str(uid or ""))
+    return Speaker(OWNER, "房主" if n in ("", "房主") else clean_name(n, "房主"), str(uid or ""), str(identity_id or "user:owner"))
 
 
-def member_speaker(name: object, uid: str = "") -> Speaker:
-    return Speaker(MEMBER, clean_name(name), str(uid or ""))
+def member_speaker(name: object, uid: str = "", identity_id: str = "") -> Speaker:
+    return Speaker(MEMBER, clean_name(name), str(uid or ""), str(identity_id or ""))
+
+
+def bot_speaker(name: object = "机器人", uid: str = "", identity_id: str = "") -> Speaker:
+    n = str(name or "").strip()
+    return Speaker(BOT, "机器人" if n in ("", "机器人") else clean_name(n, "机器人"), str(uid or ""), str(identity_id or ""))
