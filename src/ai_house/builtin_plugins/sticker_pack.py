@@ -1,9 +1,9 @@
 """Built-in demo tool plugin: safe roommate mood stickers (`pick_mood_sticker`)."""
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from ..plugin_api import ConfigField, PluginDefinition, PluginManifest, ToolRegistration
+from ..plugin_api import ConfigField, PluginDefinition, PluginManifest, ToolContext, ToolRegistration
 
 STICKERS: Dict[str, Dict[str, str]] = {
     "happy": {"emoji": "😊", "label": "开心比耶"},
@@ -16,10 +16,12 @@ STICKERS: Dict[str, Dict[str, str]] = {
 }
 
 
-def pick_mood_sticker(mood: str = "happy") -> Dict[str, Any]:
-    key = str(mood or "happy").strip().lower()
-    spec = STICKERS.get(key) or STICKERS["happy"]
-    return {"ok": True, "mood": key if key in STICKERS else "happy", **spec, "tag": f"[{spec['emoji']} {spec['label']}]"}
+def pick_mood_sticker(mood: str = "", ctx: Optional[ToolContext] = None) -> Dict[str, Any]:
+    fallback = str((ctx.plugin_config or {}).get("default_mood") or "happy").strip().lower() if ctx is not None else "happy"
+    key = str(mood or "").strip().lower() or fallback
+    spec = STICKERS.get(key) or STICKERS.get(fallback) or STICKERS["happy"]
+    chosen = key if key in STICKERS else (fallback if fallback in STICKERS else "happy")
+    return {"ok": True, "mood": chosen, **spec, "tag": f"[{spec['emoji']} {spec['label']}]"}
 
 
 TOOL_SPEC = {

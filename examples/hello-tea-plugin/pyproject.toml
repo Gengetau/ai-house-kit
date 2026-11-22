@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-house-hello-tea-plugin"
+version = "0.1.0"
+description = "Example zero-dependency third-party plugin for ai-house-kit (config, HTTP route, periodic task, context tool)."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."ai_house.plugins"]
+hello_tea = "hello_tea_plugin:PLUGIN_DEF"

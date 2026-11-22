@@ -20,7 +20,7 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 from worldkernel import avatar, inventory, legacy, statuscard, vocab_life1, wardrobeview
@@ -50,7 +50,15 @@ from .onboarding import (
     upsert_dotenv_vars,
     write_custom_pack,
 )
-from .plugin_api import PluginRegistry
+from .plugin_api import (
+    PluginDefinition,
+    PluginRegistry,
+    PluginRequestContext,
+    PluginRoute,
+    PluginTaskContext,
+    ToolContext,
+    invoke_tool_handler,
+)
 from .settings_store import SettingsStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
@@ -163,6 +171,7 @@ class HouseDaemon:
         self._plugin_runtime_errors: List[Dict[str, str]] = []
         self._managed_plugin_extensions: List[Any] = []
         self._managed_plugin_ext_map: Dict[str, Any] = {}
+        self._plugin_task_last_run: Dict[tuple[str, str], float] = {}
         self._active_channel_ids: set[str] = set()
         self._active_tools = self.registry.active_tools(self.env, stored_plugins=stored_plugins)
         self.providers = [inst for _, inst in self.registry.active_providers(self.env, stored_plugins=stored_plugins)]
@@ -415,6 +424,41 @@ class HouseDaemon:
                         self.diary.save_generated(job, text, mode, now)
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
+            self._run_plugin_tasks(now)
+
+    def _run_plugin_tasks(self, now: float) -> None:
+        stored_plugins = self.settings_store.get_plugins_map()
+        tasks = self.registry.active_tasks(self.env, stored_plugins=stored_plugins)
+        for defn, task in tasks:
+            key = (defn.plugin_id, task.task_id)
+            last = self._plugin_task_last_run.get(key)
+            if last is not None and (now - last) < float(task.interval_s):
+                continue
+            self._plugin_task_last_run[key] = now
+            cfg = self.registry.resolve_config(defn.plugin_id, env=self.env, stored_plugins=stored_plugins)
+            tctx = PluginTaskContext(
+                plugin_id=defn.plugin_id,
+                task_id=task.task_id,
+                now=now,
+                plugin_config=cfg,
+                daemon=self,
+            )
+            try:
+                if task.run_outside_lock:
+                    task.handler(tctx)
+                else:
+                    with self._lock:
+                        task.handler(tctx)
+            except Exception as exc:  # noqa: BLE001
+                err = {
+                    "plugin_id": defn.plugin_id,
+                    "group": "ai_house.tasks",
+                    "error": mask_secrets(f"{task.task_id}: {type(exc).__name__}: {exc}"),
+                }
+                with self._lock:
+                    if err not in self._plugin_runtime_errors:
+                        self._plugin_runtime_errors.append(err)
+                self.log(f"plugin task {defn.plugin_id}.{task.task_id} skipped: {err['error']}")
 
     def step_once(self) -> Dict[str, Any]:
         with self._lock:
@@ -785,17 +829,38 @@ class HouseDaemon:
                         intent_obj["qty"] = max(1, min(3, int(targs.get("qty") or 1)))
                         intent_obj["kind"] = "errand"
                     return {"recorded": True, "intent": intent_obj}
-                if tname == "browse_bookshelf":
-                    return {"notes": nook.recent_notes() if nook is not None else []}
                 spec_entry = self._active_tools.get(tname) or next(
                     (v for v in self._active_tools.values() if v["spec"].get("name") == tname),
                     None,
                 )
-                if spec_entry and callable(spec_entry.get("fn")):
-                    try:
-                        return dict(spec_entry["fn"](**targs))
-                    except Exception as exc:  # noqa: BLE001
-                        return {"error": f"{type(exc).__name__}: {exc}"}
+                if spec_entry:
+                    reg = spec_entry.get("registration")
+                    pid = str(spec_entry.get("plugin_id") or "")
+                    if reg is not None and callable(reg.handler):
+                        try:
+                            stored_plugins = self.settings_store.get_plugins_map()
+                            plug_cfg = (
+                                self.registry.resolve_config(pid, env=self.env, stored_plugins=stored_plugins)
+                                if pid in self.registry.definitions
+                                else {}
+                            )
+                            tctx = ToolContext(
+                                actor=_aid,
+                                scope=scope,
+                                channel=channel,
+                                speaker=speaker,
+                                now=now,
+                                plugin_config=plug_cfg,
+                                daemon=self,
+                            )
+                            return invoke_tool_handler(reg, targs, tctx)
+                        except Exception as exc:  # noqa: BLE001
+                            return {"error": mask_secrets(f"{type(exc).__name__}: {exc}")}
+                    if callable(spec_entry.get("fn")):
+                        try:
+                            return dict(spec_entry["fn"](**targs))
+                        except Exception as exc:  # noqa: BLE001
+                            return {"error": mask_secrets(f"{type(exc).__name__}: {exc}")}
                 return {"error": f"unknown_tool:{tname}"}
 
             rep = self.chat_agent.reply_as(
@@ -1526,6 +1591,7 @@ class HouseDaemon:
 
             if hasattr(self.clock, "reset"):
                 self.clock.reset()
+            self._plugin_task_last_run.clear()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():
@@ -1538,6 +1604,39 @@ class HouseDaemon:
 
         self._broadcast("state", {"now": snap["now_jst"], "needs_onboarding": True})
         return {"ok": True, "needs_onboarding": True, "state": snap}
+
+    def find_plugin_route(self, method: str, path: str) -> Optional[tuple[PluginDefinition, PluginRoute]]:
+        stored_plugins = self.settings_store.get_plugins_map()
+        routes = self.registry.active_routes(self.env, stored_plugins=stored_plugins)
+        clean_path = "/" + str(path or "").strip().lstrip("/")
+        if clean_path != "/" and clean_path.endswith("/"):
+            clean_path = clean_path.rstrip("/")
+        return routes.get((str(method or "GET").upper(), clean_path))
+
+    def execute_plugin_route(
+        self,
+        defn: PluginDefinition,
+        route: PluginRoute,
+        *,
+        method: str,
+        path: str,
+        query: Dict[str, List[str]],
+        body: Any,
+    ) -> Dict[str, Any]:
+        stored_plugins = self.settings_store.get_plugins_map()
+        cfg = self.registry.resolve_config(defn.plugin_id, env=self.env, stored_plugins=stored_plugins)
+        ctx = PluginRequestContext(
+            plugin_id=defn.plugin_id,
+            method=str(method or "GET").upper(),
+            path=path,
+            query=dict(query or {}),
+            body=body,
+            plugin_config=cfg,
+            daemon=self,
+            now=self.clock.now(),
+        )
+        res = route.handler(ctx)
+        return dict(res) if isinstance(res, Mapping) else {"ok": True, "result": res}
 
     def handle_mcp_rpc(self, body: Dict[str, Any]) -> Dict[str, Any]:
         req_id = body.get("id")
@@ -1919,20 +2018,55 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     if q in daemon._sse_clients:
                         daemon._sse_clients.remove(q)
                 return
+            if parsed.path.startswith("/api/plugins/"):
+                plug_hit = daemon.find_plugin_route("GET", parsed.path)
+                if plug_hit is None:
+                    self._send_json({"error": "not_found"}, status=404)
+                    return
+                defn, plug_route = plug_hit
+                if plug_route.tier != "public" and not self._need(parsed, plug_route.tier):
+                    return
+                try:
+                    self._send_json(daemon.execute_plugin_route(
+                        defn, plug_route, method="GET", path=parsed.path, query=parse_qs(parsed.query), body=None,
+                    ))
+                except ValueError as exc:
+                    self._send_json({"ok": False, "error": mask_secrets(str(exc))}, status=400)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"ok": False, "error": mask_secrets(f"{type(exc).__name__}: {exc}")}, status=500)
+                return
             self._send_json({"error": "not_found"}, status=404)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             if not self._pre(True):
                 return
+            plug_hit = daemon.find_plugin_route("POST", parsed.path) if parsed.path.startswith("/api/plugins/") else None
+            is_public_plugin = plug_hit is not None and plug_hit[1].tier == "public"
             # 先确认令牌有效，再读请求体；具体档位要看请求内容，读完后再判。
-            if not policy.authenticated(self._token(parsed)):
+            if not is_public_plugin and not policy.authenticated(self._token(parsed)):
                 self._deny(401, "unauthorized")
                 return
             try:
                 body = self._read_json()
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            if parsed.path.startswith("/api/plugins/"):
+                if plug_hit is None:
+                    self._send_json({"error": "not_found"}, status=404)
+                    return
+                defn, plug_route = plug_hit
+                if plug_route.tier != "public" and not self._need(parsed, plug_route.tier):
+                    return
+                try:
+                    self._send_json(daemon.execute_plugin_route(
+                        defn, plug_route, method="POST", path=parsed.path, query=parse_qs(parsed.query), body=body,
+                    ))
+                except ValueError as exc:
+                    self._send_json({"ok": False, "error": mask_secrets(str(exc))}, status=400)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"ok": False, "error": mask_secrets(f"{type(exc).__name__}: {exc}")}, status=500)
                 return
             if parsed.path in (
                 "/api/setup",
