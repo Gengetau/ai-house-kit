@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ..plugin_api import ConfigField, LifeExtension, PluginDefinition, PluginManifest, ToolRegistration
+from ..plugin_api import ConfigField, LifeExtension, PluginDefinition, PluginManifest, ToolContext, ToolRegistration
 
 _BOOK_TOPICS = (
     "《海边小站气象手记》：记着晴空都北环线的旧车站故事",
@@ -72,6 +72,12 @@ class BookNookExtension(LifeExtension):
         return list(self.life.get("book_nook:notes") or [])
 
 
+def browse_bookshelf(ctx: ToolContext) -> Dict[str, Any]:
+    """Context-aware chat tool handler returning recent living-room bookshelf notes."""
+    nook = ctx.daemon._book_nook() if ctx.daemon is not None and hasattr(ctx.daemon, "_book_nook") else None
+    return {"notes": nook.recent_notes() if nook is not None else []}
+
+
 TOOL_SPEC = {
     "name": "browse_bookshelf",
     "description": "翻看合租屋客厅书架上大家留下的公开读书便签。",
@@ -101,5 +107,5 @@ PLUGIN_DEF = PluginDefinition(
         ),
     ),
     extension_factory=BookNookExtension.from_env,
-    tools=(ToolRegistration(spec=TOOL_SPEC, handler=None, plugin_id="book_nook"),),
+    tools=(ToolRegistration(spec=TOOL_SPEC, handler=browse_bookshelf, plugin_id="book_nook", takes_context=True),),
 )

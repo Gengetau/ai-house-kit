@@ -202,6 +202,120 @@ class ToolRegistration:
 
 
 @dataclass(frozen=True)
+class ToolContext:
+    """Contextual metadata passed to context-aware plugin chat tools."""
+
+    actor: str
+    scope: str
+    channel: str
+    speaker: Any
+    now: float
+    plugin_config: Mapping[str, Any] = field(default_factory=dict)
+    daemon: Any = None
+
+
+@dataclass(frozen=True)
+class PluginRequestContext:
+    """Request context passed to plugin-registered HTTP endpoints under `/api/plugins/<plugin_id>/...`."""
+
+    plugin_id: str
+    method: str
+    path: str
+    query: Dict[str, List[str]]
+    body: Any
+    plugin_config: Mapping[str, Any] = field(default_factory=dict)
+    daemon: Any = None
+    now: float = 0.0
+
+
+@dataclass(frozen=True)
+class PluginRoute:
+    """Declarative HTTP route registered by a plugin under `/api/plugins/<plugin_id>/<subpath>`."""
+
+    method: str
+    subpath: str
+    handler: Callable[[PluginRequestContext], Any]
+    tier: str = "read"
+
+    def __post_init__(self) -> None:
+        m = str(self.method or "GET").strip().upper()
+        if m not in ("GET", "POST"):
+            raise ValueError(f"Unsupported PluginRoute method {self.method!r}")
+        raw_sub = "/" + str(self.subpath or "").strip().lstrip("/")
+        if ".." in raw_sub or "\\" in raw_sub or "\x00" in raw_sub:
+            raise ValueError(f"Unsafe PluginRoute subpath {self.subpath!r}")
+        if raw_sub != "/" and raw_sub.endswith("/"):
+            raw_sub = raw_sub.rstrip("/")
+        tier = str(self.tier or "read").strip().lower()
+        if tier not in ("public", "read", "write", "private", "owner"):
+            raise ValueError(f"Unsupported PluginRoute tier {self.tier!r}")
+        object.__setattr__(self, "method", m)
+        object.__setattr__(self, "subpath", raw_sub)
+        object.__setattr__(self, "tier", tier)
+
+
+@dataclass(frozen=True)
+class PluginTaskContext:
+    """Execution context passed to plugin background periodic tasks."""
+
+    plugin_id: str
+    task_id: str
+    now: float
+    plugin_config: Mapping[str, Any] = field(default_factory=dict)
+    daemon: Any = None
+
+
+@dataclass(frozen=True)
+class PluginTask:
+    """Declarative periodic background job dispatched during post-step cycles."""
+
+    task_id: str
+    interval_s: float
+    handler: Callable[[PluginTaskContext], None]
+    run_outside_lock: bool = True
+
+    def __post_init__(self) -> None:
+        tid = str(self.task_id or "").strip()
+        if not tid:
+            raise ValueError("PluginTask task_id must not be empty")
+        iv = float(self.interval_s)
+        if not math.isfinite(iv) or iv <= 0:
+            raise ValueError(f"PluginTask interval_s must be positive, got {self.interval_s!r}")
+        object.__setattr__(self, "task_id", tid)
+        object.__setattr__(self, "interval_s", iv)
+
+
+def invoke_tool_handler(
+    reg: ToolRegistration,
+    args: Mapping[str, Any],
+    ctx: ToolContext,
+) -> Dict[str, Any]:
+    """Execute a registered tool handler, injecting `ctx` / `context` when requested."""
+    fn = reg.handler
+    if not callable(fn):
+        return {"error": f"tool_not_callable:{reg.name}"}
+    clean_args = dict(args or {})
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+    except (TypeError, ValueError):
+        params = {}
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if "ctx" in params or (reg.takes_context and has_varkw):
+        clean_args["ctx"] = ctx
+    elif "context" in params:
+        clean_args["context"] = ctx
+    elif reg.takes_context and params:
+        first_name = next(iter(params.keys()))
+        if first_name not in clean_args:
+            return dict(fn(ctx, **clean_args))
+    if not has_varkw and params:
+        allowed = set(params.keys())
+        clean_args = {k: v for k, v in clean_args.items() if k in allowed}
+    return dict(fn(**clean_args))
+
+
+@dataclass(frozen=True)
 class PluginLoadErrorRecord:
     """Captured discovery/instantiation failure for an isolated plugin."""
 
@@ -282,8 +396,8 @@ class PluginDefinition:
     extension_factory: Optional[Callable[..., Optional[Any]]] = None
     provider_factory: Optional[Callable[..., Optional[StudioProvider]]] = None
     tools: Tuple[ToolRegistration, ...] = ()
-    routes: Tuple[Any, ...] = ()
-    tasks: Tuple[Any, ...] = ()
+    routes: Tuple[PluginRoute, ...] = ()
+    tasks: Tuple[PluginTask, ...] = ()
     source: str = "builtin"
 
     @property
@@ -770,6 +884,30 @@ class PluginRegistry:
                     "registration": tr,
                     "plugin_id": defn.plugin_id,
                 }
+        return out
+
+    def active_routes(
+        self,
+        env: Optional[Mapping[str, str]] = None,
+        stored_plugins: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[Tuple[str, str], Tuple[PluginDefinition, PluginRoute]]:
+        out: Dict[Tuple[str, str], Tuple[PluginDefinition, PluginRoute]] = {}
+        for defn in self.active_definitions(env=env, stored_plugins=stored_plugins):
+            prefix = f"/api/plugins/{defn.plugin_id}"
+            for rt in defn.routes:
+                full = prefix if rt.subpath == "/" else (prefix + rt.subpath)
+                out[(rt.method, full)] = (defn, rt)
+        return out
+
+    def active_tasks(
+        self,
+        env: Optional[Mapping[str, str]] = None,
+        stored_plugins: Optional[Mapping[str, Any]] = None,
+    ) -> List[Tuple[PluginDefinition, PluginTask]]:
+        out: List[Tuple[PluginDefinition, PluginTask]] = []
+        for defn in self.active_definitions(env=env, stored_plugins=stored_plugins):
+            for task in defn.tasks:
+                out.append((defn, task))
         return out
 
 

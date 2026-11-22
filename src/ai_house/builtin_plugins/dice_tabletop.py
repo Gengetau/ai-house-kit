@@ -3,15 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import random
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from ..plugin_api import ConfigField, PluginDefinition, PluginManifest, ToolRegistration
+from ..plugin_api import ConfigField, PluginDefinition, PluginManifest, ToolContext, ToolRegistration
 
 _FORTUNES = ("大吉 · 今天厨艺爆棚", "中吉 · 适合在客厅喝茶看书", "小吉 · 散步或许会遇见好风景", "吉 · 安稳惬意的一天")
 
 
-def roll_dice(sides: int = 6, count: int = 1, seed_hint: str = "") -> Dict[str, Any]:
-    s = max(2, min(int(sides or 6), 100))
+def roll_dice(sides: Optional[int] = None, count: int = 1, seed_hint: str = "", ctx: Optional[ToolContext] = None) -> Dict[str, Any]:
+    default_sides = int((ctx.plugin_config or {}).get("default_sides") or 6) if ctx is not None else 6
+    s = max(2, min(int(sides if sides is not None else default_sides), 100))
     n = max(1, min(int(count or 1), 5))
     rng = random.Random(seed_hint) if seed_hint else random.Random()
     rolls = [rng.randint(1, s) for _ in range(n)]
