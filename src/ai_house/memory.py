@@ -525,6 +525,7 @@ class MemoryStore:
         *,
         clock: Any = None,
         llm_fn: Optional[Callable[[str, str], Any]] = None,
+        model_router: Any = None,
         embed_plugin: Optional[Union[VectorEmbedder, Callable[[Sequence[str]], Optional[Sequence[Sequence[float]]]]]] = None,
         names: Optional[Mapping[str, str]] = None,
         env: Optional[Mapping[str, str]] = None,
@@ -542,6 +543,7 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
         self._llm_fn = llm_fn
+        self.model_router = model_router
         self.names = dict(names or {})
         self.unified_groups = bool(unified_groups or self._env.get("AI_HOUSE_MEMORY_UNIFIED_GROUPS") == "1")
         self.recency_half_life_days = max(0.1, float(recency_half_life_days))
@@ -1352,11 +1354,28 @@ class MemoryStore:
     # ---- 4. Periodic Extraction (`extract`) -----------------------------------------
 
     def _build_extractor_fn(
-        self, override_fn: Optional[Callable[[str, str], Any]] = None
+        self,
+        override_fn: Optional[Callable[[str, str], Any]] = None,
+        *,
+        actor: str = "",
     ) -> Optional[Callable[[str, str], Dict[str, Any]]]:
         fn = override_fn or self._llm_fn
         if fn is not None:
             return lambda sys_p, usr_p: _parse_ops_json(fn(sys_p, usr_p))
+        if self.model_router is not None and self.model_router.has_live_endpoint(purpose="memory_extract", actor=actor):
+            router = self.model_router
+
+            def _routed(sys_p: str, usr_p: str) -> Dict[str, Any]:
+                res = router.complete_messages(
+                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}],
+                    purpose="memory_extract",
+                    actor=actor,
+                )
+                if not res.content.strip() and not res.completion_tokens:
+                    raise MemoryRefusedError("memory extractor model returned empty refusal")
+                return _parse_ops_json(res.content)
+
+            return _routed
         api_key = (
             self._env.get("AI_HOUSE_MEMORY_API_KEY")
             or self._env.get("AI_HOUSE_API_KEY")
@@ -1611,7 +1630,7 @@ class MemoryStore:
             "refused": 0,
             "expired": expired,
         }
-        if extractor_fn is None:
+        if extractor_fn is None and self.model_router is None:
             return totals
 
         clauses = ["done=0"]
@@ -1656,12 +1675,15 @@ class MemoryStore:
                 if is_urgent:
                     self._urgent_times[key] = ts
 
+            bucket_extractor = self._build_extractor_fn(llm_fn, actor=key[0])
+            if bucket_extractor is None:
+                continue
             try:
                 res = self._extract_bucket(
                     key[0],
                     key[1],
                     key[2],
-                    extractor_fn,
+                    bucket_extractor,
                     ts,
                     allow_shared=allow_shared,
                 )

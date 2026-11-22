@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import inspect
 import json
 import re
 import sqlite3
@@ -192,7 +193,15 @@ class DiaryService:
             )
             user_prompt = "今天你经历过的事：\n" + "\n".join(f"- {f}" for f in facts)
             try:
-                raw, _ = llm_fn(sys_prompt, user_prompt)
+                accepts_actor = False
+                try:
+                    sig = inspect.signature(llm_fn)
+                    accepts_actor = "actor" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    accepts_actor = False
+                raw, _ = llm_fn(sys_prompt, user_prompt, actor=aid) if accepts_actor else llm_fn(sys_prompt, user_prompt)
                 cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]+", " ", str(raw or "")).strip()[:280]
                 if len(cleaned) >= 20 and (self.guard is None or not self.guard.check("world", cleaned)):
                     return cleaned, "live_api"

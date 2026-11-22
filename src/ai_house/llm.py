@@ -1,0 +1,910 @@
+"""Unified OpenAI-compatible Model Router, GPT-5 compatibility, retries/failover, and SQLite usage ledger (`0.3.0`)."""
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+
+from .onboarding import mask_secret
+
+JST = dt.timezone(dt.timedelta(hours=9))
+_SK_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+_TRANSIENT_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
+VALID_PURPOSES = ("chat", "life", "memory_extract", "diary", "ping")
+
+DEFAULT_TASK_PROFILES: Dict[str, Tuple[float, int, float, int]] = {
+    # purpose: (temperature, max_tokens, timeout_s, max_retries)
+    "chat": (0.7, 400, 25.0, 1),
+    "life": (0.7, 400, 25.0, 1),
+    "memory_extract": (0.2, 2000, 45.0, 1),
+    "diary": (0.7, 500, 25.0, 1),
+    "ping": (0.7, 350, 12.0, 0),
+}
+
+USAGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    day_jst TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    model TEXT NOT NULL,
+    base_url_host TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 1,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_day ON llm_usage(day_jst, purpose, actor);
+"""
+
+
+class LLMAPIError(RuntimeError):
+    """Structured error raised on HTTP failures from OpenAI-compatible endpoints."""
+
+    def __init__(self, status_code: int, message: str, detail: str = "") -> None:
+        self.status_code = int(status_code or 0)
+        self.detail = detail
+        super().__init__(message)
+
+
+def mask_secrets(text: str, api_key: str = "") -> str:
+    """Redact API keys and sk-* tokens before surfacing errors to logs or UI."""
+    cleaned = str(text or "")
+    key = str(api_key or "").strip()
+    if key:
+        cleaned = cleaned.replace(key, "[REDACTED]")
+    return _SK_SECRET_RE.sub("[REDACTED]", cleaned)
+
+
+def _extract_http_error_detail(exc: urllib.error.HTTPError, api_key: str = "") -> str:
+    raw = ""
+    try:
+        if exc.fp is not None:
+            raw = exc.fp.read(4096).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        raw = ""
+    if raw:
+        try:
+            doc = json.loads(raw)
+            err = doc.get("error")
+            if isinstance(err, dict):
+                parts = [str(err.get("message") or "").strip()]
+                if err.get("param"):
+                    parts.append(f"param={err['param']}")
+                if err.get("code"):
+                    parts.append(f"code={err['code']}")
+                raw = "; ".join(p for p in parts if p)
+            elif isinstance(err, str):
+                raw = err
+            elif doc.get("message"):
+                raw = str(doc.get("message"))
+        except ValueError:
+            pass
+    detail = " ".join(str(raw or exc.reason or f"HTTP {exc.code}").split())
+    return mask_secrets(detail, api_key=api_key)[:280]
+
+
+def _adapt_reasoning_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    adapted = dict(payload)
+    if "max_tokens" in adapted:
+        old_max = adapted.pop("max_tokens")
+        try:
+            n = int(old_max or 0)
+        except (TypeError, ValueError):
+            n = 0
+        adapted["max_completion_tokens"] = max(n, 1024)
+    elif "max_completion_tokens" in adapted:
+        try:
+            n = int(adapted["max_completion_tokens"] or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n < 1024:
+            adapted["max_completion_tokens"] = 1024
+    adapted.pop("temperature", None)
+    return adapted
+
+
+def _compat_retry_payload(payload: Mapping[str, Any], detail: str) -> Optional[Dict[str, Any]]:
+    low = detail.lower()
+    if not any(tok in low for tok in ("max_tokens", "max_completion_tokens", "temperature")):
+        return None
+    adapted = _adapt_reasoning_payload(payload)
+    return adapted if adapted != dict(payload) else None
+
+
+def _chat_completions_url(base_url: str) -> str:
+    url = (base_url or "https://api.openai.com").strip().rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url = (url + "/chat/completions") if url.endswith("/v1") else (url + "/v1/chat/completions")
+    return url
+
+
+def _send_chat_request(url: str, api_key: str, payload: Mapping[str, Any], timeout_s: float) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(dict(payload), ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "ai-house-kit/0.3 (+https://github.com/Gengetau/ai-house-kit)",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def post_openai_chat_json(
+    *,
+    base_url: str,
+    api_key: str,
+    payload: Mapping[str, Any],
+    timeout_s: float = 25.0,
+) -> Dict[str, Any]:
+    """POST to `/v1/chat/completions`, auto-adapting GPT-5/o-series parameter limits on HTTP 400."""
+    url = _chat_completions_url(base_url)
+    try:
+        return _send_chat_request(url, api_key, payload, timeout_s)
+    except urllib.error.HTTPError as exc:
+        detail = _extract_http_error_detail(exc, api_key=api_key)
+        if exc.code == 400:
+            retry_payload = _compat_retry_payload(payload, detail)
+            if retry_payload is not None:
+                try:
+                    return _send_chat_request(url, api_key, retry_payload, timeout_s)
+                except urllib.error.HTTPError as retry_exc:
+                    retry_detail = _extract_http_error_detail(retry_exc, api_key=api_key)
+                    raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {retry_detail}", detail=retry_detail) from retry_exc
+        raise LLMAPIError(exc.code, f"HTTP {exc.code}: {detail}", detail=detail) from exc
+
+
+def openai_compatible_chat(
+    system: str,
+    user: str,
+    *,
+    api_key: str,
+    base_url: str = "https://api.openai.com",
+    model: str = "gpt-4o-mini",
+    timeout_s: float = 25.0,
+) -> Tuple[str, int]:
+    """Call any OpenAI-compatible `/v1/chat/completions` endpoint using Python stdlib."""
+    doc = post_openai_chat_json(
+        base_url=base_url,
+        api_key=api_key,
+        payload={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 350,
+        },
+        timeout_s=timeout_s,
+    )
+    msg = (((doc.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+    tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
+    return str(msg).strip(), tokens
+
+
+@dataclass(frozen=True)
+class ModelEndpoint:
+    base_url: str
+    api_key: str
+    model: str
+
+
+@dataclass(frozen=True)
+class TaskProfile:
+    temperature: float = 0.7
+    max_tokens: int = 400
+    timeout_s: float = 25.0
+    max_retries: int = 1
+
+
+@dataclass(frozen=True)
+class LLMCallResult:
+    message: Dict[str, Any]
+    content: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    model: str
+    base_url: str
+    fallback_used: bool
+    latency_ms: int
+
+
+def _safe_float(raw: Any, default: float) -> float:
+    try:
+        v = float(raw)
+        return v if v == v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(raw: Any, default: int) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _actor_env_key(actor: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "_", str(actor or "").upper())
+
+
+def _host_label(base_url: str) -> str:
+    try:
+        p = urlparse(base_url)
+        return p.netloc or p.path or base_url
+    except ValueError:
+        return str(base_url)[:80]
+
+
+class ModelRouter:
+    """Routes chat, life, memory extraction, and diary LLM calls with failover and SQLite usage tracking."""
+
+    CONFIG_FILENAME = "llm_config.json"
+    USAGE_DB_FILENAME = "usage.db"
+
+    def __init__(
+        self,
+        env: Optional[Mapping[str, str]] = None,
+        *,
+        runtime_dir: Optional[str | Path] = None,
+        clock: Any = None,
+        retry_delay_s: float = 0.08,
+    ) -> None:
+        self._lock = threading.RLock()
+        self.env: Dict[str, str] = dict(os.environ if env is None else env)
+        self.runtime_dir = Path(runtime_dir) if runtime_dir is not None else None
+        self._clock = clock
+        self.retry_delay_s = max(0.0, float(retry_delay_s))
+        self._reasoning_caps: set[Tuple[str, str]] = set()
+        self._config_path = (self.runtime_dir / self.CONFIG_FILENAME) if self.runtime_dir is not None else None
+        self._usage_db = (self.runtime_dir / self.USAGE_DB_FILENAME) if self.runtime_dir is not None else None
+        self._overrides: Dict[str, Any] = self._load_overrides()
+        if self._usage_db is not None:
+            self._init_usage_schema()
+
+    def _now(self) -> float:
+        return float(self._clock.now()) if self._clock is not None else time.time()
+
+    def _load_overrides(self) -> Dict[str, Any]:
+        if self._config_path is None or not self._config_path.is_file():
+            return {"fallback": {}, "resident_models": {}, "task_profiles": {}}
+        try:
+            doc = json.loads(self._config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"fallback": {}, "resident_models": {}, "task_profiles": {}}
+        if not isinstance(doc, dict):
+            return {"fallback": {}, "resident_models": {}, "task_profiles": {}}
+        return {
+            "fallback": dict(doc.get("fallback") or {}) if isinstance(doc.get("fallback"), dict) else {},
+            "resident_models": dict(doc.get("resident_models") or {}) if isinstance(doc.get("resident_models"), dict) else {},
+            "task_profiles": dict(doc.get("task_profiles") or {}) if isinstance(doc.get("task_profiles"), dict) else {},
+        }
+
+    def _save_overrides(self) -> None:
+        if self._config_path is None or self.runtime_dir is None:
+            return
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.runtime_dir / f".{self.CONFIG_FILENAME}.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps(self._overrides, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self._config_path)
+        try:
+            os.chmod(self._config_path, 0o600)
+        except OSError:
+            pass
+
+    def _init_usage_schema(self) -> None:
+        assert self._usage_db is not None
+        self._usage_db.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(self._usage_db, timeout=5)) as c:
+            with c:
+                c.executescript(USAGE_SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            self._reasoning_caps.clear()
+
+    def update_env(self, env: Mapping[str, str]) -> None:
+        with self._lock:
+            self.env = dict(env)
+
+    def update_overrides(self, spec: Mapping[str, Any], *, persist: bool = True) -> None:
+        """Persist optional fallback, per-resident model routes, and task parameter overrides."""
+        with self._lock:
+            changed = False
+            if isinstance(spec.get("fallback"), Mapping):
+                fb_in = spec["fallback"]
+                fb_cur = dict(self._overrides.get("fallback") or {})
+                if fb_in.get("clear_key") is True:
+                    fb_cur["api_key"] = ""
+                    self.env.pop("AI_HOUSE_FALLBACK_API_KEY", None)
+                elif str(fb_in.get("api_key") or "").strip():
+                    fb_cur["api_key"] = str(fb_in["api_key"]).strip()
+                if "base_url" in fb_in:
+                    u = str(fb_in.get("base_url") or "").strip().rstrip("/")
+                    if u and not u.startswith(("http://", "https://")):
+                        raise ValueError("备用 Base URL 必须以 http:// 或 https:// 开头")
+                    fb_cur["base_url"] = u
+                if "model" in fb_in:
+                    fb_cur["model"] = str(fb_in.get("model") or "").strip()
+                self._overrides["fallback"] = fb_cur
+                changed = True
+
+            if isinstance(spec.get("resident_models"), Mapping):
+                res_out: Dict[str, Dict[str, str]] = {}
+                cur_res = dict(self._overrides.get("resident_models") or {})
+                for aid, raw_ent in spec["resident_models"].items():
+                    clean_aid = str(aid or "").strip()
+                    if not clean_aid or not isinstance(raw_ent, Mapping):
+                        continue
+                    prev_ent = dict(cur_res.get(clean_aid) or {})
+                    mdl = str(raw_ent.get("model") or "").strip()
+                    url = str(raw_ent.get("base_url") or "").strip().rstrip("/")
+                    if url and not url.startswith(("http://", "https://")):
+                        raise ValueError(f"住客 {clean_aid} Base URL 必须以 http:// 或 https:// 开头")
+                    if raw_ent.get("clear_key") is True:
+                        key = ""
+                    elif str(raw_ent.get("api_key") or "").strip():
+                        key = str(raw_ent["api_key"]).strip()
+                    else:
+                        key = str(prev_ent.get("api_key") or "").strip()
+                    if mdl or url or key:
+                        res_out[clean_aid] = {"model": mdl, "base_url": url, "api_key": key}
+                self._overrides["resident_models"] = res_out
+                changed = True
+
+            if isinstance(spec.get("task_profiles"), Mapping):
+                tp_out = dict(self._overrides.get("task_profiles") or {})
+                for p, raw_tp in spec["task_profiles"].items():
+                    clean_p = str(p or "").strip()
+                    if clean_p not in VALID_PURPOSES or not isinstance(raw_tp, Mapping):
+                        continue
+                    prev_tp = dict(tp_out.get(clean_p) or {})
+                    ent: Dict[str, Any] = {}
+                    if raw_tp.get("temperature") is not None:
+                        ent["temperature"] = max(0.0, min(_safe_float(raw_tp["temperature"], 0.7), 2.0))
+                    if raw_tp.get("max_tokens") is not None:
+                        ent["max_tokens"] = max(32, min(_safe_int(raw_tp["max_tokens"], 400), 16000))
+                    if raw_tp.get("timeout_s") is not None:
+                        ent["timeout_s"] = max(1.0, min(_safe_float(raw_tp["timeout_s"], 25.0), 180.0))
+                    if raw_tp.get("max_retries") is not None:
+                        ent["max_retries"] = max(0, min(_safe_int(raw_tp["max_retries"], 1), 3))
+                    if raw_tp.get("model"):
+                        ent["model"] = str(raw_tp["model"]).strip()
+                    if raw_tp.get("base_url"):
+                        u = str(raw_tp["base_url"]).strip().rstrip("/")
+                        if u and not u.startswith(("http://", "https://")):
+                            raise ValueError(f"任务 {clean_p} Base URL 必须以 http:// 或 https:// 开头")
+                        ent["base_url"] = u
+                    if raw_tp.get("clear_key") is True:
+                        pass
+                    elif str(raw_tp.get("api_key") or "").strip():
+                        ent["api_key"] = str(raw_tp["api_key"]).strip()
+                    elif prev_tp.get("api_key"):
+                        ent["api_key"] = str(prev_tp["api_key"])
+                    tp_out[clean_p] = ent
+                self._overrides["task_profiles"] = tp_out
+                changed = True
+
+            if changed and persist:
+                self._save_overrides()
+
+    def status_view(self) -> Dict[str, Any]:
+        with self._lock:
+            p_url, p_key, p_model = self._primary_tuple()
+            fb = self._fallback_tuple(p_url, p_model)
+            res_view: Dict[str, Dict[str, Any]] = {}
+            for aid, ent in (self._overrides.get("resident_models") or {}).items():
+                if not isinstance(ent, Mapping):
+                    continue
+                ak = str(ent.get("api_key") or "").strip()
+                res_view[str(aid)] = {
+                    "model": str(ent.get("model") or ""),
+                    "base_url": str(ent.get("base_url") or ""),
+                    "api_key_set": bool(ak),
+                    "api_key_masked": mask_secret(ak),
+                }
+            return {
+                "fallback": {
+                    "enabled": bool(fb and fb[1]),
+                    "base_url": fb[0] if fb else p_url,
+                    "model": fb[2] if fb else p_model,
+                    "api_key_set": bool(fb and fb[1]),
+                    "api_key_masked": mask_secret(fb[1] if fb else ""),
+                },
+                "resident_models": res_view,
+                "task_profiles": {
+                    p: {
+                        "temperature": prof.temperature,
+                        "max_tokens": prof.max_tokens,
+                        "timeout_s": prof.timeout_s,
+                        "max_retries": prof.max_retries,
+                    }
+                    for p, prof in ((k, self.resolve_profile(k)) for k in VALID_PURPOSES)
+                },
+            }
+
+    def collect_secrets(self) -> List[str]:
+        """Return all configured primary, fallback, resident, and task API keys for leak-guarding."""
+        secrets: List[str] = []
+        with self._lock:
+            candidates: List[str] = [
+                str(self.env.get("AI_HOUSE_FALLBACK_API_KEY") or ""),
+                str(self.env.get("AI_HOUSE_MEMORY_API_KEY") or ""),
+                str((self._overrides.get("fallback") or {}).get("api_key") or ""),
+            ]
+            for k, v in self.env.items():
+                if k.startswith(("AI_HOUSE_ACTOR_API_KEY_", "AI_HOUSE_LIFE_API_KEY", "AI_HOUSE_DIARY_API_KEY", "AI_HOUSE_PING_API_KEY", "AI_HOUSE_CHAT_API_KEY")):
+                    candidates.append(str(v or ""))
+            for group_name in ("resident_models", "task_profiles"):
+                for ent in (self._overrides.get(group_name) or {}).values():
+                    if isinstance(ent, Mapping):
+                        candidates.append(str(ent.get("api_key") or ""))
+            for item in candidates:
+                cleaned = item.strip()
+                if cleaned and cleaned not in secrets:
+                    secrets.append(cleaned)
+        return secrets
+
+    def _primary_tuple(self) -> Tuple[str, str, str]:
+        url = (
+            self.env.get("AI_HOUSE_BASE_URL")
+            or self.env.get("OPENAI_BASE_URL")
+            or self.env.get("WORLD_KERNEL_BASE_URL")
+            or "https://api.openai.com"
+        ).strip().rstrip("/")
+        key = (
+            self.env.get("AI_HOUSE_API_KEY")
+            or self.env.get("OPENAI_API_KEY")
+            or self.env.get("WORLD_KERNEL_API_KEY")
+            or ""
+        ).strip()
+        model = (
+            self.env.get("AI_HOUSE_MODEL")
+            or self.env.get("WORLD_KERNEL_MODEL")
+            or "gpt-4o-mini"
+        ).strip()
+        return url, key, model
+
+    def _fallback_tuple(self, default_url: str, default_model: str) -> Optional[Tuple[str, str, str]]:
+        fb_ov = self._overrides.get("fallback") or {}
+        key = str(fb_ov.get("api_key") or self.env.get("AI_HOUSE_FALLBACK_API_KEY") or "").strip()
+        if not key:
+            return None
+        url = str(fb_ov.get("base_url") or self.env.get("AI_HOUSE_FALLBACK_BASE_URL") or default_url).strip().rstrip("/")
+        mdl = str(fb_ov.get("model") or self.env.get("AI_HOUSE_FALLBACK_MODEL") or default_model).strip()
+        return url, key, mdl
+
+    def resolve_profile(self, purpose: str = "chat") -> TaskProfile:
+        with self._lock:
+            p = purpose if purpose in DEFAULT_TASK_PROFILES else "chat"
+            t_def, m_def, to_def, r_def = DEFAULT_TASK_PROFILES[p]
+            prefix = f"AI_HOUSE_{p.upper()}"
+            temp = _safe_float(self.env.get(f"{prefix}_TEMPERATURE") or self.env.get("AI_HOUSE_LLM_TEMPERATURE"), t_def)
+            mtok = _safe_int(self.env.get(f"{prefix}_MAX_TOKENS") or self.env.get("AI_HOUSE_LLM_MAX_TOKENS"), m_def)
+            tout = _safe_float(self.env.get(f"{prefix}_TIMEOUT_S") or self.env.get("AI_HOUSE_LLM_TIMEOUT_S"), to_def)
+            ret = _safe_int(self.env.get(f"{prefix}_MAX_RETRIES") or self.env.get("AI_HOUSE_LLM_MAX_RETRIES"), r_def)
+
+            tp_ov = (self._overrides.get("task_profiles") or {}).get(p) or {}
+            if tp_ov.get("temperature") is not None:
+                temp = float(tp_ov["temperature"])
+            if tp_ov.get("max_tokens") is not None:
+                mtok = int(tp_ov["max_tokens"])
+            if tp_ov.get("timeout_s") is not None:
+                tout = float(tp_ov["timeout_s"])
+            if tp_ov.get("max_retries") is not None:
+                ret = int(tp_ov["max_retries"])
+            return TaskProfile(
+                temperature=max(0.0, min(temp, 2.0)),
+                max_tokens=max(32, min(mtok, 16000)),
+                timeout_s=max(1.0, min(tout, 180.0)),
+                max_retries=max(0, min(ret, 3)),
+            )
+
+    def _task_endpoint_override(self, purpose: str) -> Tuple[str, str, str]:
+        p = purpose if purpose in VALID_PURPOSES else "chat"
+        prefix = f"AI_HOUSE_{p.upper()}"
+        tp_ov = (self._overrides.get("task_profiles") or {}).get(p) or {}
+        if p == "memory_extract":
+            url = str(tp_ov.get("base_url") or self.env.get("AI_HOUSE_MEMORY_BASE_URL") or self.env.get(f"{prefix}_BASE_URL") or "").strip().rstrip("/")
+            key = str(tp_ov.get("api_key") or self.env.get("AI_HOUSE_MEMORY_API_KEY") or self.env.get(f"{prefix}_API_KEY") or "").strip()
+            mdl = str(tp_ov.get("model") or self.env.get("AI_HOUSE_MEMORY_MODEL") or self.env.get(f"{prefix}_MODEL") or "").strip()
+        else:
+            url = str(tp_ov.get("base_url") or self.env.get(f"{prefix}_BASE_URL") or "").strip().rstrip("/")
+            key = str(tp_ov.get("api_key") or self.env.get(f"{prefix}_API_KEY") or "").strip()
+            mdl = str(tp_ov.get("model") or self.env.get(f"{prefix}_MODEL") or "").strip()
+        return url, key, mdl
+
+    def _resident_endpoint_override(self, actor: str) -> Tuple[str, str, str]:
+        if not actor:
+            return "", "", ""
+        ak = _actor_env_key(actor)
+        ov = (self._overrides.get("resident_models") or {}).get(actor) or {}
+        url = str(ov.get("base_url") or self.env.get(f"AI_HOUSE_ACTOR_BASE_URL_{ak}") or "").strip().rstrip("/")
+        key = str(ov.get("api_key") or self.env.get(f"AI_HOUSE_ACTOR_API_KEY_{ak}") or "").strip()
+        mdl = str(ov.get("model") or self.env.get(f"AI_HOUSE_ACTOR_MODEL_{ak}") or "").strip()
+        return url, key, mdl
+
+    def resolve_endpoints(self, *, purpose: str = "chat", actor: str = "") -> List[Tuple[ModelEndpoint, bool]]:
+        """Return ordered `[(ModelEndpoint, is_fallback), ...]` for the given task purpose and roommate."""
+        with self._lock:
+            p_url, p_key, p_model = self._primary_tuple()
+            t_url, t_key, t_model = self._task_endpoint_override(purpose)
+            r_url, r_key, r_model = self._resident_endpoint_override(actor)
+
+            # Explicit dedicated task overrides (e.g. AI_HOUSE_MEMORY_MODEL) govern memory_extract/ping,
+            # while per-resident overrides customize chat, life decisions, and diaries.
+            if purpose in ("memory_extract", "ping") and (t_url or t_key or t_model):
+                sel_url = t_url or r_url or p_url
+                sel_key = t_key or r_key or p_key
+                sel_model = t_model or r_model or p_model
+            else:
+                sel_url = r_url or t_url or p_url
+                sel_key = r_key or t_key or p_key
+                sel_model = r_model or t_model or p_model
+
+            eps: List[Tuple[ModelEndpoint, bool]] = []
+            if sel_key:
+                eps.append((ModelEndpoint(base_url=sel_url, api_key=sel_key, model=sel_model), False))
+
+            fb = self._fallback_tuple(sel_url, sel_model)
+            if fb is not None:
+                fb_ep = ModelEndpoint(base_url=fb[0], api_key=fb[1], model=fb[2])
+                if not eps or fb_ep != eps[0][0]:
+                    eps.append((fb_ep, True))
+            return eps
+
+    def has_live_endpoint(self, *, purpose: str = "chat", actor: str = "") -> bool:
+        return bool(self.resolve_endpoints(purpose=purpose, actor=actor))
+
+    def _record_usage(
+        self,
+        *,
+        purpose: str,
+        actor: str,
+        endpoint: ModelEndpoint,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        latency_ms: int,
+        ok: bool,
+        fallback_used: bool,
+        error_code: str = "",
+    ) -> None:
+        if self._usage_db is None:
+            return
+        ts = self._now()
+        day_jst = dt.datetime.fromtimestamp(ts, JST).date().isoformat()
+        host = _host_label(endpoint.base_url)
+        with self._lock, contextlib.closing(sqlite3.connect(self._usage_db, timeout=5)) as c:
+            with c:
+                c.execute(
+                    "INSERT INTO llm_usage(ts, day_jst, purpose, actor, model, base_url_host, "
+                    "prompt_tokens, completion_tokens, total_tokens, latency_ms, ok, fallback_used, error_code) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        ts,
+                        day_jst,
+                        str(purpose or "chat"),
+                        str(actor or ""),
+                        endpoint.model,
+                        host,
+                        int(prompt_tokens or 0),
+                        int(completion_tokens or 0),
+                        int(total_tokens or 0),
+                        int(latency_ms or 0),
+                        1 if ok else 0,
+                        1 if fallback_used else 0,
+                        str(error_code or "")[:64],
+                    ),
+                )
+
+    def get_usage_summary(self, *, days: int = 7, now: Optional[float] = None) -> Dict[str, Any]:
+        """Aggregate LLM calls and tokens from `usage.db` across the trailing `days` window."""
+        clean_days = max(1, min(int(days or 7), 90))
+        ref_ts = float(now) if now is not None else self._now()
+        cutoff = ref_ts - clean_days * 86400.0
+        empty = {
+            "ok": True,
+            "days": clean_days,
+            "totals": {"calls": 0, "ok_calls": 0, "failed_calls": 0, "fallback_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "by_day": [],
+            "by_purpose": [],
+            "by_actor": [],
+            "by_model": [],
+        }
+        if self._usage_db is None or not self._usage_db.is_file():
+            return empty
+
+        with self._lock, contextlib.closing(sqlite3.connect(self._usage_db, timeout=5)) as c:
+            c.row_factory = sqlite3.Row
+            tot = c.execute(
+                "SELECT COUNT(*) AS calls, SUM(ok) AS ok_calls, SUM(1 - ok) AS failed_calls, "
+                "SUM(fallback_used) AS fallback_calls, COALESCE(SUM(prompt_tokens), 0) AS pt, "
+                "COALESCE(SUM(completion_tokens), 0) AS ct, COALESCE(SUM(total_tokens), 0) AS tt "
+                "FROM llm_usage WHERE ts>=?",
+                (cutoff,),
+            ).fetchone()
+            by_day = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT day_jst AS day, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    "FROM llm_usage WHERE ts>=? GROUP BY day_jst ORDER BY day_jst DESC",
+                    (cutoff,),
+                ).fetchall()
+            ]
+            by_purpose = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT purpose, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    "FROM llm_usage WHERE ts>=? GROUP BY purpose ORDER BY total_tokens DESC, purpose ASC",
+                    (cutoff,),
+                ).fetchall()
+            ]
+            by_actor = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT actor, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    "FROM llm_usage WHERE ts>=? AND actor!='' GROUP BY actor ORDER BY total_tokens DESC, actor ASC",
+                    (cutoff,),
+                ).fetchall()
+            ]
+            by_model = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT model, COUNT(*) AS calls, COALESCE(SUM(total_tokens), 0) AS total_tokens "
+                    "FROM llm_usage WHERE ts>=? GROUP BY model ORDER BY total_tokens DESC, model ASC",
+                    (cutoff,),
+                ).fetchall()
+            ]
+
+        return {
+            "ok": True,
+            "days": clean_days,
+            "totals": {
+                "calls": int(tot["calls"] or 0),
+                "ok_calls": int(tot["ok_calls"] or 0),
+                "failed_calls": int(tot["failed_calls"] or 0),
+                "fallback_calls": int(tot["fallback_calls"] or 0),
+                "prompt_tokens": int(tot["pt"] or 0),
+                "completion_tokens": int(tot["ct"] or 0),
+                "total_tokens": int(tot["tt"] or 0),
+            },
+            "by_day": by_day,
+            "by_purpose": by_purpose,
+            "by_actor": by_actor,
+            "by_model": by_model,
+        }
+
+    def _call_single_endpoint(
+        self,
+        ep: ModelEndpoint,
+        base_payload: Mapping[str, Any],
+        timeout_s: float,
+    ) -> Dict[str, Any]:
+        url = _chat_completions_url(ep.base_url)
+        cap_key = (ep.base_url, ep.model)
+        with self._lock:
+            is_reasoning = cap_key in self._reasoning_caps
+        payload = _adapt_reasoning_payload(base_payload) if is_reasoning else dict(base_payload)
+        try:
+            return _send_chat_request(url, ep.api_key, payload, timeout_s)
+        except urllib.error.HTTPError as exc:
+            detail = _extract_http_error_detail(exc, api_key=ep.api_key)
+            if exc.code == 400 and not is_reasoning:
+                retry_payload = _compat_retry_payload(base_payload, detail)
+                if retry_payload is not None:
+                    with self._lock:
+                        self._reasoning_caps.add(cap_key)
+                    try:
+                        return _send_chat_request(url, ep.api_key, retry_payload, timeout_s)
+                    except urllib.error.HTTPError as retry_exc:
+                        r_detail = _extract_http_error_detail(retry_exc, api_key=ep.api_key)
+                        raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {r_detail}", detail=r_detail) from retry_exc
+            raise LLMAPIError(exc.code, f"HTTP {exc.code}: {detail}", detail=detail) from exc
+
+    def complete_messages(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        *,
+        purpose: str = "chat",
+        actor: str = "",
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        retry_without_tools_on_400: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout_s: Optional[float] = None,
+    ) -> LLMCallResult:
+        """Execute a chat completion across resolved endpoints with retries, failover, and usage logging."""
+        eps = self.resolve_endpoints(purpose=purpose, actor=actor)
+        if not eps:
+            raise RuntimeError("no API key configured")
+        prof = self.resolve_profile(purpose)
+        eff_temp = prof.temperature if temperature is None else float(temperature)
+        eff_max = prof.max_tokens if max_tokens is None else int(max_tokens)
+        eff_timeout = prof.timeout_s if timeout_s is None else float(timeout_s)
+
+        last_exc: Optional[BaseException] = None
+        for ep, is_fallback in eps:
+            payload: Dict[str, Any] = {
+                "model": ep.model,
+                "messages": list(messages),
+                "temperature": eff_temp,
+                "max_tokens": eff_max,
+            }
+            if tools:
+                payload["tools"] = [{"type": "function", "function": t} for t in tools]
+                payload["tool_choice"] = "auto"
+
+            for attempt in range(prof.max_retries + 1):
+                t0 = time.monotonic()
+                try:
+                    doc = self._call_single_endpoint(ep, payload, eff_timeout)
+                    return self._finish_usage_success(doc, ep, purpose, actor, is_fallback, t0)
+                except LLMAPIError as exc:
+                    if exc.status_code == 400 and tools and retry_without_tools_on_400:
+                        plain_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+                        try:
+                            doc2 = self._call_single_endpoint(ep, plain_payload, eff_timeout)
+                            return self._finish_usage_success(doc2, ep, purpose, actor, is_fallback, t0)
+                        except LLMAPIError as inner_exc:
+                            exc = inner_exc
+                        except Exception as inner_exc:  # noqa: BLE001
+                            latency_ms = int((time.monotonic() - t0) * 1000)
+                            self._record_usage(
+                                purpose=purpose,
+                                actor=actor,
+                                endpoint=ep,
+                                prompt_tokens=0,
+                                completion_tokens=0,
+                                total_tokens=0,
+                                latency_ms=latency_ms,
+                                ok=False,
+                                fallback_used=is_fallback,
+                                error_code=type(inner_exc).__name__,
+                            )
+                            last_exc = inner_exc
+                            if attempt < prof.max_retries:
+                                time.sleep(self.retry_delay_s * (attempt + 1))
+                                continue
+                            break
+
+                    latency_ms = int((time.monotonic() - t0) * 1000)
+                    self._record_usage(
+                        purpose=purpose,
+                        actor=actor,
+                        endpoint=ep,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        latency_ms=latency_ms,
+                        ok=False,
+                        fallback_used=is_fallback,
+                        error_code=f"HTTP_{exc.status_code}",
+                    )
+                    last_exc = exc
+                    if exc.status_code in _TRANSIENT_HTTP_CODES and attempt < prof.max_retries:
+                        time.sleep(self.retry_delay_s * (attempt + 1))
+                        continue
+                    break
+                except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                    latency_ms = int((time.monotonic() - t0) * 1000)
+                    self._record_usage(
+                        purpose=purpose,
+                        actor=actor,
+                        endpoint=ep,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        latency_ms=latency_ms,
+                        ok=False,
+                        fallback_used=is_fallback,
+                        error_code=type(exc).__name__,
+                    )
+                    last_exc = exc
+                    if attempt < prof.max_retries:
+                        time.sleep(self.retry_delay_s * (attempt + 1))
+                        continue
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    latency_ms = int((time.monotonic() - t0) * 1000)
+                    self._record_usage(
+                        purpose=purpose,
+                        actor=actor,
+                        endpoint=ep,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                        latency_ms=latency_ms,
+                        ok=False,
+                        fallback_used=is_fallback,
+                        error_code=type(exc).__name__,
+                    )
+                    last_exc = exc
+                    break
+
+        assert last_exc is not None
+        raise last_exc
+
+    def _finish_usage_success(
+        self,
+        doc: Mapping[str, Any],
+        ep: ModelEndpoint,
+        purpose: str,
+        actor: str,
+        is_fallback: bool,
+        t0: float,
+    ) -> LLMCallResult:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        choice = (doc.get("choices") or [{}])[0]
+        message = dict(choice.get("message") or {})
+        content = str(message.get("content") or "").strip()
+        usage = doc.get("usage") or {}
+        pt = int(usage.get("prompt_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or 0)
+        tt = int(usage.get("total_tokens") or (pt + ct))
+        self._record_usage(
+            purpose=purpose,
+            actor=actor,
+            endpoint=ep,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+            latency_ms=latency_ms,
+            ok=True,
+            fallback_used=is_fallback,
+        )
+        return LLMCallResult(
+            message=message,
+            content=content,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+            model=ep.model,
+            base_url=ep.base_url,
+            fallback_used=is_fallback,
+            latency_ms=latency_ms,
+        )
+
+    def complete_text(
+        self,
+        system: str,
+        user: str,
+        *,
+        purpose: str = "chat",
+        actor: str = "",
+        timeout_s: Optional[float] = None,
+    ) -> Tuple[str, int]:
+        res = self.complete_messages(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            purpose=purpose,
+            actor=actor,
+            timeout_s=timeout_s,
+        )
+        return res.content, res.total_tokens
+
+    def chat_fn(self, *, purpose: str = "chat") -> Callable[..., Tuple[str, int]]:
+        def _call(system: str, user: str, *, actor: str = "") -> Tuple[str, int]:
+            return self.complete_text(system, user, purpose=purpose, actor=actor)
+
+        return _call

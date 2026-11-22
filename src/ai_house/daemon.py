@@ -36,6 +36,7 @@ from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_com
 from .chat_guard import ReplyGuard
 from .chat_identity import Speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
+from .llm import ModelRouter
 from .memory import MemoryStore
 from .onboarding import (
     ACCENT_OPTIONS,
@@ -165,6 +166,7 @@ class HouseDaemon:
             self.clock = OffsetWallClock(self.runtime_dir / "clock_offset.json")
 
         self.settings_store = SettingsStore(self.runtime_dir)
+        self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
         self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env)
         stored_plugins = self.settings_store.get_plugins_map()
@@ -220,8 +222,14 @@ class HouseDaemon:
             raise
 
     def _rebuild_llm_and_guard(self) -> None:
-        self.chat_agent = RoommateChatAgent(self.vocab, env=self.env, llm_fn=self._llm_fn)
+        router = getattr(self, "model_router", None)
+        if router is not None:
+            router.update_env(self.env)
+        self.chat_agent = RoommateChatAgent(self.vocab, env=self.env, llm_fn=self._llm_fn, router=router)
         guard_env = dict(self.env)
+        if router is not None:
+            for idx, sec in enumerate(router.collect_secrets()):
+                guard_env[f"AI_HOUSE_MODEL_SECRET_{idx}"] = sec
         if getattr(self, "settings_store", None) is not None and getattr(self, "registry", None) is not None:
             for idx, sec in enumerate(self.settings_store.collect_secrets(self.registry.definitions, self.env)):
                 guard_env[f"AI_HOUSE_PLUGIN_SECRET_{idx}"] = sec
@@ -237,10 +245,14 @@ class HouseDaemon:
         if getattr(self, "memory", None) is not None:
             self.memory.names = self.vocab.NAMES
         if getattr(self, "authority", None) is not None:
-            k_chat = self.chat_agent.kernel_chat_fn()
-            self.authority.life.model = LiveLifeModel(k_chat, self.vocab.SELVES) if k_chat else FakeLifeModel(vocab=self.vocab)
+            life_chat = (
+                router.chat_fn(purpose="life")
+                if (self._llm_fn is None and router is not None and router.has_live_endpoint(purpose="life"))
+                else self.chat_agent.kernel_chat_fn()
+            )
+            self.authority.life.model = LiveLifeModel(life_chat, self.vocab.SELVES) if life_chat else FakeLifeModel(vocab=self.vocab)
             if self.authority.city_bridge is not None and hasattr(self.authority.city_bridge, "chat"):
-                self.authority.city_bridge.chat = k_chat
+                self.authority.city_bridge.chat = life_chat
                 self.authority.city_bridge.selves = self.vocab.SELVES
 
     def _teardown_world(self) -> None:
@@ -313,12 +325,17 @@ class HouseDaemon:
         self.intents = IntentsLite(self.world_db, vocab=self.vocab)
         self.intents.init()
         self._rebuild_llm_and_guard()
-        k_chat = self.chat_agent.kernel_chat_fn()
+        life_chat = (
+            self.model_router.chat_fn(purpose="life")
+            if (self._llm_fn is None and self.model_router.has_live_endpoint(purpose="life"))
+            else self.chat_agent.kernel_chat_fn()
+        )
 
         self.memory = MemoryStore(
             self.runtime_dir,
             clock=self.clock,
             llm_fn=self._llm_fn,
+            model_router=self.model_router,
             names=self.vocab.NAMES,
             env=self.env,
         )
@@ -333,7 +350,7 @@ class HouseDaemon:
         eff_env = dict(self.env)
         eff_env.setdefault("INTENTS", "1")
         eff_env.setdefault("INTENTS_KERNEL_MATCH", "on")
-        eff_env.setdefault("WORLD_KERNEL_DAY_NOTE", "1" if k_chat else "0")
+        eff_env.setdefault("WORLD_KERNEL_DAY_NOTE", "1" if life_chat else "0")
 
         stored_plugins = self.settings_store.get_plugins_map()
         managed_exts: List[Any] = []
@@ -351,11 +368,11 @@ class HouseDaemon:
             _track_ext_factory(pid_k, f)
             for pid_k, f in self.registry.active_extension_specs(self.env, stored_plugins=stored_plugins)
         ]
-        life_model = LiveLifeModel(k_chat, self.vocab.SELVES) if k_chat else FakeLifeModel(vocab=self.vocab)
+        life_model = LiveLifeModel(life_chat, self.vocab.SELVES) if life_chat else FakeLifeModel(vocab=self.vocab)
         self.authority = Authority(
             self.life_db,
             self.world_db,
-            k_chat,
+            life_chat,
             self.vocab.SELVES,
             clock=self.clock,
             model=life_model,
@@ -405,6 +422,8 @@ class HouseDaemon:
                 self._teardown_world()
         else:
             self._teardown_world()
+        if getattr(self, "model_router", None) is not None:
+            self.model_router.close()
 
     def _run_post_step_jobs(self) -> None:
         """Run slow periodic memory/diary LLM jobs outside `self._lock` so `/api/state` never stalls."""
@@ -418,9 +437,13 @@ class HouseDaemon:
                 self.log(f"memory extract error: {type(exc).__name__}: {exc}")
             if due_diary_day(now) is not None:
                 try:
-                    llm_fn = self.chat_agent.kernel_chat_fn()
+                    diary_fn = (
+                        self.model_router.chat_fn(purpose="diary")
+                        if (self._llm_fn is None and self.model_router.has_live_endpoint(purpose="diary"))
+                        else self.chat_agent.kernel_chat_fn()
+                    )
                     for job in self.diary.collect_due_jobs(now):
-                        text, mode = self.diary.generate_text(job, llm_fn=llm_fn)
+                        text, mode = self.diary.generate_text(job, llm_fn=diary_fn)
                         self.diary.save_generated(job, text, mode, now)
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
@@ -1177,13 +1200,19 @@ class HouseDaemon:
             or self.env.get("WORLD_KERNEL_API_KEY")
             or ""
         ).strip()
-        return {
+        out: Dict[str, Any] = {
             "mode": "live_api" if self.chat_agent.live_llm_enabled else "zero_key_demo",
             "base_url": (self.env.get("AI_HOUSE_BASE_URL") or self.env.get("OPENAI_BASE_URL") or "https://api.openai.com").strip(),
             "model": (self.env.get("AI_HOUSE_MODEL") or self.env.get("WORLD_KERNEL_MODEL") or "gpt-4o-mini").strip(),
             "api_key_set": bool(raw_key),
             "api_key_masked": mask_secret(raw_key),
         }
+        if getattr(self, "model_router", None) is not None:
+            out.update(self.model_router.status_view())
+        return out
+
+    def get_usage_summary(self, *, days: int = 7) -> Dict[str, Any]:
+        return self.model_router.get_usage_summary(days=days, now=self.clock.now())
 
     def _apply_llm_config(self, spec: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
         base_url = str(
@@ -1210,6 +1239,9 @@ class HouseDaemon:
             new_key = raw_key
         else:
             new_key = (self.env.get("AI_HOUSE_API_KEY") or self.env.get("OPENAI_API_KEY") or "").strip()
+
+        if any(k in spec for k in ("fallback", "resident_models", "task_profiles")):
+            self.model_router.update_overrides(spec, persist=persist)
 
         self.env["AI_HOUSE_BASE_URL"] = base_url
         self.env["AI_HOUSE_MODEL"] = model
@@ -1902,6 +1934,16 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 if not self._need(parsed, "owner"):
                     return
                 self._send_json(daemon.get_plugins_settings_view())
+                return
+            if parsed.path == "/api/usage":
+                if not self._need(parsed, "read"):
+                    return
+                qs = parse_qs(parsed.query)
+                try:
+                    days = int((qs.get("days") or ["7"])[0])
+                except (TypeError, ValueError):
+                    days = 7
+                self._send_json(daemon.get_usage_summary(days=days))
                 return
             if parsed.path == "/api/state":
                 if not self._need(parsed, "read"):
