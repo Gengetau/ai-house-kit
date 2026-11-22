@@ -658,7 +658,15 @@ class PluginRegistry:
     ) -> "PluginRegistry":
         """Discover built-in plugins, filesystem packs, and third-party entry points safely."""
         # 1) Built-in declarative plugins
-        from .builtin_plugins import book_nook, city_mcp_outing, dice_tabletop, onebot_ws, sticker_pack, svg_wardrobe_studio
+        from .builtin_plugins import (
+            book_nook,
+            city_mcp_outing,
+            dice_tabletop,
+            group_behavior,
+            onebot_ws,
+            sticker_pack,
+            svg_wardrobe_studio,
+        )
 
         for mod in (
             city_mcp_outing,
@@ -667,6 +675,7 @@ class PluginRegistry:
             onebot_ws,
             sticker_pack,
             dice_tabletop,
+            group_behavior,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 
