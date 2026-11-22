@@ -31,6 +31,7 @@ from worldkernel.store import VirtualClock, WallClock
 
 from . import __version__
 from .auth import AuthPolicy, check_bind, host_is_loopback, mcp_tier, origin_is_loopback, tier_for_channel
+from .backup import create_backup, list_backups
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_compatible_chat
 from .chat_guard import ReplyGuard
@@ -913,6 +914,23 @@ class HouseDaemon:
         enabled = "group_behavior" in {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored)}
         cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored)
         return {"ok": True, "enabled": enabled, "config": cfg, **self.group_behavior.status_view(now=self.clock.now())}
+
+    def list_backup_snapshots(self) -> Dict[str, Any]:
+        return {"ok": True, "backups": list_backups(self.runtime_dir)}
+
+    def create_backup_snapshot(self, spec: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(spec or {})
+        keep_count = int(data.get("keep_count") or 10)
+        keep_days = int(data.get("keep_days") or 14)
+        with self._async_job_lock, self._lock:
+            res = create_backup(
+                self.runtime_dir,
+                keep_count=keep_count,
+                keep_days=keep_days,
+                now=self.clock.now(),
+            )
+            res["backups"] = list_backups(self.runtime_dir)
+            return res
 
     def mutate_group_behavior(self, spec: Mapping[str, Any]) -> Dict[str, Any]:
         data = dict(spec or {})
@@ -2222,6 +2240,11 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     lim = 50
                 self._send_json(daemon.get_outbox_view(limit=lim))
                 return
+            if parsed.path == "/api/backups":
+                if not self._need(parsed, "owner"):
+                    return
+                self._send_json(daemon.list_backup_snapshots())
+                return
             if parsed.path == "/api/group/behavior":
                 if not self._need(parsed, "owner"):
                     return
@@ -2419,6 +2442,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 "/api/residents",
                 "/api/residents/update",
                 "/api/setup/reset",
+                "/api/backup",
             ):
                 tier = "owner"
             elif parsed.path in ("/api/step", "/api/avatar", "/api/house/avatar", "/api/stock", "/api/city/depart", "/api/city/return"):
@@ -2476,6 +2500,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 if parsed.path == "/api/setup/reset":
                     self._send_json(daemon.reset_house())
+                    return
+                if parsed.path == "/api/backup":
+                    self._send_json(daemon.create_backup_snapshot(body if isinstance(body, dict) else {}))
                     return
                 if parsed.path == "/api/intents/cancel":
                     if daemon.needs_onboarding or daemon.intents is None:
