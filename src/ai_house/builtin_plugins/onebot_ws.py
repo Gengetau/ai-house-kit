@@ -204,6 +204,8 @@ class OneBotChannel(ChannelPlugin):
 
     def start(self, host: Any) -> None:
         self._host = host
+        if getattr(host, "identity_store", None) is not None:
+            host.identity_store.sync_onebot_owners(self.cfg.owners)
         roster = list(host.vocab.ROSTER)
         if not self.actor:
             self.actor = roster[0]
@@ -359,8 +361,10 @@ class OneBotChannel(ChannelPlugin):
             return "self_or_unknown", {}
         kind = ev.get("message_type")
         gid = ""
+        id_store = getattr(self._host, "identity_store", None)
+        is_mapped_owner = bool(id_store is not None and id_store.is_owner_external("onebot", uid))
         if kind == "private":
-            if uid not in self.cfg.owners:
+            if uid not in self.cfg.owners and not is_mapped_owner:
                 return "private_not_owner", {}
         elif kind == "group":
             gid = _id(ev.get("group_id"))
@@ -385,16 +389,25 @@ class OneBotChannel(ChannelPlugin):
         if self.cfg.stale_s > 0 and isinstance(stamp, (int, float)) and time.time() - stamp > self.cfg.stale_s:
             return self._ignore("stale")  # backlog from before a reconnect or a slow model: do not answer late
         uid, kind, text, nick = info["uid"], info["kind"], info["text"], info["nick"]
-        speaker: Speaker
+        id_store = getattr(self._host, "identity_store", None)
+        is_cfg_owner = uid in self.cfg.owners
+        if id_store is not None:
+            speaker = id_store.resolve_speaker(
+                "onebot",
+                uid,
+                fallback_name=nick or ("房主" if is_cfg_owner else ""),
+                default_owner=is_cfg_owner,
+            )
+        else:
+            speaker = owner_speaker(nick or "房主", uid) if (kind == "private" or is_cfg_owner) else member_speaker(nick, uid)
+        if speaker.is_bot:
+            return self._ignore("bot_speaker")
         if kind == "private":
-            speaker = owner_speaker(nick or "房主", uid)
             channel, key, target, actor = f"private:{self.actor}", f"private:{uid}", uid, None
         else:
             gid = info["gid"]
-            is_owner = uid in self.cfg.owners
-            speaker = owner_speaker(nick or "房主", uid) if is_owner else member_speaker(nick, uid)
             # the owner has their own budget in a group, so members cannot use it up
-            channel, key, target, actor = f"qq-group:{gid}", f"group:{gid}:{'owner' if is_owner else 'member'}", gid, self.actor
+            channel, key, target, actor = f"qq-group:{gid}", f"group:{gid}:{'owner' if speaker.is_owner else 'member'}", gid, self.actor
             if not text:
                 text = "（只@了你一下，没说别的）"
         if not text:

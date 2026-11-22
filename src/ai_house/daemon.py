@@ -36,6 +36,7 @@ from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_com
 from .chat_guard import ReplyGuard
 from .chat_identity import Speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
+from .identity import IdentityStore
 from .llm import ModelRouter
 from .memory import MemoryStore
 from .onboarding import (
@@ -167,6 +168,7 @@ class HouseDaemon:
 
         self.settings_store = SettingsStore(self.runtime_dir)
         self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
+        self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
         self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env)
         stored_plugins = self.settings_store.get_plugins_map()
@@ -325,6 +327,8 @@ class HouseDaemon:
         self.intents = IntentsLite(self.world_db, vocab=self.vocab)
         self.intents.init()
         self._rebuild_llm_and_guard()
+        if getattr(self, "identity_store", None) is not None:
+            self.identity_store.sync_residents(self.vocab.ROSTER, self.vocab.NAMES)
         life_chat = (
             self.model_router.chat_fn(purpose="life")
             if (self._llm_fn is None and self.model_router.has_live_endpoint(purpose="life"))
@@ -424,6 +428,8 @@ class HouseDaemon:
             self._teardown_world()
         if getattr(self, "model_router", None) is not None:
             self.model_router.close()
+        if getattr(self, "identity_store", None) is not None:
+            self.identity_store.close()
 
     def _run_post_step_jobs(self) -> None:
         """Run slow periodic memory/diary LLM jobs outside `self._lock` so `/api/state` never stalls."""
@@ -722,8 +728,8 @@ class HouseDaemon:
             now=self.clock.now(),
         )
 
-    def send_chat(self, channel: str, text: str, sender_name: str = "房主") -> Dict[str, Any]:
-        """Web studio / MCP entry. The caller already passed the token tier check, so the speaker is the owner."""
+    def send_chat(self, channel: str, text: str, sender_name: str = "房主", *, external_id: str = "") -> Dict[str, Any]:
+        """Web studio / MCP entry. The caller already passed the token tier check, so default speaker is the owner."""
         self._require_world()
         channel = str(channel or "group")
         if channel != "group":
@@ -731,7 +737,46 @@ class HouseDaemon:
             if aid not in self.vocab.ROSTER:
                 raise ValueError(f"未知室友: {aid}")
             channel = f"private:{aid}"
-        return self.converse(channel, text, owner_speaker(sender_name))
+        ext = str(external_id or "").strip()
+        if ext and getattr(self, "identity_store", None) is not None:
+            spk = self.identity_store.resolve_speaker("web", ext, fallback_name=sender_name, default_owner=False)
+            if channel != "group" and not spk.is_owner:
+                raise ValueError("私聊仅限房主身份")
+        elif getattr(self, "identity_store", None) is not None:
+            spk = self.identity_store.resolve_speaker("web", "owner", fallback_name=sender_name, default_owner=True)
+        else:
+            spk = owner_speaker(sender_name)
+        return self.converse(channel, text, spk)
+
+    def list_identities(self) -> Dict[str, Any]:
+        return {"ok": True, "identities": self.identity_store.list_identities()}
+
+    def mutate_identity(self, spec: Mapping[str, Any]) -> Dict[str, Any]:
+        data = dict(spec or {})
+        op = str(data.get("op") or "").strip().lower()
+        if op == "upsert":
+            ent = self.identity_store.upsert_identity(
+                str(data.get("identity_id") or ""),
+                kind=str(data.get("kind") or "visitor"),
+                display_name=str(data.get("display_name") or ""),
+                notes=str(data.get("notes") or ""),
+            )
+            return {"ok": True, "identity": ent, "identities": self.identity_store.list_identities()}
+        if op == "bind":
+            binding = self.identity_store.bind_external(
+                str(data.get("platform") or ""),
+                str(data.get("external_id") or ""),
+                str(data.get("identity_id") or ""),
+                meta=data.get("meta") if isinstance(data.get("meta"), Mapping) else None,
+            )
+            return {"ok": True, "binding": binding, "identities": self.identity_store.list_identities()}
+        if op == "unbind":
+            removed = self.identity_store.unbind_external(
+                str(data.get("platform") or ""),
+                str(data.get("external_id") or ""),
+            )
+            return {"ok": True, "removed": removed, "identities": self.identity_store.list_identities()}
+        raise ValueError(f"不支持的身份操作：{op or '(空)'}")
 
     def converse(
         self,
@@ -752,6 +797,14 @@ class HouseDaemon:
         if not text:
             raise ValueError("消息不能为空")
         text = text[:2000]
+        if speaker.is_bot:
+            return {
+                "ok": True,
+                "channel": channel,
+                "replies": [],
+                "ignored": "bot_speaker",
+                "messages": self.list_chat(channel, limit=40),
+            }
         if not speaker.is_owner:
             text = one_line(text)  # a member's message stays one line of its own in every later prompt
         with self._lock:
@@ -934,6 +987,7 @@ class HouseDaemon:
                     channel=mem_ch,
                     speaker=speaker.name,
                     speaker_role=speaker_role,
+                    speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
                     reply="" if rep["mode"] in ("blocked", "sleeping") else rep["text"],
                     now=now,
                 )
@@ -1935,6 +1989,11 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 self._send_json(daemon.get_plugins_settings_view())
                 return
+            if parsed.path == "/api/identities":
+                if not self._need(parsed, "owner"):
+                    return
+                self._send_json(daemon.list_identities())
+                return
             if parsed.path == "/api/usage":
                 if not self._need(parsed, "read"):
                     return
@@ -2115,6 +2174,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 "/api/setup/test-llm",
                 "/api/settings/llm",
                 "/api/settings/plugins",
+                "/api/identities",
                 "/api/residents",
                 "/api/residents/update",
                 "/api/setup/reset",
@@ -2155,6 +2215,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 if parsed.path == "/api/settings/plugins":
                     self._send_json(daemon.update_plugin_settings(body if isinstance(body, dict) else {}))
                     return
+                if parsed.path == "/api/identities":
+                    self._send_json(daemon.mutate_identity(body if isinstance(body, dict) else {}))
+                    return
                 if parsed.path == "/api/residents":
                     self._send_json(daemon.add_resident(body if isinstance(body, dict) else {}))
                     return
@@ -2174,6 +2237,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                         channel=str(body.get("channel") or "group"),
                         text=str(body.get("text") or ""),
                         sender_name=str(body.get("sender_name") or "房主"),
+                        external_id=str(body.get("external_id") or ""),
                     )
                     self._send_json(res)
                     return

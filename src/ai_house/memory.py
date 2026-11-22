@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS seen (
     channel TEXT NOT NULL,
     speaker TEXT NOT NULL DEFAULT '',
     speaker_role TEXT NOT NULL DEFAULT 'member',
+    speaker_id TEXT NOT NULL DEFAULT '',
     line TEXT NOT NULL,
     ts REAL NOT NULL,
     done INTEGER NOT NULL DEFAULT 0
@@ -188,6 +189,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_expires ON mem(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_mem_ver_mem ON mem_ver(mem_id, replaced);
 CREATE INDEX IF NOT EXISTS idx_seen_pending ON seen(actor, scope, channel, done, id);
 CREATE INDEX IF NOT EXISTS idx_seen_ts ON seen(actor, ts);
+CREATE INDEX IF NOT EXISTS idx_seen_speaker_id ON seen(actor, speaker_id);
 """
 
 
@@ -479,6 +481,7 @@ class NarrowMemoryAPI:
         channel: str = "",
         speaker: str = "",
         speaker_role: Optional[str] = None,
+        speaker_id: str = "",
         reply: str = "",
         now: Optional[float] = None,
     ) -> int:
@@ -489,6 +492,7 @@ class NarrowMemoryAPI:
             channel=channel,
             speaker=speaker,
             speaker_role=speaker_role,
+            speaker_id=speaker_id,
             reply=reply,
             now=now,
         )
@@ -653,6 +657,7 @@ class MemoryStore:
             for col_name, col_ddl in (
                 ("speaker", "TEXT NOT NULL DEFAULT ''"),
                 ("speaker_role", "TEXT NOT NULL DEFAULT 'member'"),
+                ("speaker_id", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if col_name not in seen_cols:
                     c.execute(f"ALTER TABLE seen ADD COLUMN {col_name} {col_ddl}")
@@ -796,13 +801,14 @@ class MemoryStore:
         channel: str = "",
         speaker: str = "",
         speaker_role: Optional[str] = None,
+        speaker_id: str = "",
         reply: str = "",
         now: Optional[float] = None,
     ) -> int:
         """Record a conversation or world event turn as raw material for periodic extraction.
 
         Non-owner private messages (`scope='private'` with `speaker_role != 'owner'`) and secret-bearing
-        lines are ignored (`returns 0`) so unverified DMs or credentials never enter `memory.db`.
+        or external bot lines are ignored (`returns 0`) so unverified DMs or bot chatter never enter `memory.db`.
         """
         actor = self._valid_actor(actor)
         scope = self._valid_scope(scope)
@@ -813,31 +819,34 @@ class MemoryStore:
             else ("owner" if scope == "private" else "world" if scope == "world" else "member")
         ).strip().lower()
 
+        if role == "bot":
+            return 0
         if scope == "private" and role not in ("owner", "self"):
             return 0
 
         ts = self._now(now)
-        entries: List[Tuple[str, str, str]] = []
+        entries: List[Tuple[str, str, str, str]] = []
+        in_speaker_id = str(speaker_id or ("user:owner" if role == "owner" else "")).strip()
 
         clean_in = _clean_line(text, single_line=(role != "owner"))
         if clean_in and not _SECRETS_RE.search(clean_in):
             spk = _clean_speaker(speaker, role)
             formatted = clean_in if role == "world" and not speaker else f"[{spk}]: {clean_in}"
-            entries.append((spk, role, formatted[:MAX_LINE_CHARS]))
+            entries.append((spk, role, in_speaker_id, formatted[:MAX_LINE_CHARS]))
 
         clean_rep = _clean_line(reply, single_line=True)
         if clean_rep and not _SECRETS_RE.search(clean_rep):
             self_name = self.names.get(actor, actor)
-            entries.append((self_name, "self", f"[{self_name}(自己)]: {clean_rep}"[:MAX_LINE_CHARS]))
+            entries.append((self_name, "self", f"resident:{actor}", f"[{self_name}(自己)]: {clean_rep}"[:MAX_LINE_CHARS]))
 
         if not entries:
             return 0
 
         with self._lock, self._connect() as c:
             c.executemany(
-                "INSERT INTO seen(actor, scope, channel, speaker, speaker_role, line, ts, done) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, 0)",
-                [(actor, scope, resolved_ch, spk, r_role, ln, ts) for spk, r_role, ln in entries],
+                "INSERT INTO seen(actor, scope, channel, speaker, speaker_role, speaker_id, line, ts, done) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                [(actor, scope, resolved_ch, spk, r_role, spk_id, ln, ts) for spk, r_role, spk_id, ln in entries],
             )
         return len(entries)
 
