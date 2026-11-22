@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ..plugin_api import LifeExtension
+from ..plugin_api import ConfigField, LifeExtension, PluginDefinition, PluginManifest, ToolRegistration
 
 _BOOK_TOPICS = (
     "《海边小站气象手记》：记着晴空都北环线的旧车站故事",
@@ -18,13 +18,21 @@ class BookNookExtension(LifeExtension):
 
     shops = False
 
-    def __init__(self, life: Any):
+    def __init__(self, life: Any, max_notes: int = 12):
         super().__init__(life)
+        self.max_notes = max(1, min(int(max_notes or 12), 50))
         self._seen_event_id = int(self.life.get("book_nook:cursor") or 0)
 
     @classmethod
     def from_env(cls, life: Any, env: Optional[Dict[str, str]] = None) -> "BookNookExtension":
-        return cls(life)
+        import os
+
+        eff = os.environ if env is None else env
+        try:
+            max_notes = int((eff.get("AI_HOUSE_BOOK_NOOK_MAX_NOTES") or "12").strip())
+        except ValueError:
+            max_notes = 12
+        return cls(life, max_notes=max_notes)
 
     def step(self) -> None:
         with self.life.s.read() as db:
@@ -53,7 +61,7 @@ class BookNookExtension(LifeExtension):
         with self.life.s.tx():
             self.life.put("book_nook:cursor", max_eid)
             if changed:
-                self.life.put("book_nook:notes", notes[-12:])
+                self.life.put("book_nook:notes", notes[-self.max_notes:])
         self._seen_event_id = max_eid
 
     def context(self, actor_id: str, decision_kind: str) -> Optional[Dict[str, Any]]:
@@ -69,3 +77,29 @@ TOOL_SPEC = {
     "description": "翻看合租屋客厅书架上大家留下的公开读书便签。",
     "parameters": {"type": "object", "properties": {}},
 }
+
+
+PLUGIN_DEF = PluginDefinition(
+    manifest=PluginManifest(
+        plugin_id="book_nook",
+        name="客厅书架便签",
+        kind="extension",
+        version="0.3.0",
+        description="室友读书结束后自动记录公开读书便签，并向对话提供书架工具与生活上下文。",
+        default_enabled=True,
+        config_fields=(
+            ConfigField(
+                key="max_notes",
+                label="保留便签条数",
+                field_type="int",
+                default=12,
+                min_val=1,
+                max_val=50,
+                env_var="AI_HOUSE_BOOK_NOOK_MAX_NOTES",
+                description="客厅书架最多保留的最新公开读书便签条数（1–50）。",
+            ),
+        ),
+    ),
+    extension_factory=BookNookExtension.from_env,
+    tools=(ToolRegistration(spec=TOOL_SPEC, handler=None, plugin_id="book_nook"),),
+)

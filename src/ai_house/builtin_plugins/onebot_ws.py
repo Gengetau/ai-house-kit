@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from ..chat_identity import Speaker, member_speaker, owner_speaker
-from ..plugin_api import ChannelPlugin
+from ..plugin_api import ChannelPlugin, ConfigField, PluginDefinition, PluginManifest
 
 
 class ChannelConfigError(ValueError):
@@ -469,3 +469,97 @@ class OneBotChannel(ChannelPlugin):
         if resp.get("status") == "ok" or resp.get("retcode") == 0:
             return True, "ok"
         return False, f"retcode_{resp.get('retcode')}"
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg_values: Mapping[str, Any],
+        env: Optional[Mapping[str, str]] = None,
+    ) -> Optional["OneBotChannel"]:
+        merged = dict(env or {})
+        mapping = {
+            "ws_url": "ONEBOT_WS_URL",
+            "access_token": "ONEBOT_ACCESS_TOKEN",
+            "owner_qq": "ONEBOT_OWNER_QQ",
+            "actor": "ONEBOT_ACTOR",
+            "groups": "ONEBOT_GROUPS",
+            "max_per_hour": "ONEBOT_MAX_PER_HOUR",
+        }
+        for key, env_name in mapping.items():
+            if key in cfg_values and cfg_values[key] not in (None, ""):
+                val = cfg_values[key]
+                merged[env_name] = ",".join(str(x) for x in val) if isinstance(val, (list, tuple)) else str(val)
+        return cls.from_env(merged)
+
+
+PLUGIN_DEF = PluginDefinition(
+    manifest=PluginManifest(
+        plugin_id="onebot_v11",
+        name="QQ / OneBot v11",
+        kind="channel",
+        version="0.3.0",
+        description="通过外部 OneBot v11 正向 WebSocket 服务连接 QQ 私聊与白名单群聊。",
+        default_enabled=False,
+        requires_packages=("websockets",),
+        config_fields=(
+            ConfigField(
+                key="ws_url",
+                label="WebSocket 地址",
+                field_type="string",
+                default="",
+                required=True,
+                env_var="ONEBOT_WS_URL",
+                placeholder="ws://127.0.0.1:3001",
+                description="OneBot 正向 WebSocket 地址（不要在 URL 中携带 token 查询串）。",
+            ),
+            ConfigField(
+                key="access_token",
+                label="访问令牌 (Access Token)",
+                field_type="string",
+                default="",
+                secret=True,
+                env_var="ONEBOT_ACCESS_TOKEN",
+                description="通过请求头鉴权的 OneBot Access Token，仅加密脱敏展示。",
+            ),
+            ConfigField(
+                key="owner_qq",
+                label="房主 QQ 号",
+                field_type="string",
+                default="",
+                required=True,
+                env_var="ONEBOT_OWNER_QQ",
+                placeholder="多个用逗号分隔",
+                description="唯一允许向室友下指令的房主 QQ 号，多个用逗号分隔。",
+            ),
+            ConfigField(
+                key="actor",
+                label="绑定室友代号",
+                field_type="string",
+                default="",
+                env_var="ONEBOT_ACTOR",
+                placeholder="留空默认首位住客",
+                description="此 QQ 账号对应的住客 actor ID（如 nell / sora）。",
+            ),
+            ConfigField(
+                key="groups",
+                label="白名单 QQ 群",
+                field_type="string",
+                default="",
+                env_var="ONEBOT_GROUPS",
+                placeholder="多个群号用逗号分隔，留空不响应群聊",
+                description="仅在这些群里被 @ 时回应。",
+            ),
+            ConfigField(
+                key="max_per_hour",
+                label="单会话每小时上限",
+                field_type="int",
+                default=30,
+                min_val=1,
+                max_val=3600,
+                env_var="ONEBOT_MAX_PER_HOUR",
+                description="每个私聊/群会话每小时最多回复条数（1–3600）。",
+            ),
+        ),
+    ),
+    channel_factory=OneBotChannel.from_env,
+)

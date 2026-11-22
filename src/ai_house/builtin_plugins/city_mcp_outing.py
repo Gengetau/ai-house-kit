@@ -49,6 +49,8 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from worldkernel import materials
 
+from ..plugin_api import ConfigField, PluginDefinition, PluginManifest
+
 log = logging.getLogger("ai_house.city_mcp_outing")
 
 DEFAULT_FEDERATION_PLACES = (
@@ -839,3 +841,53 @@ class CityMcpOutingExtension:
         if cursor is not None:
             args["cursor"] = str(cursor)
         return client.call_tool("world_wait", args)
+
+
+PLUGIN_DEF = PluginDefinition(
+    manifest=PluginManifest(
+        plugin_id="city_mcp_outing",
+        name="晴空都公共城市远足",
+        kind="extension",
+        version="0.3.0",
+        description="通过 Streamable HTTP MCP 接入共享晴空都城市世界（单室友单令牌隔离）。",
+        default_enabled=False,
+        config_fields=(
+            ConfigField(
+                key="mcp_url",
+                label="城市 MCP 地址",
+                field_type="string",
+                default="",
+                env_var="CITY_FEDERATION_MCP_URL",
+                placeholder="http://qingkong-city:7700/mcp",
+                description="公共晴空都 MCP 服务端点 URL。",
+            ),
+            ConfigField(
+                key="house_tag",
+                label="小屋名牌标识",
+                field_type="string",
+                default="樱丘小屋",
+                env_var="CITY_FEDERATION_HOUSE_TAG",
+                description="进城访问记录的小屋展示标识。",
+            ),
+            ConfigField(
+                key="shared_token",
+                label="单室友共享城市令牌",
+                field_type="string",
+                default="",
+                secret=True,
+                env_var="CITY_FEDERATION_TOKEN",
+                description="只带一名室友出城时的 Bearer 令牌；多人出城请按住客设 CITY_FEDERATION_TOKEN_<ACTOR>。",
+            ),
+            ConfigField(
+                key="actors",
+                label="绑定出城室友",
+                field_type="string",
+                default="",
+                env_var="CITY_FEDERATION_ACTORS",
+                placeholder="例如 nell",
+                description="使用共享令牌时必须精确指定一名室友 actor ID。",
+            ),
+        ),
+    ),
+    extension_factory=CityMcpOutingExtension.from_env,
+)

@@ -31,6 +31,7 @@ from worldkernel.store import VirtualClock, WallClock
 
 from . import __version__
 from .auth import AuthPolicy, check_bind, host_is_loopback, mcp_tier, origin_is_loopback, tier_for_channel
+from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_compatible_chat
 from .chat_guard import ReplyGuard
 from .chat_identity import Speaker, one_line, owner_speaker
@@ -155,8 +156,9 @@ class HouseDaemon:
             self.clock = OffsetWallClock(self.runtime_dir / "clock_offset.json")
 
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
+        self._plugin_runtime_errors: List[Dict[str, str]] = []
         self._active_tools = self.registry.active_tools(self.env)
-        self.providers = [factory() for factory in self.registry.providers.values()]
+        self.providers = [inst for _, inst in self.registry.active_providers(self.env)]
         self.channels = []
         self.authority: Any = None
         self.memory: Any = None
@@ -178,11 +180,24 @@ class HouseDaemon:
             else:
                 self._mount_world(None)
 
-            for ch_factory in self.registry.channels.values():
-                inst = ch_factory(self.env) if callable(ch_factory) else None
-                if inst is not None:
-                    inst.start(self)
-                    self.channels.append(inst)
+            for ch_pid, ch_factory in self.registry.active_channels(self.env):
+                try:
+                    inst = ch_factory()
+                    if inst is not None:
+                        inst.start(self)
+                        self.channels.append(inst)
+                except ChannelConfigError:
+                    if ch_pid == "onebot_v11":
+                        raise
+                    self._plugin_runtime_errors.append({
+                        "plugin_id": ch_pid,
+                        "group": "ai_house.channels",
+                        "error": "ChannelConfigError",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    err = {"plugin_id": ch_pid, "group": "ai_house.channels", "error": f"{type(exc).__name__}: {exc}"}
+                    self._plugin_runtime_errors.append(err)
+                    self.log(f"plugin {ch_pid} channel load skipped: {err['error']}")
         except BaseException:
             self.close()
             raise
@@ -378,7 +393,14 @@ class HouseDaemon:
                 return self.get_state()
             self.authority.step()
             for p in self.providers:
-                p.step(self)
+                try:
+                    p.step(self)
+                except Exception as exc:  # noqa: BLE001
+                    pid = str(getattr(p, "provider_id", type(p).__name__))
+                    err = {"plugin_id": pid, "group": "ai_house.providers", "error": f"{type(exc).__name__}: {exc}"}
+                    if err not in self._plugin_runtime_errors:
+                        self._plugin_runtime_errors.append(err)
+                    self.log(f"provider {pid} step skipped: {err['error']}")
         self._run_post_step_jobs()
         snap = self.get_state()
         self._broadcast("state", {"now": snap["now_jst"], "ts": snap["now"]})
@@ -432,13 +454,7 @@ class HouseDaemon:
                     "city_enabled": False,
                     "city_trips": {},
                     "tools": sorted(self._active_tools.keys()),
-                    "plugins": {
-                        "packs": sorted(self.registry.packs.keys()),
-                        "channels": ["webchat"] + [c.channel_id for c in self.channels],
-                        "extensions": [],
-                        "providers": [p.provider_id for p in self.providers],
-                        "tools": sorted(self._active_tools.keys()),
-                    },
+                    "plugins": self._plugins_state_view(),
                 }
 
             k_uri = Path(self.life_db).resolve().as_uri() + "?mode=ro"
@@ -527,14 +543,23 @@ class HouseDaemon:
                 "city_enabled": bool(self.authority.city_bridge is not None or self._city_fed() is not None),
                 "city_trips": self._city_fed().active_sessions() if self._city_fed() is not None else {},
                 "tools": sorted(self._active_tools.keys()),
-                "plugins": {
-                    "packs": sorted(self.registry.packs.keys()),
-                    "channels": ["webchat"] + [c.channel_id for c in self.channels],
-                    "extensions": [e.__class__.__name__ for e in self.authority.life.extensions],
-                    "providers": [p.provider_id for p in self.providers],
-                    "tools": sorted(self._active_tools.keys()),
-                },
+                "plugins": self._plugins_state_view(),
             }
+
+    def _plugins_state_view(self) -> Dict[str, Any]:
+        errors = [e.to_dict() for e in self.registry.load_errors] + list(self._plugin_runtime_errors)
+        return {
+            "packs": sorted(self.registry.packs.keys()),
+            "channels": ["webchat"] + [c.channel_id for c in self.channels],
+            "extensions": (
+                [e.__class__.__name__ for e in self.authority.life.extensions if not getattr(e, "_is_stub", False)]
+                if self.authority is not None
+                else []
+            ),
+            "providers": [p.provider_id for p in self.providers],
+            "tools": sorted(self._active_tools.keys()),
+            "load_errors": errors,
+        }
 
     def _city_fed(self) -> Any:
         if self.authority is None:
