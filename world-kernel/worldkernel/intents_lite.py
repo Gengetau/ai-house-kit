@@ -40,10 +40,19 @@ CREATE TABLE IF NOT EXISTS owner_chat_queue (
 """
 
 _BUY_VERBS = ("买", "补货", "带点", "带些", "捎", "采购", "缺")
+_CN_NUMS = {"一": 1, "二": 2, "两": 2, "俩": 2, "三": 3}
 _DEFAULT_ITEM_ALIASES = {
     "鸡蛋": "egg", "牛奶": "milk", "大米": "rice", "米": "rice", "咖喱块": "curry_roux",
-    "猪肉": "pork", "鸡肉": "chicken", "牛肉": "beef", "土豆": "potato", "胡萝卜": "carrot",
-    "洋葱": "onion", "豆腐": "tofu", "面包": "bread", "薯片": "chips", "饼干": "cookie",
+    "猪肉": "pork", "鸡肉": "chicken", "牛肉": "beef", "鲜鱼": "fish", "鱼": "fish",
+    "土豆": "potato", "胡萝卜": "carrot", "洋葱": "onion", "卷心菜": "cabbage",
+    "包菜": "cabbage", "白菜": "cabbage", "豆腐": "tofu", "味噌": "miso",
+    "面粉": "flour", "意面": "pasta", "面条": "noodle", "乌冬": "noodle",
+    "乌冬面": "noodle", "炒面": "noodle", "奶酪": "cheese", "芝士": "cheese",
+    "黄油": "butter", "南瓜": "pumpkin", "苦瓜": "bitter_melon", "纳豆": "natto",
+    "青椒": "green_pepper", "面包": "bread", "饭团": "onigiri", "水果": "fruit",
+    "布丁杯": "pudding_cup", "布丁": "pudding_cup", "巧克力": "chocolate",
+    "薯片": "chips", "饼干": "cookie", "红茶": "black_tea", "咖啡": "coffee",
+    "可乐": "cola", "蜜瓜苏打": "melon_soda",
 }
 
 
@@ -169,7 +178,9 @@ class IntentsLite:
             if actor not in actors:
                 continue
             t = str(text or "")
-            if ("做了" in t or "做好了" in t) and any(w in summary for w in ("做饭", "咖喱", "火锅", "晚饭", "午饭", "早饭")):
+            if ("做了" in t or "做好了" in t) and not any(w in summary for w in ("过敏", "忌口", "不吃")) and any(
+                w in summary for w in ("做饭", "下厨", "煮", "咖喱", "火锅", "晚饭", "午饭", "早饭")
+            ):
                 return float(ts), f"script:{sid}"
             if "睡" in t and "睡" in summary:
                 return float(ts), f"script:{sid}"
@@ -205,12 +216,40 @@ class IntentsLite:
                             )
                 c.execute("UPDATE house_intents SET state='expired' WHERE state='open' AND expires_at<=?", (ts,))
 
+    def _resolve_item_id(self, raw_item):
+        raw = str(raw_item or "").strip()
+        if not raw:
+            return None
+        ingredients = getattr(self.vocab, "INGREDIENTS", None) if self.vocab else None
+        if ingredients is not None:
+            if raw in ingredients:
+                return raw
+            low = raw.lower()
+            if low in ingredients:
+                return low
+            for item_id, spec in ingredients.items():
+                lbl = str((spec or {}).get("label") or "").strip()
+                short = lbl.split("（", 1)[0].strip()
+                if raw in (lbl, short):
+                    return item_id
+            aliased = _DEFAULT_ITEM_ALIASES.get(raw)
+            if aliased and aliased in ingredients:
+                return aliased
+            return None
+        if re.fullmatch(r"[a-zA-Z0-9_]+", raw):
+            return raw.lower()
+        return _DEFAULT_ITEM_ALIASES.get(raw)
+
     def _detect_errand_item(self, text):
         if not any(v in text for v in _BUY_VERBS):
             return None, 1
-        candidates = dict(_DEFAULT_ITEM_ALIASES)
-        if self.vocab and getattr(self.vocab, "INGREDIENTS", None):
-            for item_id, spec in self.vocab.INGREDIENTS.items():
+        ingredients = getattr(self.vocab, "INGREDIENTS", None) if self.vocab else None
+        candidates = {
+            k: v for k, v in _DEFAULT_ITEM_ALIASES.items()
+            if ingredients is None or v in ingredients
+        }
+        if ingredients:
+            for item_id, spec in ingredients.items():
                 lbl = str((spec or {}).get("label") or "").strip()
                 if lbl:
                     candidates[lbl] = item_id
@@ -219,8 +258,15 @@ class IntentsLite:
                         candidates.setdefault(short, item_id)
         for label, item_id in sorted(candidates.items(), key=lambda kv: -len(kv[0])):
             if label in text:
-                m = re.search(rf"(\d+)\s*(?:个|盒|瓶|袋|份|斤)?\s*{re.escape(label)}", text)
-                qty = max(1, min(3, int(m.group(1)))) if m else 2
+                m = re.search(
+                    rf"([1-9]|[一二两俩三])\s*(?:个|盒|瓶|袋|份|斤|根|条|颗|包|块|束|片|杯|罐|听)?\s*{re.escape(label)}",
+                    text,
+                )
+                if m:
+                    tok = m.group(1)
+                    qty = _CN_NUMS[tok] if tok in _CN_NUMS else max(1, min(3, int(tok)))
+                else:
+                    qty = 2
                 return item_id, qty
         return None, 1
 
@@ -229,8 +275,35 @@ class IntentsLite:
         if not self.world_db:
             return None
         ts = float(now if now is not None else time.time())
-        extracted = list(intents or ())
-        if not extracted and owner_text:
+        extracted = [dict(it) for it in (intents or ()) if isinstance(it, dict)]
+        if extracted:
+            for it in extracted:
+                resolved = self._resolve_item_id(it.get("item"))
+                if resolved:
+                    it["item"] = resolved
+                    it["kind"] = "errand"
+                    continue
+                ctx_text = f"{owner_text}\n{it.get('text') or ''}"
+                if it.get("kind") == "errand" or any(v in ctx_text for v in _BUY_VERBS):
+                    det_item, det_qty = self._detect_errand_item(ctx_text)
+                    if det_item:
+                        it["item"] = det_item
+                        it["kind"] = "errand"
+                        if not it.get("qty"):
+                            it["qty"] = det_qty
+                        continue
+                it.pop("item", None)
+            if owner_text:
+                buy_item, buy_qty = self._detect_errand_item(owner_text)
+                if buy_item and not any(x.get("item") == buy_item for x in extracted):
+                    extracted.append({
+                        "text": f"和房主约好采购：{owner_text[:72]}",
+                        "kind": "errand",
+                        "item": buy_item,
+                        "qty": buy_qty,
+                        "答应了的": [actor],
+                    })
+        elif owner_text:
             combined = f"{owner_text}\n{reply_text}"
             buy_item, buy_qty = self._detect_errand_item(owner_text)
             if buy_item:
