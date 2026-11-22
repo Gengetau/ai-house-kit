@@ -41,6 +41,7 @@ from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .llm import ModelRouter
 from .memory import MemoryStore
+from .proactive import ProactiveEngine
 from .send_gate import SendGate
 from .onboarding import (
     ACCENT_OPTIONS,
@@ -174,6 +175,7 @@ class HouseDaemon:
         self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
         self.send_gate = SendGate(self)
         self.group_behavior = GroupBehaviorController(self.runtime_dir, clock=self.clock)
+        self.proactive = ProactiveEngine(self.runtime_dir, clock=self.clock)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
         self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env)
         stored_plugins = self.settings_store.get_plugins_map()
@@ -402,6 +404,12 @@ class HouseDaemon:
         self.needs_onboarding = False
         with self._lock:
             self.authority.step()
+            stored_pl = self.settings_store.get_plugins_map()
+            if (
+                "proactive_talk" in {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_pl)}
+                and not self.proactive.is_initialized()
+            ):
+                self.proactive.anchor(self.world_db, now=self.clock.now())
 
     def log(self, msg: str) -> None:
         print(f"[ai-house] {msg}", flush=True)
@@ -1694,6 +1702,8 @@ class HouseDaemon:
             raise
 
         with self._lock:
+            if pid == "proactive_talk" and enabled is True and not self.needs_onboarding and self.authority is not None:
+                self.proactive.anchor(self.world_db, now=self.clock.now())
             plugin_view = next((p for p in self._serialize_all_plugins() if p["plugin_id"] == pid), None)
             snap = self.get_state()
         self._broadcast("state", {"now": snap["now_jst"], "plugin_updated": pid})
@@ -1867,6 +1877,8 @@ class HouseDaemon:
                 self.send_gate.reset()
             if getattr(self, "group_behavior", None) is not None:
                 self.group_behavior.reset()
+            if getattr(self, "proactive", None) is not None:
+                self.proactive.reset()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():
