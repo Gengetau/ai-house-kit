@@ -25,9 +25,9 @@ from .plans import Plans
 from .wardrobe import Wardrobe
 
 JST = dt.timezone(dt.timedelta(hours=9))
-ROSTER = ("nell", "elsa", "alma", "mina", "yuki", "wanda")
-NAMES = {"nell": "奈尔", "elsa": "艾莎", "alma": "阿尔玛", "mina": "米娜", "yuki": "由纪", "wanda": "婉妲"}
-COOK_ORDER = ("nell", "elsa", "yuki", "wanda", "alma", "mina")  # who takes the stove first, by cooking skill
+ROSTER = V.ROSTER
+NAMES = V.NAMES
+COOK_ORDER = V.COOK_ORDER  # derived from WorldPack manifest & people/*.json
 # The house fridge target (genesis and the 17:30 restock). Ids are catalog life1 ingredients (renamed
 # salmon -> fish, noodles -> noodle, the bought pudding -> pudding_cup; beef is in because nikujaga now uses it).
 STOCK = {"egg": 12, "rice": 10, "tofu": 4, "miso": 4, "pork": 4, "chicken": 3, "fish": 3, "beef": 2, "potato": 8,
@@ -74,9 +74,13 @@ def synthetic_weather(ts):
 
 class Life:
     def __init__(self, store, model=None, limits=None, weather=None, seed_reality=None, extensions=(), seed_items=None,
-                 city_recovery=None):
+                 city_recovery=None, vocab=None):
+        self.V = vocab or V
+        self.roster = tuple(getattr(self.V, 'ROSTER', ROSTER))
+        self.names = dict(getattr(self.V, 'NAMES', NAMES))
+        self.cook_order = tuple(getattr(self.V, 'COOK_ORDER', self.roster))
         self.s, self.clock = store, store.clock
-        self.k = Kernel(store, ROSTER, vocab=V)
+        self.k = Kernel(store, self.roster, vocab=self.V)
         self.city_visits = self.k.city_visits
         self.preparing_city_visits = self.city_visits.recover_preparing(city_recovery)
         with self.s.tx() as c:
@@ -85,16 +89,16 @@ class Life:
         if not self.s.meta("seeded"):
             # what is left in the old house (inventory.legacy_items) comes along, once, with where it came from
             fixture = self._genesis(seed_reality or {})
-            extra, report = inventory.migrate(seed_items or (), STOCK, V, ROSTER)
+            extra, report = inventory.migrate(seed_items or (), STOCK, self.V, self.roster)
             fixture["resources"] += extra
             with self.s.tx():
                 self.k.seed(fixture, source="life1_genesis")
                 if seed_items is not None:
                     self.put("genesis:inventory", report)
         self.weather = weather or synthetic_weather
-        self.wardrobe = Wardrobe(self.k, V.PEOPLE)
-        self.plans = Plans(self.k, ROSTER)
-        self.meals = Meals(self.k, ROSTER, late_grace_s=2400)
+        self.wardrobe = Wardrobe(self.k, self.V.PEOPLE)
+        self.plans = Plans(self.k, self.roster)
+        self.meals = Meals(self.k, self.roster, late_grace_s=2400)
         self.budget = Budget(store, pool="world-kernel/life1", limits=limits or {"total": 10 ** 9, "per_hour": 40,
                                                                                  "per_day": 300})
         self.model = model
@@ -110,12 +114,12 @@ class Life:
     # ------------------------------------------------------------------ seed
     def _genesis(self, reality):
         actors = {}
-        for a in ROSTER:
+        for a in self.roster:
             r = reality.get(a) or {}
-            actors[a] = {"location": V.bed(a), "profile_ref": f"life1:people/{a}",
+            actors[a] = {"location": self.V.bed(a), "profile_ref": f"life1:people/{a}",
                          "body": {"hunger": float(r.get("hunger") or 30), "energy": float(r.get("energy") or 70)}}
         res = [{"id": k, "kind": "food", "location": "kitchen", "qty": q} for k, q in STOCK.items()]
-        res += [{"id": k, "kind": "anchor", "location": where, "qty": 1} for k, where in V.HOUSE["anchors"].items()]
+        res += [{"id": k, "kind": "anchor", "location": where, "qty": 1} for k, where in self.V.HOUSE["anchors"].items()]
         return {"actors": actors, "resources": res}
 
     # ------------------------------------------------------------------ runner memory (restart-safe)
@@ -135,7 +139,7 @@ class Life:
 
     # ------------------------------------------------------------------ helpers
     def person(self, a):
-        return V.PEOPLE[a]
+        return self.V.PEOPLE[a]
 
     def schedule(self, a, ts=None):
         d = jst(ts or self.clock.now())
@@ -213,7 +217,7 @@ class Life:
             ext.step()
         if not any(getattr(ext, "shops", False) for ext in self.extensions):
             self.restock_fallback()
-        for a in ROSTER:
+        for a in self.roster:
             if not self.city_visits.home_allowed(a):
                 continue
             self._answer_invitations(a)  # a phone thing: she can answer while her hands are busy
@@ -308,7 +312,7 @@ class Life:
         body = me["body"]
         # 6) tired: rest in her room
         if body.get("energy", 50) <= 20:
-            if self.go(a, V.bed(a), "rest"):
+            if self.go(a, self.V.bed(a), "rest"):
                 self.submit(a, "rest", {"seconds": 1800}, "rest")
             return
         # 7) hungry between meals: a snack, unless a meal is near
@@ -347,8 +351,8 @@ class Life:
         return t.timestamp()
 
     def _to_bed(self, a, day, now, until=None):
-        if self.k.actor(a)["location"] != V.bed(a) and not V.LOCATIONS[self.k.actor(a)["location"]].get("lodging"):
-            return self.go(a, V.bed(a), "bed")
+        if self.k.actor(a)["location"] != self.V.bed(a) and not self.V.LOCATIONS[self.k.actor(a)["location"]].get("lodging"):
+            return self.go(a, self.V.bed(a), "bed")
         w = self.weather(now)
         if self.wardrobe.dress(a, "sleep", w["temp_c"]):
             return
@@ -388,7 +392,7 @@ class Life:
         cue, _ = self.bedtime_window(a, now)
         if now < cue - 3600 and seconds < 4 * 3600:
             return
-        if me["location"] == V.bed(a) or V.LOCATIONS.get(me["location"], {}).get("lodging"):
+        if me["location"] == self.V.bed(a) or self.V.LOCATIONS.get(me["location"], {}).get("lodging"):
             self.wardrobe.dress(a, "sleep", self.weather(now)["temp_c"])
 
     def _stop_for_meal(self, a, args):
@@ -398,11 +402,11 @@ class Life:
         what she does about the meal is hers. The changed args, or None to leave them."""
         if not isinstance(args, dict) or args.get("party"):
             return None
-        spec, sec = V.ACTIVITIES.get(args.get("activity")), args.get("seconds")
+        spec, sec = self.V.ACTIVITIES.get(args.get("activity")), args.get("seconds")
         if not spec or type(sec) not in (int, float) or not spec["min"] <= sec <= spec["max"]:
             return None  # the kernel refuses it as it is
         now = self.clock.now()
-        if V.LOCATIONS.get(self.k.actor(a)["location"], {}).get("kind") != "room":
+        if self.V.LOCATIONS.get(self.k.actor(a)["location"], {}).get("kind") != "room":
             return None
         # the meal she is told of (next_meal: one not had yet, still on): a step decided just before it opens is
         # submitted a tick later, or after a move, when it is already on (review P3); then it runs its shortest.
@@ -428,7 +432,7 @@ class Life:
             return False
         # first up today somewhere else than her room (the outing engine had her from the moment she woke): what she
         # wears is left to _change_back, which takes her to her room first and leaves what she chose herself on
-        if self.wardrobe.current(a) and self.k.actor(a)["location"] != V.bed(a):
+        if self.wardrobe.current(a) and self.k.actor(a)["location"] != self.V.bed(a):
             return False
         w = self.weather(now)
         return bool(self.wardrobe.dress(a, "out" if self._outing_soon(a, now) else "home", w["temp_c"], w["rain"]))
@@ -442,7 +446,7 @@ class Life:
             return False
         if now >= cue - (3600 if cur["occasion"] == "sleep" else 0):
             return False
-        if V.LOCATIONS.get(self.k.actor(a)["location"], {}).get("kind") != "room":
+        if self.V.LOCATIONS.get(self.k.actor(a)["location"], {}).get("kind") != "room":
             return False
         soon = self._outing_soon(a, now)
         if cur["occasion"] == "out" and soon:
@@ -454,7 +458,7 @@ class Life:
         to = "out" if soon else "home"
         if not self.wardrobe.pick(a, to, w["temp_c"], w["rain"]):
             return False
-        if not self.go(a, V.bed(a), "change"):
+        if not self.go(a, self.V.bed(a), "change"):
             return True
         return bool(self.wardrobe.dress(a, to, w["temp_c"], w["rain"]))
 
@@ -489,10 +493,10 @@ class Life:
             if not self.go(a, p["location"], f"plan:{p['plan_id']}"):
                 return True
             if now >= p["start_at"] - 60:
-                act = p["what"] if p["what"] in V.ACTIVITIES else None
+                act = p["what"] if p["what"] in self.V.ACTIVITIES else None
                 self.put(f"joined:{a}:{p['plan_id']}", now)
                 if act:
-                    spec = V.ACTIVITIES[act]
+                    spec = self.V.ACTIVITIES[act]
                     end = p["end_at"] or (p["start_at"] + spec["default"])
                     sec = max(spec["min"], min(spec["max"], end - now))
                     args = {"activity": act, "seconds": round(sec), "party": p["plan_id"]}
@@ -515,11 +519,11 @@ class Life:
         got = self.get(key)
         if got and self.city_visits.home_allowed(got):
             return got
-        for a in COOK_ORDER:
+        for a in self.cook_order:
             if not self.city_visits.home_allowed(a):
                 continue
             me = self.k.actor(a)
-            if me["activity"] != "sleeping" and V.LOCATIONS[me["location"]]["kind"] == "room" and not any(
+            if me["activity"] != "sleeping" and self.V.LOCATIONS[me["location"]]["kind"] == "room" and not any(
                     ext.owns(a) for ext in self.extensions if getattr(ext, "owns", None)):
                 self.put(key, a)
                 return a
@@ -537,10 +541,10 @@ class Life:
         for r in rows:
             if not self.city_visits.home_allowed(r[0]):
                 continue
-            if r[1] == "eat" and r[2] in V.MAIN_FOODS:
+            if r[1] == "eat" and r[2] in self.V.MAIN_FOODS:
                 continue
             me = self.k.actor(r[0])
-            if me["activity"] != "sleeping" and V.LOCATIONS[me["location"]]["kind"] == "room":
+            if me["activity"] != "sleeping" and self.V.LOCATIONS[me["location"]]["kind"] == "room":
                 out.append(r[0])
         return out
 
@@ -548,7 +552,7 @@ class Life:
         with self.s.read() as c:
             rows = c.execute("SELECT resource_id,item FROM resources WHERE kind='food' AND location='kitchen'"
                              " AND holder IS NULL AND qty>0").fetchall()
-            return sum(self.k._free_qty(c, r[0]) or 0 for r in rows if r[1] in V.MAIN_FOODS)
+            return sum(self.k._free_qty(c, r[0]) or 0 for r in rows if r[1] in self.V.MAIN_FOODS)
 
     def cooking_now(self):
         with self.s.read() as c:
@@ -556,7 +560,7 @@ class Life:
                              ).fetchone()[0]
 
     def can_cook(self, recipe):
-        rec = V.RECIPES[recipe]
+        rec = self.V.RECIPES[recipe]
         with self.s.read() as c:
             for item, q in rec["consume"].items():
                 rows = c.execute("SELECT resource_id FROM resources WHERE item=? AND location='kitchen' AND holder IS NULL",
@@ -580,7 +584,7 @@ class Life:
         cannot = set(self.person(a)["cooking"].get("cannot", ()))
 
         def ready_by(until):
-            return [r for r, rec in V.RECIPES.items() if rec["main"] and slot in rec["meal"] and r not in cannot
+            return [r for r, rec in self.V.RECIPES.items() if rec["main"] and slot in rec["meal"] and r not in cannot
                     and (until is None or now + rec["seconds"] + EAT_MARGIN_S <= until) and self.can_cook(r)]
         got = ready_by(ends)
         if got or for_others or ends is None or now >= ends:
@@ -597,10 +601,10 @@ class Life:
     def meal_coming(self, row):
         """when the main dishes on the stove are ready, if they are in time for this meal and, with what is
         ready, make a serving for everyone still expecting it (a pot for one is not hers to wait for); else None."""
-        due = [(d, r) for _, r, d in self.cooking() if V.RECIPES.get(r, {}).get("main") and d + EAT_MARGIN_S <= row["ends"]]
+        due = [(d, r) for _, r, d in self.cooking() if self.V.RECIPES.get(r, {}).get("main") and d + EAT_MARGIN_S <= row["ends"]]
         if not due:
             return None
-        servings = self.ready_servings() + sum(V.RECIPES[r]["makes"].get(r, 0) for _, r in due)
+        servings = self.ready_servings() + sum(self.V.RECIPES[r]["makes"].get(r, 0) for _, r in due)
         return min(d for d, _ in due) if servings >= len(self.eaters(row["slot"], row["day"])) else None
 
     def l0_recipe(self, a, slot, need, quick=False):
@@ -613,10 +617,10 @@ class Life:
             return None
         rng = self.rng(a, slot, day_of(self.clock.now()))
         if quick:
-            return max(options, key=lambda r: (min(V.RECIPES[r]["makes"][r], need), -V.RECIPES[r]["seconds"],
-                                               r in p["good_at"], V.RECIPES[r]["difficulty"] <= p["skill"], rng.random()))
-        return max(options, key=lambda r: (r in p["good_at"], min(V.RECIPES[r]["makes"][r], need),
-                                           V.RECIPES[r]["difficulty"] <= p["skill"], rng.random()))
+            return max(options, key=lambda r: (min(self.V.RECIPES[r]["makes"][r], need), -self.V.RECIPES[r]["seconds"],
+                                               r in p["good_at"], self.V.RECIPES[r]["difficulty"] <= p["skill"], rng.random()))
+        return max(options, key=lambda r: (r in p["good_at"], min(self.V.RECIPES[r]["makes"][r], need),
+                                           self.V.RECIPES[r]["difficulty"] <= p["skill"], rng.random()))
 
     def _meal(self, a, day, now):
         row = self.meals.current(a)
@@ -664,20 +668,20 @@ class Life:
         # on the stove that is ready while the meal is on is coming (from 13:00 the four still waiting were
         # asked to decide while the pot was on, and missed it)
         hm_ = self.k.actor(head) if head else None
-        head_on_duty = hm_ and hm_["activity"] != "sleeping" and V.LOCATIONS[hm_["location"]]["kind"] == "room"
+        head_on_duty = hm_ and hm_["activity"] != "sleeping" and self.V.LOCATIONS[hm_["location"]]["kind"] == "room"
         coming = self.meal_coming(row) if a != head else None
         if a != head and (coming or head_on_duty and now < row["ends"] - 1800):
             # a pot that is coming is waited for in the kitchen, so it is served as soon as it is ready (review F7: on
             # the real clock a tick is 60 s plus the model calls in it, and the walk over, a hop a tick, took the
             # margin; for a pot ready five minutes before close two of them sat down after lunch had closed). Only from
             # inside the house: anywhere else she waits where she is, as before.
-            if coming and V.LOCATIONS[self.k.actor(a)["location"]]["kind"] == "room" and \
+            if coming and self.V.LOCATIONS[self.k.actor(a)["location"]]["kind"] == "room" and \
                     not self.go(a, "kitchen", f"wait_meal:{slot}"):
                 return True
             sec = int(max(60, min(600, coming - now + 60))) if coming else 600
             here = self.k.actor(a)["location"]
-            if PASS_TIME in V.ACTIVITIES and V.activity_allowed_at(PASS_TIME, a, here) and \
-                    sec >= V.ACTIVITIES[PASS_TIME]["min"]:
+            if PASS_TIME in self.V.ACTIVITIES and self.V.activity_allowed_at(PASS_TIME, a, here) and \
+                    sec >= self.V.ACTIVITIES[PASS_TIME]["min"]:
                 self.submit(a, "begin_activity", {"activity": PASS_TIME, "seconds": sec}, f"wait_meal:{slot}")
             else:
                 self.submit(a, "wait", {"seconds": sec}, f"wait_meal:{slot}")
@@ -687,7 +691,7 @@ class Life:
             return bool(got.get("action"))
         # the next main dish on the stove, if it is ready before the meal closes (sim7-b1r5 11-09: wanda waited
         # ten minutes at a time and was still waiting when mina's yakisoba came off at 13:28, two minutes before close)
-        soon = [d for _, r, d in self.cooking() if V.RECIPES.get(r, {}).get("main") and d + 60 < row["ends"]]
+        soon = [d for _, r, d in self.cooking() if self.V.RECIPES.get(r, {}).get("main") and d + 60 < row["ends"]]
         # she decides when she has a choice: with that pot on and nothing she could start herself (one stove, taken)
         # she waits for it first, and her one decision of the meal is not spent on an empty list (review P2-1: from
         # 09:00 the others were asked while a toast for one was on, and none of them made breakfast after it)
@@ -717,7 +721,7 @@ class Life:
         eating_snack). Never one she dislikes or never eats; one she likes four times as likely, otherwise as likely as
         there are pieces of it up to five, so the owner's gifts and the house bread are both eaten and no one big row
         (the house's 20 black tea) is most of it (review P3-5). Deterministic per person and minute."""
-        classes = classes or V.ACTIVITIES[activity]["eats"]
+        classes = classes or self.V.ACTIVITIES[activity]["eats"]
         taste = self.person(a).get("taste", {})
         no, likes = set(taste.get("dislikes", ())) | set(taste.get("never", ())), set(taste.get("likes", ()))
         with self.s.read() as c:
@@ -726,10 +730,10 @@ class Life:
                                                " location='kitchen')) ORDER BY resource_id", (a,))]
             options = []
             for r in rows:
-                spec = V.CATALOG["items"].get(r["item"], {})
-                if r["item"] not in V.SNACKS or spec.get("class") not in classes or r["item"] in no:
+                spec = self.V.CATALOG["items"].get(r["item"], {})
+                if r["item"] not in self.V.SNACKS or spec.get("class") not in classes or r["item"] in no:
                     continue
-                if here is not None and not V.snack_ok(r, activity, a, here):
+                if here is not None and not self.V.snack_ok(r, activity, a, here):
                     continue
                 free = self.k._free_qty(c, r["resource_id"]) or 0
                 if free > 0:
@@ -745,7 +749,7 @@ class Life:
         args with it, or None (not such an activity, already named, or nothing left: the kernel then refuses it)."""
         if not isinstance(args, dict) or "snack" in args:
             return None
-        spec = V.ACTIVITIES.get(args.get("activity"))
+        spec = self.V.ACTIVITIES.get(args.get("activity"))
         if not spec or not spec.get("eats"):
             return None
         got = self.snack_for(a, here=self.k.actor(a)["location"], activity=args["activity"])
@@ -777,15 +781,15 @@ class Life:
         rng = self.rng(a, day, n)
         pick = rng.choices(options, weights=[w * w for _, w, _ in options])[0]
         k, _, homes = pick
-        spec = V.ACTIVITIES[k]
+        spec = self.V.ACTIVITIES[k]
         hold = self.hold_until(a, now)  # the 一起刷站 she goes to; too close for this: she waits for it
         if hold and hold < now + spec["min"]:
             if hold - now > 60:
                 self.submit(a, "wait", {"seconds": int(hold - now)}, "before_browse")
             return
         here = self.k.actor(a)["location"]
-        where = here if (here in homes or (here == V.bed(a) and "own_room" in homes)) else (
-            V.bed(a) if homes[0] == "own_room" else homes[0])
+        where = here if (here in homes or (here == self.V.bed(a) and "own_room" in homes)) else (
+            self.V.bed(a) if homes[0] == "own_room" else homes[0])
         if not self.go(a, where, "pastime"):
             return
         sec = rng.randint(spec["min"], spec["max"])
@@ -818,7 +822,7 @@ class Life:
             cooling = {key.rsplit(":", 1)[1] for key, until in c.execute(
                 "SELECT key, value FROM life_runtime WHERE key LIKE ?", (f"pastime_cool:{a}:%",)) if json.loads(until) > now}
         options = []
-        for k, spec in V.ACTIVITIES.items():
+        for k, spec in self.V.ACTIVITIES.items():
             if k in avoid or spec["party"] and spec["party"].get("min", 1) > 1 or k == "bathing":
                 continue
             if room is not None and spec["min"] > room:
@@ -827,7 +831,7 @@ class Life:
                 continue
             if spec.get("eats") and not self.snack_for(a, activity=k):
                 continue  # nothing left to have (she may buy some: shopping)
-            homes = [w for w in spec["where"] if w == "own_room" or w in V.HOUSE["rooms"]]
+            homes = [w for w in spec["where"] if w == "own_room" or w in self.V.HOUSE["rooms"]]
             if not homes:
                 continue
             if k in ("music", "gardening") and not 8 * 60 <= m < 21 * 60:
@@ -896,9 +900,9 @@ class Life:
                "plans": [{k: p[k] for k in ("plan_id", "kind", "what", "location", "host", "members")} |
                          {"start": jst(p["start_at"]).strftime("%m-%d %H:%M")} for p in self.plans.upcoming(a)],
                "invitations": [self._invitation_seen(a, i) for i in self.plans.pending_for(a)],
-               "roommates": [r for r in ROSTER if r != a],
+               "roommates": [r for r in self.roster if r != a],
                # their names (on 11-03 wanda's line called yuki 星莉 and mina's called nell "nell")
-               "names": {r: NAMES[r] for r in ROSTER if r != a} | {"owner": "房主"}}
+               "names": {r: self.names.get(r, r) for r in self.roster if r != a} | {"owner": "房主"}}
         choices = self.wardrobe.wardrobe_choices(a)
         if choices:
             out["wardrobe_choices"] = choices
@@ -918,8 +922,8 @@ class Life:
             if row:
                 out.update(self.meal_context(a, row["slot"]))
         if kind == "free_time":
-            out["activities"] = {k: s["label"] for k, s in V.ACTIVITIES.items()}
-            out["places"] = {k: p["label"] for k, p in V.PLACES.items()}
+            out["activities"] = {k: s["label"] for k, s in self.V.ACTIVITIES.items()}
+            out["places"] = {k: p["label"] for k, p in self.V.PLACES.items()}
             out["roommates_now"] = self.roommates_now(a)
         for ext in self.extensions:
             if hasattr(ext, "context"):
@@ -939,23 +943,23 @@ class Life:
         behind a bedroom door or out of the house is not shown unless she is there too, and of the others' plans
         only the time they are taken, once agreed (an invitation not yet answered, and what or with whom, is theirs)."""
         now, out = self.clock.now(), {}
-        bedrooms = {V.bed(r) for r in ROSTER}
+        bedrooms = {self.V.bed(r) for r in self.roster}
         with self.s.read() as db:
             mine = db.execute("SELECT location FROM actors WHERE actor_id=?", (a,)).fetchone()
             here = mine[0] if mine else None
-            for r in ROSTER:
+            for r in self.roster:
                 row = db.execute("SELECT location, activity, action_id FROM actors WHERE actor_id=?", (r,)).fetchone()
                 if r == a or not row:
                     continue
                 loc, act = row[0], row[1]
-                seen = {"name": NAMES[r]}
-                outside = V.LOCATIONS.get(loc, {}).get("kind") != "room"
+                seen = {"name": self.names.get(r, r)}
+                outside = self.V.LOCATIONS.get(loc, {}).get("kind") != "room"
                 if outside:
                     seen["where"] = "外出"
                 else:
-                    seen["where"] = "她的卧室" if loc == V.bed(r) else loc
+                    seen["where"] = "她的卧室" if loc == self.V.bed(r) else loc
                 if act and act != "idle" and (loc == here or not (outside or loc in bedrooms)):
-                    seen["doing"] = "睡觉" if act == "sleeping" else V.ACTIVITIES.get(act, {}).get("label", act)
+                    seen["doing"] = "睡觉" if act == "sleeping" else self.V.ACTIVITIES.get(act, {}).get("label", act)
                     due = db.execute("SELECT due_at FROM actions WHERE action_id=?", (row[2],)).fetchone() \
                         if row[2] else None
                     if due and due[0] and due[0] > now:
@@ -985,15 +989,15 @@ class Life:
         ends = row["ends"] if row and row["slot"] == slot else None
         opts = {}
         for r in self.cook_choices(a, slot, for_others=head, lag=DECIDE_LAG_S):
-            rec, done = V.RECIPES[r], now + DECIDE_LAG_S + V.RECIPES[r]["seconds"]
+            rec, done = self.V.RECIPES[r], now + DECIDE_LAG_S + self.V.RECIPES[r]["seconds"]
             # when it is ready, and (review P2-4) that a dish ready after the meal closes is hers alone
             late = "（ends 之后才好，只算你自己这顿）" if ends is not None and done + EAT_MARGIN_S > ends else ""
             opts[r] = f"{rec['label']}，{rec['makes'][r]}人份，做{rec['seconds'] // 60}分钟，约{jst(done).strftime('%H:%M')}好{late}"
         # main dishes only, and how many each feeds (review P3-4: a soup on the stove was there to wait for)
         meal = {"slot": slot, "eaters": len(self.eaters(slot, day_of(now))), "ready_servings": self.ready_servings(),
-                "cooking": [{"who": w, "recipe": r, "servings": V.RECIPES[r]["makes"].get(r, 0),
+                "cooking": [{"who": w, "recipe": r, "servings": self.V.RECIPES[r]["makes"].get(r, 0),
                              "ready": jst(due).strftime("%H:%M")}
-                            for w, r, due in self.cooking() if V.RECIPES.get(r, {}).get("main")]}
+                            for w, r, due in self.cooking() if self.V.RECIPES.get(r, {}).get("main")]}
         if ends is not None:
             meal["ends"] = jst(ends).strftime("%H:%M")
         meal["note"] = ("要吃这顿的人数 eaters 里也算你。cook_options 只列现在开做、ends 前来得及做好的菜；一锅不够可以再做一锅。"

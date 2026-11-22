@@ -7,15 +7,17 @@ from contextlib import closing
 from .store import LockHeld
 
 
-def enabled():
+def enabled(env=None):
     # The base intents switch keeps owner reopen receipts draining after a phase-1 rollback.
-    return os.environ.get("INTENTS", "0") == "1" or any(os.environ.get(k, "0") not in ("0", "off", "") for k in (
+    src = os.environ if env is None else env
+    return src.get("INTENTS", "0") == "1" or any(src.get(k, "0") not in ("0", "off", "") for k in (
         "INTENTS_KERNEL_MATCH", "INTENTS_DECIDE_CTX", "WORLD_KERNEL_ERRANDS_FROM_INTENTS", "INTENTS_EXPIRY_V2"))
 
 
 class Promises:
-    def __init__(self, life, world_db, projector, intents):
+    def __init__(self, life, world_db, projector, intents, env=None):
         self.life, self.s, self.path, self.projector, self.intents = life, life.s, world_db, projector, intents
+        self._env = env
 
     def context(self, actor, kind):
         try:
@@ -104,7 +106,8 @@ class Promises:
         return body
 
     def run(self):
-        mode = os.environ.get("INTENTS_KERNEL_MATCH", "off")
+        src = os.environ if self._env is None else self._env
+        mode = src.get("INTENTS_KERNEL_MATCH", "off")
         if mode in ("shadow", "on"):
             # Reuse the legacy projector's stream binding and synthetic/live separation.
             with closing(self.projector._conn()) as c:

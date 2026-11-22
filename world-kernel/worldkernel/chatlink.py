@@ -38,7 +38,7 @@ class ChatLink:
         """-> [(actor, body)] taken from world.db (marked taken at once: a crash loses a nudge, never repeats one)."""
         if not self.world_db or not Path(self.world_db).exists():
             return []
-        c = sqlite3.connect(f"file:{self.world_db}?mode=rw", uri=True, timeout=5)
+        c = sqlite3.connect(Path(self.world_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
         try:
             if not c.execute("SELECT 1 FROM sqlite_master WHERE name='owner_chat_queue'").fetchone():
                 return []
@@ -51,7 +51,7 @@ class ChatLink:
                     body = json.loads(r[2])
                 except ValueError:
                     continue  # a bad row is already marked taken: it never comes back
-                if r[1] in V.PEOPLE and isinstance(body, dict):
+                if r[1] in getattr(self.life, 'V', V).PEOPLE and isinstance(body, dict):
                     out.append((r[1], body))
             return out
         finally:

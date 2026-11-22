@@ -5,6 +5,7 @@
   kernel the same road a food delivery does (queued in world.db, applied by the scheduler once per request key).
 Run: python3 -m unittest -v test_owner_stock_169   (temp dbs, synthetic clock, no model, no network)
 """
+import contextlib
 import datetime as dt
 import json
 import os
@@ -245,8 +246,9 @@ class OwnerEdits(Base):
 
     def test_old_queued_edits_expire(self):  # (queued, rolled back to shadow, authority again later)
         inventory.queue_owner_stock(self.wdb, "cmd:owner", "set", dict(id="milk", qty=1), "old")
-        with sqlite3.connect(self.wdb) as c:
-            c.execute("UPDATE owner_stock_queue SET created=? WHERE source_key='old'", (time.time() - 7200,))
+        with contextlib.closing(sqlite3.connect(self.wdb)) as c:
+            with c:
+                c.execute("UPDATE owner_stock_queue SET created=? WHERE source_key='old'", (time.time() - 7200,))
         inventory.process_owner_stock_queue(self.k, self.wdb)
         rec = inventory.queue_owner_stock(self.wdb, "cmd:owner", "set", dict(id="milk", qty=1), "old")
         self.assertEqual((rec["status"], rec["reason"]), ("failed", "expired"))
@@ -256,8 +258,9 @@ class OwnerEdits(Base):
         args = dict(name="可乐", qty=2)
         inventory.queue_owner_stock(self.wdb, "cmd:owner", "add", args, "late")
         first = inventory.receive_owner_stock(self.k, "cmd:owner", "late", "add", args)  # committed, then a crash
-        with sqlite3.connect(self.wdb) as c:  # and the restart comes 2 hours later
-            c.execute("UPDATE owner_stock_queue SET created=? WHERE source_key='late'", (time.time() - 7200,))
+        with contextlib.closing(sqlite3.connect(self.wdb)) as c:  # and the restart comes 2 hours later
+            with c:
+                c.execute("UPDATE owner_stock_queue SET created=? WHERE source_key='late'", (time.time() - 7200,))
         inventory.process_owner_stock_queue(self.k, self.wdb)
         self.assertEqual(inventory.queue_owner_stock(self.wdb, "cmd:owner", "add", args, "late"), first)
         self.assertEqual(first["status"], "succeeded")
@@ -312,6 +315,7 @@ class AuthorityStep(unittest.TestCase):
         self.clock = VirtualClock(dt.datetime(2026, 11, 7, 10, 0, tzinfo=JST).timestamp())
         self.a = authority.Authority(kpath, self.wpath, None, {}, clock=self.clock, model=FakeLifeModel(),
                                      migrate_items=False)
+        self.addCleanup(self.a.store.close)
         self.addCleanup(self.a.store.release)
         self.authority = authority
 

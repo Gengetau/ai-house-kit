@@ -1,5 +1,4 @@
 """Phase 1 & Phase 2 tests for the public 未分类 shelf, autonomous choice, and render outbox/relayer."""
-import fcntl
 import json
 import os
 import sys
@@ -15,7 +14,9 @@ from worldkernel.cognition import Cognition  # noqa: E402
 from worldkernel.kernel import Kernel  # noqa: E402
 from worldkernel.life import Life, ROSTER  # noqa: E402
 from worldkernel.store import Store, VirtualClock  # noqa: E402
-from worldkernel.wardrobe_render import WardrobeRenderLedger, sha256_bytes, verify_blob  # noqa: E402
+from worldkernel.wardrobe_render import (  # noqa: E402
+    WardrobeRenderLedger, _acquire_lock_nb, _release_lock, sha256_bytes, verify_blob,
+)
 
 BASE_TS = 1793671200.0  # 2026-11-03 10:00 JST
 PNG_A = b"\x89PNG\r\n\x1a\n" + b"PORTRAIT_V1_" * 8
@@ -145,6 +146,7 @@ def seed_world(store):
 class ShelfAndWardrobeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.asset_root = os.path.join(self.tmp.name, "assets")
         self.profiles_dir = os.path.join(self.tmp.name, "profiles")
         self.blob_root = os.path.join(self.tmp.name, "blobs")
@@ -173,7 +175,11 @@ class ShelfAndWardrobeTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        self.tmp.cleanup()
+        try:
+            if self.store.epoch is not None:
+                self.store.release()
+        finally:
+            self.store.close()
 
     def test_validate_garment_assets_accepts_bundles_without_count_cap(self):
         self.assertEqual(V.validate_garment_assets(self.shelf_doc), [])
@@ -229,6 +235,7 @@ class ShelfAndWardrobeTests(unittest.TestCase):
     def test_13_column_legacy_garments_db_upgrade(self):
         clock = VirtualClock(BASE_TS)
         s = Store(":memory:", synthetic=True, clock=clock)
+        self.addCleanup(s.close)
         s.acquire()
         with s.tx() as db:
             db.execute(
@@ -354,6 +361,7 @@ class ShelfAndWardrobeTests(unittest.TestCase):
     def test_live_model_autonomous_pick_then_change_end_to_end(self):
         clock = VirtualClock(BASE_TS)
         s = Store(":memory:", synthetic=True, clock=clock)
+        self.addCleanup(s.close)
         s.acquire()
         shelf = make_shelf(self.asset_root)
 
@@ -461,7 +469,7 @@ class ShelfAndWardrobeTests(unittest.TestCase):
         job = ledger.claim_next_job(now=now, blob_root=self.blob_root)
         lock_path = os.path.join(self.tmp.name, "exec.lock")
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _acquire_lock_nb(fd)
         try:
             ledger.begin_submit(job["job_id"], job["claim_token"], now=now, executor_lock_path=lock_path)
             # Even after 1 hour, live lock prevents recovery.
@@ -471,7 +479,7 @@ class ShelfAndWardrobeTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(status, "submitting")
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _release_lock(fd)
             os.close(fd)
         # Once lock is released (dead executor), recovery happens immediately without waiting for lease expiry.
         rec = ledger.recover_stale_submitting(now=now + 1)

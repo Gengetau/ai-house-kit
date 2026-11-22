@@ -1,6 +1,7 @@
 """聊天介入生活: world.db owner_chat_queue -> one decision of her own in the house; and his own
 「我到家了」 from chat puts the avatar in for two hours (owner card 11-06).
 Run: python3 -m unittest -v test_chatlink.py"""
+import contextlib
 import json
 import os
 import sqlite3
@@ -116,10 +117,11 @@ class ChatLinkTest(unittest.TestCase):
         import sqlite3
 
         def from_chat(body):  # what shared-services intents.presence_from_chat writes (the page cannot send via)
-            with sqlite3.connect(self.world_db) as c:
-                c.execute(avatar.QUEUE_SCHEMA)
-                c.execute("INSERT INTO owner_avatar_queue VALUES(?,?,'queued',NULL,?)",
-                          (body["cmd_id"], json.dumps(body, sort_keys=True), self.clock.now()))
+            with contextlib.closing(sqlite3.connect(self.world_db)) as c:
+                with c:
+                    c.execute(avatar.QUEUE_SCHEMA)
+                    c.execute("INSERT INTO owner_avatar_queue VALUES(?,?,'queued',NULL,?)",
+                              (body["cmd_id"], json.dumps(body, sort_keys=True), self.clock.now()))
         self.place("living", "yuki")
         from_chat({"op": "enter", "cmd_id": "chat-a", "session": "qqchat", "via": "chat", "location": "living",
                    "said_at": self.clock.now()})

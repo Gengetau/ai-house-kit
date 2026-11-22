@@ -1,0 +1,190 @@
+{
+ "key": "bedroom_0",
+ "size": [
+  276,
+  244
+ ],
+ "objects": [
+  {
+   "id": "bed",
+   "label": "床",
+   "x": 73,
+   "y": 96,
+   "w": 72,
+   "h": 59,
+   "ax": 0,
+   "ay": 0,
+   "depth": 61.0
+  },
+  {
+   "id": "nightstand",
+   "label": "床头柜和台灯",
+   "x": 103,
+   "y": 91,
+   "w": 24,
+   "h": 35,
+   "ax": 73,
+   "ay": 0,
+   "depth": 30.0
+  },
+  {
+   "id": "slippers",
+   "label": "拖鞋",
+   "x": 121,
+   "y": 149,
+   "w": 15,
+   "h": 10,
+   "ax": 98,
+   "ay": 0,
+   "depth": 101.5
+  },
+  {
+   "id": "wardrobe",
+   "label": "衣柜，围裙挂在最外面",
+   "x": 125,
+   "y": 55,
+   "w": 40,
+   "h": 73,
+   "ax": 114,
+   "ay": 0,
+   "depth": 27.0
+  },
+  {
+   "id": "desk",
+   "label": "书桌，摊着记账本",
+   "x": 203,
+   "y": 121,
+   "w": 48,
+   "h": 51,
+   "ax": 155,
+   "ay": 0,
+   "depth": 111.0
+  },
+  {
+   "id": "dchair",
+   "label": "椅子",
+   "x": 198,
+   "y": 152,
+   "w": 24,
+   "h": 21,
+   "ax": 204,
+   "ay": 0,
+   "depth": 127.0
+  },
+  {
+   "id": "plant",
+   "label": "小盆栽",
+   "x": 147,
+   "y": 182,
+   "w": 18,
+   "h": 32,
+   "ax": 229,
+   "ay": 0,
+   "depth": 214.0
+  },
+  {
+   "id": "basket",
+   "label": "针线篮",
+   "x": 97,
+   "y": 164,
+   "w": 22,
+   "h": 22,
+   "ax": 248,
+   "ay": 0,
+   "depth": 152.0
+  },
+  {
+   "id": "side",
+   "label": "小茶几",
+   "x": 195,
+   "y": 168,
+   "w": 22,
+   "h": 21,
+   "ax": 271,
+   "ay": 0,
+   "depth": 166.0
+  },
+  {
+   "id": "cush",
+   "label": "粉色坐垫",
+   "x": 105,
+   "y": 157,
+   "w": 22,
+   "h": 15,
+   "ax": 294,
+   "ay": 0,
+   "depth": 124.0
+  },
+  {
+   "id": "trash",
+   "label": "垃圾桶",
+   "x": 29,
+   "y": 148,
+   "w": 14,
+   "h": 16,
+   "ax": 317,
+   "ay": 0,
+   "depth": 112.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "bed",
+   "x": 95,
+   "y": 118,
+   "depth": 61.5,
+   "pose": "sleep",
+   "activities": [
+    "sleeping",
+    "resting"
+   ]
+  },
+  {
+   "id": "desk",
+   "x": 209,
+   "y": 158,
+   "depth": 127.5,
+   "pose": "sit",
+   "activities": [
+    "working",
+    "reading",
+    "phone"
+   ]
+  },
+  {
+   "id": "rug",
+   "x": 136,
+   "y": 167,
+   "depth": 126.5,
+   "pose": "sit",
+   "activities": [
+    "phone",
+    "resting",
+    "idle",
+    "reading"
+   ]
+  },
+  {
+   "id": "wardrobe",
+   "x": 130,
+   "y": 126,
+   "depth": 44.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "chores_clean"
+   ]
+  },
+  {
+   "id": "stand",
+   "x": 140,
+   "y": 189,
+   "depth": 170.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "drawing"
+   ]
+  }
+ ]
+}

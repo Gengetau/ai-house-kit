@@ -1,85 +1,101 @@
 # ai-house-kit
 
-让几个 AI 角色住进同一个虚拟的家、各自过日子的**世界内核**，以及一个可以直接跑起来的虚构示例世界。
+**填一个 API Key，在浏览器里养活一屋子有作息、会做饭换装、能坐电车去「晴空都」逛街偶遇的 AI 室友。**
 
-> English summary: a small, dependency-free world kernel (Python standard library + SQLite) for simulating
-> several AI characters living together in one house: single-writer transactions, a command pipeline with
-> idempotency and resource reservation, audience-scoped views and materials, a rule-based daily routine
-> (no model needed), a virtual model-call budget, and an outbox with receipts. Ships with a fictional example
-> world and a contract test suite. Status: 0.1 preview, APIs will change.
+> 📖 **[English README](README.en.md)** · 🧩 **[自定义世界包与插件教程](docs/CUSTOM-WORLD-TUTORIAL.md)** · 🏙️ **[插件与晴空都联动](docs/PLUGINS-AND-CITY.md)** · 💬 **[QQ 与聊天通道说明](docs/CHAT-AND-QQ.md)**
 
-## 它是什么
+## 为什么它不一样？
 
-- **world-kernel/**：内核本体（`worldkernel` 包）
-  - 存储与事务：SQLite 单写者锁 + runtime epoch，被接管的旧调度器什么都写不进；虚拟时钟
-  - 命令管线：来源身份、幂等键、词表与时效校验、多资源稳定顺序预留、开始/完成复核，状态、效果、事件、观察者和视图在同一个事务里提交
-  - 视图：按受众独立的事件序号和游标，快照（R1）与事件流（R2）同一读边界，字段白名单
-  - 受众隔离的材料：谁知道一件事和这件事能对谁说分开存；悄悄话只有知情人有原文
-  - L0 日常：不调用模型的需求检查（睡觉、吃饭、休息），习惯从人设确定性派生
-  - 认知适配器：上下文只装角色本人感知到的东西，先记预算再调用，过时的答复直接失败
-  - 虚拟预算、outbox + 回执对账、钱包、购物与外出、衣柜、每日记录等生活模块
-  - 可选的城市桥接（`city_bridge.py`）：接 [bot-game-mcp](https://github.com/Gengetau/bot-game-mcp) 的城市引擎；测试里用假引擎
-- **world-catalog/**：活动目录和统一词表（`worldcatalog` 包），内核在动作开始、排队和结算前都跑目录的 `guard()`
-- **world-contract-tests/**：21 个黄金场景和判定器，用来验收任何实现了同一契约的内核
-- **docs/city/bridge-v1.schema.json**：城市桥接接口的 JSON Schema（来自 bot-game-mcp，MIT）
+- **三行命令开箱即住（零前端构建、跨 Windows / Linux）**：核心运行时仅靠 Python 3.11+ 标准库与 SQLite；不填 API Key 也能以零成本内置演示模式体验完整一天的生活，填入任意 OpenAI 兼容端点（OpenAI / Gemini / DeepSeek / Claude / 本地 Ollama）即切换真实智能体，并支持主备模型自动故障转移（`AI_HOUSE_FALLBACK_*`）。
+- **挂机一整天只需百次级调用（省掉 98% 无效轮询）**：睡觉、洗漱、日常消遣由零成本 L0 规则驱动，只在需要拿主意的节点（做饭、邀约、购物、搭话、外出）预留 `Budget` 调一次模型；对话与日记生成均在内核写锁外执行，慢模型不会冻结状态面板。
+- **从聊天约定到真实采购履行的闭环**：在群聊或私聊里和室友约好「帮忙买 2 个鸡蛋」，会进入 `house_intents` 并驱动 `Shopping` 外出下单采购，结合内核 `intent_evidence` / `script` 自动对账标记为 `completed`。
+- **受众隔离长期记忆 & 每晚室友个人日记**：Built-in SQLite `MemoryStore` 严格隔离 `private` / `group` / `world` 三重边界（群聊绝不召回或泄露房主私聊秘密，且支持在工作台一键「忘掉」）；每晚 22:30 JST 自动生成第一人称个人日记（仅基于当日客观 `daylog`/`script`），23:30 JST 生成「今天的小屋」。
+- **四轴插件、工具循环 & 自定义世界包 (`WorldPack`)**：内置表情贴纸（`sticker_pack`）、桌游掷骰（`dice_tabletop`）、共享书架便签（`book_nook`）三款示例插件；通过 `ai-house pack-check indie-studio-3` 一键切换 3 人独立游戏工作室模板（已随包内置）。
+- **双模联动「晴空都」([bot-game-mcp](https://github.com/Gengetau/bot-game-mcp))**：
+  - **模式 A（本地双容器私享）**：`docker compose --profile city up -d --build`，支持通过 `BOTGAME_HOUSE_ROSTER_JSON` 把自定义 `WorldPack` 住客名单同步给城市引擎；
+  - **模式 B（公共联机晴空都，实验性）**：已接入真实内核外出门禁（`Outings.guard -> is_door_move`），支持「出门 / 偶遇 / 回家」，并提供**实验性**公共城市动作 `say` / `drift_book` / `take_book` / `world_wait`；把礼盒带回衣柜等尚未开启。
 
-## 示例世界
+> **关于示例世界的名字**：示例世界里的「晴空都」「日和坂 / 棱光街 / 云港」等名字，用的就是公开城市 [bot-game-mcp](https://github.com/Gengetau/bot-game-mcp) 里的真实城市和片区名，方便你直接接入它；不是另一个虚构世界。
 
-`world-catalog/worldcatalog/life1/` 是一个完全虚构的世界：樱丘一带的一栋小楼，六位室友（alma、elsa、mina、nell、wanda、yuki），
-附近的超市、商店街、河岸和几个一日游去处，以及食材、菜谱、零食、衣物和日程。物价按日元设定。
-你可以照着它的格式换成自己的世界和角色。
+## 黄金五分钟快速开始
 
-## 快速开始
-
-需要 Python 3.11 或更新版本。内核本身只用标准库；城市桥接的测试（`test_city_m1a.py`）要用 `jsonschema` 校验接口，先装一下：
+### 方式一：本地 Python 直接启动（零第三方依赖，需 Python 3.11+）
 
 ```sh
-python3 -m pip install -r requirements-dev.txt
+git clone https://github.com/Gengetau/ai-house-kit.git
+cd ai-house-kit
+python3 -m pip install -e ".[dev]"   # Windows: py -3.13 -m pip install -e ".[dev]"
+ai-house init && ai-house doctor     # 自动生成强随机令牌的 .env，并检查环境/SQLite/WorldPack
+ai-house up
 ```
+
+- 可选直接绑定内置 3 人工作室包：`ai-house init --pack indie-studio-3 --force && ai-house up`
+- 也可在 `.env` 预填 `AI_HOUSE_API_KEY`、`AI_HOUSE_BASE_URL`、`AI_HOUSE_MODEL`，并用 `ai-house doctor --live-ping` 测通后再启动（或启动后直接在网页向导里填写并测试）。
+
+浏览器打开 **`http://127.0.0.1:8780`**（若 `ai-house init` 生成了房主令牌 `AI_HOUSE_OWNER_TOKEN`，在玄关页填入即可进入）：
+- **首位 AI 住客向导（`#/setup`）**：空屋首次启动不再硬塞 6 个演示角色，直接进入 **「迎接你的第一位 AI 住客」** 向导——自定义第 1 位住客的昵称、像素立绘、主题色、作息与厨艺，选择并测试 OpenAI 兼容大模型 API（或先以零配置演示模式体验），也支持一键载入 3 人 `indie-studio-3` 或 6 人 `life1` 示例世界包；入住后可在首页或管家页随时 **「+ 邀请新住客」**、编辑档案或重置小屋；
+- **暖灯像素控制台与等轴互动**：浏览两层全屋像素剖面与 11 间等轴测房间，点房间让房主化身走进去当面说话、递零食，或点 **「⏩ 快进 +15 分钟」** 推进三餐、日记与晴空都行程流转；
+- **多板块生活与记忆管理**：覆盖 **「住客」**（此刻状态 / 衣柜换装 / 档案编辑 / 私聊与群聊）、**「日子」**（时间线 / 约定履行 / 厨房货架补货 / 晴空都行程）、**「珍藏」**（精装翻页日记 / 作用域记忆检索与遗忘 / 书架便签）与 **「管家」**（模拟步进 / 住客管理 / 大模型热更新 / MCP 接入配置），另有独立聊天页 `http://127.0.0.1:8780/chat`；
+- **想在 QQ 上聊**：支持通用 OneBot v11 正向 WebSocket（如 NapCat / Lagrange / LLOneBot），**目前仅在模拟 OneBot 服务器测试通过，未在真实 QQ 账号测试**；接入风险自担，先读 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)。
+
+> **默认只在本机可访问**：`ai-house up` 缺省只监听 `127.0.0.1`。要让局域网里别的设备访问，必须同时设置至少 16 位的 `AI_HOUSE_OWNER_TOKEN`（环境变量或 `.env`）再用 `--host 0.0.0.0`，不设会直接拒绝启动。`owner` 房主令牌开启全部控制与向导/管理接口；另可按需配置 `AI_HOUSE_READ_TOKEN`、`AI_HOUSE_WRITE_TOKEN`、`AI_HOUSE_PRIVATE_TOKEN`（读 / 写 / 私聊三档），脚本与 MCP 客户端统一通过 `Authorization: Bearer <令牌>` 传参。
+
+### 方式二：Docker Compose（含可选晴空都本地双容器）
 
 ```sh
-# 内核测试（约 2–3 分钟）
-cd world-kernel && python3 -m unittest
-
-# 目录测试
-cd world-catalog && PYTHONPATH=. python3 -m unittest discover -s . -p 'test_*.py'
-
-# 契约测试
-cd world-contract-tests && PYTHONPATH=../world-catalog python3 -m unittest discover -s . -p 'test_*.py'
-
-# 跑一晚合成的「厨房一夜」，导出快照、事件分页和时间线
-cd world-kernel && python3 kitchen_night.py --out /tmp/kitchen-night
+python3 -m pip install -e .
+ai-house init                            # 生成强随机 AI_HOUSE_OWNER_TOKEN 与 CITY_BRIDGE_KEY
+docker compose up -d --build             # 单容器启动，只发布 127.0.0.1:8780
 ```
 
-所有测试和示例都只用合成数据和假模型：不联网、不调用付费接口、不需要任何账号。
+如需拉起本地双容器晴空都：在 `.env` 设 `WORLD_KERNEL_CITY_BRIDGE=1`（按需设 `WORLD_KERNEL_CITY_ACTORS=nell` 或 `all`），再运行：
 
-## 接入真实模型
+```sh
+docker compose --profile city up -d --build
+```
 
-内核本身不带任何模型后端。`shadow.py`、`authority.py` 和 `worldkernel/daynote.py` 等需要真实模型的地方，
-都通过宿主程序传进来的聊天函数调用模型。`shadow.py` 和 `authority.py` 自带的函数会调用任意兼容 OpenAI 的
-`/v1/chat/completions` 接口，用三个环境变量配置：
+城市引擎镜像固定到 `bot-game-mcp@971484c13004e14ee6e91e9a9a75c0bd5ec65020`，仅挂在 `internal: true` 的内部网络 `citynet` 上、不暴露城市端口到宿主机；使用自定义世界包初始化时（`ai-house init --pack indie-studio-3`），还会自动写入 `BOTGAME_HOUSE_ROSTER_JSON` 让城市引擎认识你的自定义室友名单。
 
-| 变量 | 作用 |
-| --- | --- |
-| `WORLD_KERNEL_BASE_URL` | 接口地址，默认 `http://127.0.0.1:8000` |
-| `WORLD_KERNEL_API_KEY` | 你自己的 API key（必填，只在发请求时读取） |
-| `WORLD_KERNEL_MODEL` | 模型名 |
+## 接入 MCP 客户端（Claude Desktop / Cursor / Antigravity）
 
-请使用你自己的 API key 和服务条款允许的接入方式。本项目不提供、也不支持任何账号登录代理或订阅转发。
+启动 `ai-house up` 后，本地提供 Streamable HTTP MCP 端点（`http://127.0.0.1:8780/mcp`）：
 
-## 不包含的东西
+```json
+{
+  "mcpServers": {
+    "ai-house": {
+      "url": "http://127.0.0.1:8780/mcp",
+      "headers": {
+        "Authorization": "Bearer <你的 AI_HOUSE_OWNER_TOKEN>"
+      }
+    }
+  }
+}
+```
 
-- 聊天平台适配（QQ / OneBot 等）、网页控制台、记忆和日记服务、协作看板
-- 任何真实角色的人设、图片或聊天记录
+## 架构与插件生态
 
-## 免责声明
+- **`src/ai_house/`**：开箱即用宿主守护进程（`daemon.py`）、首位住客与大模型初始化引擎（`onboarding.py`）、受众隔离对话与轻量约定提取（`chat_agent.py`）、四轴插件 SDK（`plugin_api.py`）、暖灯像素可视化控制台（`web/` 含两层剖面/等轴房间引擎与 `#/setup` 向导）以及内置标准 MCP 端点（`POST /mcp`）。
+- **内置核心扩展**：长期记忆库（`memory.py`）、个人睡前日记（`diary.py`）、CLI 体检工具（`cli.py init/doctor`）及工具插件（`sticker_pack` / `dice_tabletop` / `book_nook`）。
+- **聊天入口**：网页和 QQ（`builtin_plugins/onebot_ws.py`，可选依赖 `pip install -e ".[onebot]"`）共用 `HouseDaemon.converse`；发言人身份在 `chat_identity.py`，发送前过滤在 `chat_guard.py`；详见 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)。
+- **`world-kernel/`**：单写者事务、命令管线、R1/R2 视图、受众隔离材料、L0 日常、预算账本、轻量约定与履行（`intents_lite.py`）、衣柜与晴空都桥接客户端。
+- **`world-catalog/`**：统一词表、`load_pack()`、守卫校验 `guard()` 与默认樱丘六人示例世界 `life1/`。
+- **`world-contract-tests/`**：黄金契约测试与离线判定器 `oracle.py`。
+- 插件开发与自定义世界包详见 **[docs/CUSTOM-WORLD-TUTORIAL.md](docs/CUSTOM-WORLD-TUTORIAL.md)** 与 **[docs/PLUGINS-AND-CITY.md](docs/PLUGINS-AND-CITY.md)**。
 
-本项目按原样提供。把它接到聊天平台或模型服务时，账号和合规风险由使用者自行承担。
+## 跑全套测试
 
-## 许可证
+```sh
+python3 -m pip install -e ".[dev]"
+PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-kernel -p "test_*.py"
+PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-catalog -p "test_*.py"
+PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-contract-tests -p "test_*.py"
+```
+
+## 免责声明与许可证
+
+请使用你自己的合规 API Key；本项目不提供任何账号登录代理或订阅转发。把它接到聊天平台或外部服务时，合规风险由使用者自行承担。
 
 - 代码：[Apache License 2.0](LICENSE)
-- 示例世界的内容（`world-catalog/worldcatalog/life1/`、`world-kernel/recordings/`）：[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- 示例世界内容（`world-catalog/worldcatalog/life1/`、`packs/`、`src/ai_house/bundled_packs/`、`world-kernel/recordings/`）：[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 - 第三方声明见 [NOTICE](NOTICE)
-
-Copyright 2026 Gengetau

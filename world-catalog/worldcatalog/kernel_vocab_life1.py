@@ -10,6 +10,7 @@ The guard is self-contained (no P1a phase gate): life1 enables its own action se
 and respond_invite are instant actions whose handlers live in world-kernel modules (kernel.instant).
 """
 import copy
+import os
 import heapq
 import json
 import re
@@ -609,3 +610,344 @@ def snack_ok(r, activity, me, here):
     if r.get("holder") is not None:
         return r.get("holder") == me
     return r.get("location") == here or (r.get("location") == "kitchen" and here in HOUSE["rooms"])
+
+
+def _derive_roster_meta(manifest, people):
+    roster = tuple(manifest["people"])
+    names = {a: str(people[a].get("name") or a) for a in roster}
+    selves = {
+        a: str(people[a].get("persona") or f"{names[a]}（{people[a].get('bio') or '合租室友'}）")
+        for a in roster
+    }
+    cook_order = tuple(
+        sorted(
+            roster,
+            key=lambda a: (
+                int(people[a].get("cook_priority", 99)),
+                -int(people[a].get("cooking", {}).get("skill", 1)),
+                roster.index(a),
+            ),
+        )
+    )
+    night_owls = {a: float(people[a].get("night_owl", 0.35)) for a in roster}
+    return roster, names, selves, cook_order, night_owls
+
+
+ROSTER, NAMES, SELVES, COOK_ORDER, NIGHT_OWLS = _derive_roster_meta(MANIFEST, PEOPLE)
+
+
+def load_pack(pack_dir=None):
+    """Load any life1-compatible WorldPack directory into a self-contained vocabulary namespace."""
+    from types import SimpleNamespace
+    raw = str(pack_dir).strip() if pack_dir else os.environ.get("AI_HOUSE_PACK_DIR", "").strip()
+    if not raw:
+        pdir = DIR
+    else:
+        pdir = Path(raw)
+        if not pdir.exists():
+            candidates = [
+                Path.cwd() / "packs" / raw,
+                Path(__file__).resolve().parents[2] / "src" / "ai_house" / "bundled_packs" / raw,
+            ]
+            try:
+                import importlib.resources as _res
+                candidates.append(Path(str(_res.files("ai_house") / "bundled_packs" / raw)))
+            except Exception:
+                pass
+            found = next((c for c in candidates if c.is_dir()), None)
+            if found is not None:
+                pdir = found
+    if not pdir.exists():
+        raise FileNotFoundError(f"WorldPack directory not found: {pdir}")
+
+    def read_json(stem, default=None):
+        fp = pdir / f"{stem}.json"
+        if not fp.exists():
+            if default is not None:
+                return copy.deepcopy(default)
+            return json.loads((DIR / f"{stem}.json").read_text(encoding="utf-8"))
+        return json.loads(fp.read_text(encoding="utf-8"))
+
+    manifest = read_json("manifest")
+    ingredients = read_json("ingredients")
+    extra_snacks = read_json("snacks", default={})
+    for k, v in extra_snacks.items():
+        if k not in ingredients:
+            ingredients[k] = v
+    recipe_data = read_json("recipes")
+    activity_data = read_json("activities")
+    places = read_json("places")
+    clothing = read_json("clothing")
+    render = read_json("render")
+    garment_assets = read_json("garment_assets", default={"shelf": "未分类", "assets": {}})
+    people = {}
+    for a in manifest["people"]:
+        pf = pdir / "people" / f"{a}.json"
+        people[a] = json.loads(pf.read_text(encoding="utf-8"))
+    house = manifest["house"]
+    money = manifest["money"]
+    roster, names, selves, cook_order, night_owls = _derive_roster_meta(manifest, people)
+
+    locations = {k: {"kind": "room", "public_location": k} for k in house["rooms"]}
+    for a in roster:
+        locations[bed(a)] = {"kind": "room", "public_location": "room", "owner": a}
+    locations["away"] = {"kind": "leave_point", "public_location": "away", "presentation": "street outside the house"}
+    for k, p in places.items():
+        locations[PLACE + k] = {
+            "kind": "place", "public_location": "away", "label": p["label"], "tier": p["tier"],
+            "lodging": bool(p.get("lodging_yen") is not None and p.get("nights")),
+        }
+
+    routes = {}
+    for e in house["routes"]:
+        ends = [bed(a) for a in roster] if e["to"] == "bedrooms" else [e["to"]]
+        for b in ends:
+            routes[(e["from"], b)] = e["seconds"]
+    for k, p in places.items():
+        routes[("away", PLACE + k)] = int(p["travel"]["minutes"]) * 60
+
+    actions = _actions()
+    activities = {}
+    for k, a in activity_data.items():
+        lo, hi = a["minutes"]
+        activities[k] = {
+            "label": a["label"], "min": lo * 60, "default": round((lo + hi) / 2) * 60, "max": hi * 60,
+            "effects": {"rate": dict(a.get("effects", {}))}, "interrupt_policy": "now",
+            "availability": "busy" if k in ("bathing", "movie_theater", "onsen") else "free",
+            "where": tuple(a["where"]), "hold": tuple(a.get("hold", ())), "party": a.get("party"),
+            "hours": tuple(a["hours"]) if a.get("hours") else None, "eats": tuple(EATS.get(k, ())),
+        }
+    recipes = {
+        k: {
+            "label": r["label"], "seconds": int(r["minutes"]) * 60, "consume": dict(r["consume"]),
+            "hold": list(r["hold"]), "makes": {k: int(r["makes"]["servings"])}, "main": bool(r["main"]),
+            "difficulty": r.get("difficulty", 1), "meal": list(r.get("meal", ())), "tags": list(r.get("tags", ())),
+        }
+        for k, r in recipe_data.items()
+    }
+    menu = {}
+    for pid, p in places.items():
+        for m in p.get("menu", ()):
+            menu[m["id"]] = dict(m, place=pid)
+
+    catalog = copy.deepcopy(BASE)
+    catalog["vocab_version"] = manifest["vocab_version"]
+    catalog["items"] = {}
+    for k, v in ingredients.items():
+        catalog["items"][k] = {
+            "kind": "food", "edible": bool(v.get("edible")), "label": v["label"], "class": v["kind"],
+            "price_yen": v["price_yen"], "shelf_days": v.get("shelf_days"),
+        }
+    for k, r in recipes.items():
+        catalog["items"][k] = {"kind": "food", "edible": True, "label": r["label"], "class": "dish", "main": r["main"]}
+    for k, m in menu.items():
+        catalog["items"][k] = {
+            "kind": "food", "edible": True, "label": m["label"], "class": "menu", "main": m["main"],
+            "price_yen": m["price_yen"], "place": m["place"],
+        }
+    for k in house["anchors"]:
+        catalog["items"][k] = {"kind": "anchor", "edible": False, "label": k}
+
+    main_foods = frozenset(k for k, v in catalog["items"].items() if v.get("edible") and v.get("main"))
+    snacks = frozenset(k for k, v in catalog["items"].items() if v.get("edible") and not v.get("main"))
+    edible_set = frozenset(k for k, v in catalog["items"].items() if v.get("kind") == "food" and v.get("edible"))
+
+    def pack_label(loc):
+        v = locations.get(loc, {})
+        if v.get("kind") == "place":
+            return v["label"]
+        loc_names = BASE["vocabulary"]["locations"]
+        return loc_names.get(v.get("public_location"), {}).get("name", loc)
+
+    def pack_public_location(loc):
+        return locations.get(loc, {}).get("public_location")
+
+    def pack_activity_allowed_at(act, actor_id, loc):
+        where = activities[act]["where"]
+        return loc in where or ("own_room" in where and loc == bed(actor_id))
+
+    def pack_adjacent(node):
+        for (x, y), seconds in routes.items():
+            if node == x:
+                yield y, seconds
+            elif node == y:
+                yield x, seconds
+
+    def pack_route_seconds(a, b):
+        if a not in locations or b not in locations:
+            return None
+        best, queue = {a: 0}, [(0, a)]
+        while queue:
+            cost, node = heapq.heappop(queue)
+            if cost != best[node]:
+                continue
+            if node == b:
+                return cost
+            for nxt, seconds in pack_adjacent(node):
+                if cost + seconds < best.get(nxt, float("inf")):
+                    best[nxt] = cost + seconds
+                    heapq.heappush(queue, (cost + seconds, nxt))
+        return None
+
+    def pack_next_hop(a, b):
+        if a == b or pack_route_seconds(a, b) is None:
+            return None
+        choices = [(s + pack_route_seconds(n, b), n) for n, s in pack_adjacent(a) if pack_route_seconds(n, b) is not None]
+        return min(choices)[1] if choices else None
+
+    def pack_snack_ok(r, activity, me, here):
+        item = catalog["items"].get(r.get("item"), {})
+        if (
+            r.get("kind") != "food"
+            or not item.get("edible")
+            or item.get("main")
+            or item.get("class") not in activities[activity]["eats"]
+            or (r.get("qty") or 0) < 1
+        ):
+            return False
+        if r.get("holder") is not None:
+            return r.get("holder") == me
+        return r.get("location") == here or (r.get("location") == "kitchen" and here in house["rooms"])
+
+    def pack_guard(action_type, args, actor, resources=(), **_):
+        if not isinstance(action_type, str) or action_type not in actions:
+            return ["action_not_enabled_in_life1"]
+        if not isinstance(args, dict) or not isinstance(actor, dict) or actor.get("location") not in locations:
+            return ["invalid_arguments_or_actor"]
+        if action_type in INSTANT:
+            return []
+        schema = _ARGS[action_type]
+        allowed = {k.rstrip("?") for k in schema}
+        required = {k for k in schema if not k.endswith("?")}
+        if set(args) - allowed or required - set(args):
+            return ["missing_or_unknown_argument"]
+        for name, kind in schema.items():
+            key = name.rstrip("?")
+            if key in args:
+                val = args[key]
+                ok_type = (
+                    (isinstance(val, str) and bool(val)) if kind == "str"
+                    else (isinstance(val, str) and val in locations) if kind == "location"
+                    else (type(val) in (int, float) and val > 0) if kind == "seconds"
+                    else True
+                )
+                if not ok_type:
+                    return ["invalid_argument_type:" + key]
+        here, me = actor["location"], actor["actor_id"]
+        rows = [dict(r) for r in resources]
+
+        def reachable(r):
+            return r.get("holder") == me or (r.get("holder") is None and r.get("location") == here)
+
+        reasons = []
+        if action_type == "move":
+            if args["to"] == here:
+                reasons.append("invalid_move_destination")
+            if owner_of(args["to"]) not in (None, me):
+                reasons.append("someone_elses_bedroom")
+        elif action_type == "say":
+            if not 1 <= len(args["text"].strip()) <= 500:
+                reasons.append("invalid_say_text")
+        elif action_type == "sleep":
+            if here != bed(me) and not locations[here].get("lodging"):
+                reasons.append("sleep_requires_own_bedroom")
+            if args["seconds"] > 14 * 3600:
+                reasons.append("invalid_duration_seconds")
+        elif action_type in ("wait", "rest"):
+            if args["seconds"] > 4 * 3600:
+                reasons.append("invalid_duration_seconds")
+        elif action_type == "check":
+            if not any(r.get("resource_id") == args["resource_id"] and reachable(r) for r in rows):
+                reasons.append("inspection_resource_not_reachable")
+        elif action_type == "eat":
+            item = catalog["items"].get(args["item"], {})
+            if not item.get("edible") or item.get("kind") != "food":
+                reasons.append("item_not_ready_food")
+            ok = [
+                r for r in rows
+                if r.get("item") == args["item"] and r.get("kind") == "food" and reachable(r)
+                and (r.get("qty") or 0) >= 1 and ("resource_id" not in args or r.get("resource_id") == args["resource_id"])
+            ]
+            if not ok:
+                reasons.append("food_missing_mismatched_or_out_of_reach")
+        elif action_type == "cook":
+            rec = recipes.get(args["recipe"])
+            if not rec:
+                return ["unknown_recipe"]
+            if here != "kitchen":
+                reasons.append("cooking_requires_kitchen")
+            for item, q in rec["consume"].items():
+                if not any(r.get("item") == item and r.get("kind") == "food" and reachable(r) and (r.get("qty") or 0) >= q for r in rows):
+                    reasons.append("missing_ingredient:" + item)
+            for anchor in rec["hold"]:
+                if not any(r.get("item") == anchor and r.get("kind") == "anchor" and reachable(r) for r in rows):
+                    reasons.append("missing_anchor:" + anchor)
+        elif action_type == "begin_activity":
+            act = args["activity"]
+            if act not in activities:
+                return ["activity_not_enabled_in_life1"]
+            spec = activities[act]
+            if not pack_activity_allowed_at(act, me, here):
+                reasons.append("activity_not_allowed_here")
+            sec = args.get("seconds", spec["default"])
+            if not spec["min"] <= sec <= spec["max"]:
+                reasons.append("invalid_duration_seconds")
+            for anchor in spec["hold"]:
+                if not any(r.get("item") == anchor and r.get("kind") == "anchor" and r.get("location") == here for r in rows):
+                    reasons.append("missing_anchor:" + anchor)
+            if spec.get("eats"):
+                if "snack" not in args:
+                    reasons.append("snack_required")
+                elif not any(r.get("resource_id") == args["snack"] and pack_snack_ok(r, act, me, here) for r in rows):
+                    reasons.append("snack_missing_mismatched_or_out_of_reach")
+            elif "snack" in args:
+                reasons.append("snack_not_eaten_in_this_activity")
+        return reasons
+
+    return SimpleNamespace(
+        PACK_DIR=str(pdir),
+        MANIFEST=manifest,
+        INGREDIENTS=ingredients,
+        RECIPE_DATA=recipe_data,
+        ACTIVITY_DATA=activity_data,
+        PLACES=places,
+        CLOTHING=clothing,
+        RENDER=render,
+        GARMENT_ASSETS=garment_assets,
+        PEOPLE=people,
+        HOUSE=house,
+        MONEY=money,
+        ROSTER=roster,
+        NAMES=names,
+        SELVES=selves,
+        COOK_ORDER=cook_order,
+        NIGHT_OWLS=night_owls,
+        VOCAB_VERSION=manifest["vocab_version"],
+        BEDROOM=BEDROOM,
+        PLACE=PLACE,
+        INSTANT=INSTANT,
+        LOCATIONS=locations,
+        ROUTES=routes,
+        ACTIONS=actions,
+        ACTIVITIES=activities,
+        RECIPES=recipes,
+        MENU=menu,
+        CATALOG=catalog,
+        MAIN_FOODS=main_foods,
+        SNACKS=snacks,
+        EDIBLE=edible_set,
+        BODY_KEYS=BODY_KEYS,
+        BODY_RANGE=BODY_RANGE,
+        BASE_DRIFT=BASE_DRIFT,
+        bed=bed,
+        owner_of=owner_of,
+        place_id=place_id,
+        label=pack_label,
+        public_location=pack_public_location,
+        activity_allowed_at=pack_activity_allowed_at,
+        route_seconds=pack_route_seconds,
+        next_hop=pack_next_hop,
+        snack_ok=pack_snack_ok,
+        guard=pack_guard,
+        edible=lambda v: edible_set,
+    )

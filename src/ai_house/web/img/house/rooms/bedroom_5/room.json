@@ -1,0 +1,179 @@
+{
+ "key": "bedroom_5",
+ "size": [
+  276,
+  244
+ ],
+ "objects": [
+  {
+   "id": "bed",
+   "label": "床",
+   "x": 67,
+   "y": 99,
+   "w": 72,
+   "h": 59,
+   "ax": 0,
+   "ay": 0,
+   "depth": 67.0
+  },
+  {
+   "id": "nightstand",
+   "label": "床头柜和台灯",
+   "x": 97,
+   "y": 94,
+   "w": 24,
+   "h": 35,
+   "ax": 73,
+   "ay": 0,
+   "depth": 36.0
+  },
+  {
+   "id": "slippers",
+   "label": "拖鞋",
+   "x": 115,
+   "y": 152,
+   "w": 15,
+   "h": 10,
+   "ax": 98,
+   "ay": 0,
+   "depth": 107.5
+  },
+  {
+   "id": "aquarium",
+   "label": "大水族箱",
+   "x": 173,
+   "y": 103,
+   "w": 42,
+   "h": 50,
+   "ax": 114,
+   "ay": 0,
+   "depth": 76.0
+  },
+  {
+   "id": "snackshelf",
+   "label": "零食柜（满的）",
+   "x": 209,
+   "y": 129,
+   "w": 36,
+   "h": 38,
+   "ax": 157,
+   "ay": 0,
+   "depth": 107.0
+  },
+  {
+   "id": "snacks",
+   "label": "地上的零食",
+   "x": 190,
+   "y": 160,
+   "w": 17,
+   "h": 20,
+   "ax": 194,
+   "ay": 0,
+   "depth": 136.0
+  },
+  {
+   "id": "plush",
+   "label": "鲸鱼抱枕",
+   "x": 109,
+   "y": 170,
+   "w": 34,
+   "h": 23,
+   "ax": 212,
+   "ay": 0,
+   "depth": 155.0
+  },
+  {
+   "id": "cush",
+   "label": "海浪坐垫",
+   "x": 101,
+   "y": 161,
+   "w": 22,
+   "h": 15,
+   "ax": 247,
+   "ay": 0,
+   "depth": 132.0
+  },
+  {
+   "id": "books",
+   "label": "海洋图鉴",
+   "x": 79,
+   "y": 150,
+   "w": 17,
+   "h": 14,
+   "ax": 270,
+   "ay": 0,
+   "depth": 113.0
+  },
+  {
+   "id": "trash",
+   "label": "零食袋",
+   "x": 183,
+   "y": 175,
+   "w": 14,
+   "h": 16,
+   "ax": 288,
+   "ay": 0,
+   "depth": 166.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "bed",
+   "x": 89,
+   "y": 120,
+   "depth": 67.5,
+   "pose": "sleep",
+   "activities": [
+    "sleeping",
+    "resting"
+   ]
+  },
+  {
+   "id": "aquarium",
+   "x": 178,
+   "y": 150,
+   "depth": 92.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "hobby"
+   ]
+  },
+  {
+   "id": "snacks",
+   "x": 212,
+   "y": 167,
+   "depth": 126.5,
+   "pose": "stand",
+   "activities": [
+    "eating",
+    "idle"
+   ]
+  },
+  {
+   "id": "rug",
+   "x": 132,
+   "y": 167,
+   "depth": 126.5,
+   "pose": "sit",
+   "activities": [
+    "phone",
+    "eating",
+    "resting",
+    "drama",
+    "gaming"
+   ]
+  },
+  {
+   "id": "stand",
+   "x": 78,
+   "y": 170,
+   "depth": 132.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "chores_clean"
+   ]
+  }
+ ]
+}

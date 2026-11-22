@@ -1,4 +1,5 @@
 """real kernel actions/receipts, retries and extension isolation (all offline)."""
+import contextlib
 import json
 import os
 import sqlite3
@@ -15,8 +16,9 @@ class ExportTests(Base):
         super().setUp()
         self.world = os.path.join(self.temp.name, "world.db")
         legacy.offline_world(self.world)
-        with sqlite3.connect(self.world) as c:
-            c.execute("create table intent_evidence(key text primary key,stream text,event_id int,at real,body text,state text default 'queued')")
+        with contextlib.closing(sqlite3.connect(self.world)) as c:
+            with c:
+                c.execute("create table intent_evidence(key text primary key,stream text,event_id int,at real,body text,state text default 'queued')")
         self.projector = legacy.Projector(self.l, self.world)
         self.p = promises.Promises(self.l, self.world, self.projector,
                                   SimpleNamespace(sweep=lambda _:None,kernel_context=lambda *_:[],errands=lambda *_:[]))
@@ -26,7 +28,7 @@ class ExportTests(Base):
         self.l.put("promises:cursor", 0)
 
     def rows(self):
-        with sqlite3.connect(self.world) as c:
+        with contextlib.closing(sqlite3.connect(self.world)) as c:
             return [json.loads(r[0]) for r in c.execute("select body from intent_evidence order by event_id")]
 
     def test_outing_actual_arrival_stay_activity_and_lifecycle(self):
@@ -57,8 +59,9 @@ class ExportTests(Base):
         self.assertEqual(len({e["key"] for e in self.rows()}),len(self.rows()))
 
     def test_stream_mismatch_refuses_before_cursor_write(self):
-        with sqlite3.connect(self.world) as c:
-            c.execute("insert or replace into kernel_bind values('world','other#2')")
+        with contextlib.closing(sqlite3.connect(self.world)) as c:
+            with c:
+                c.execute("insert or replace into kernel_bind values('world','other#2')")
         with self.assertRaises(RuntimeError):
             self.p.run()
         self.assertEqual(self.l.get("promises:cursor"),0)

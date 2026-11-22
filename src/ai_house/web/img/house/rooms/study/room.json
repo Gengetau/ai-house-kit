@@ -1,0 +1,256 @@
+{
+ "key": "study",
+ "size": [
+  308,
+  260
+ ],
+ "objects": [
+  {
+   "id": "shelf0",
+   "label": "书房大书墙，按门类整理好",
+   "x": 142,
+   "y": 44,
+   "w": 37,
+   "h": 82,
+   "ax": 0,
+   "ay": 0,
+   "depth": 23.5
+  },
+  {
+   "id": "shelf1",
+   "label": "书房大书墙，按门类整理好",
+   "x": 170,
+   "y": 58,
+   "w": 37,
+   "h": 82,
+   "ax": 38,
+   "ay": 0,
+   "depth": 51.5
+  },
+  {
+   "id": "shelf2",
+   "label": "书房大书墙，按门类整理好",
+   "x": 198,
+   "y": 72,
+   "w": 37,
+   "h": 82,
+   "ax": 76,
+   "ay": 0,
+   "depth": 79.5
+  },
+  {
+   "id": "desk1",
+   "label": "书桌",
+   "x": 227,
+   "y": 125,
+   "w": 50,
+   "h": 52,
+   "ax": 114,
+   "ay": 0,
+   "depth": 120.0
+  },
+  {
+   "id": "chair1",
+   "label": "书桌椅",
+   "x": 222,
+   "y": 156,
+   "w": 24,
+   "h": 21,
+   "ax": 165,
+   "ay": 0,
+   "depth": 135.0
+  },
+  {
+   "id": "desk2",
+   "label": "第二张书桌（谁都能用）",
+   "x": 53,
+   "y": 107,
+   "w": 48,
+   "h": 51,
+   "ax": 190,
+   "ay": 0,
+   "depth": 83.0
+  },
+  {
+   "id": "chair2",
+   "label": "椅子",
+   "x": 82,
+   "y": 138,
+   "w": 24,
+   "h": 21,
+   "ax": 239,
+   "ay": 0,
+   "depth": 99.0
+  },
+  {
+   "id": "armchair",
+   "label": "阅读椅",
+   "x": 123,
+   "y": 140,
+   "w": 42,
+   "h": 42,
+   "ax": 264,
+   "ay": 0,
+   "depth": 134.0
+  },
+  {
+   "id": "stool",
+   "label": "小边几和红茶",
+   "x": 152,
+   "y": 160,
+   "w": 20,
+   "h": 22,
+   "ax": 307,
+   "ay": 0,
+   "depth": 152.0
+  },
+  {
+   "id": "easel",
+   "label": "画架",
+   "x": 181,
+   "y": 166,
+   "w": 17,
+   "h": 38,
+   "ax": 328,
+   "ay": 0,
+   "depth": 190.0
+  },
+  {
+   "id": "lamp",
+   "label": "落地灯",
+   "x": 245,
+   "y": 139,
+   "w": 18,
+   "h": 48,
+   "ax": 346,
+   "ay": 0,
+   "depth": 156.0
+  },
+  {
+   "id": "plant",
+   "label": "绿萝",
+   "x": 37,
+   "y": 133,
+   "w": 18,
+   "h": 34,
+   "ax": 365,
+   "ay": 0,
+   "depth": 116.0
+  },
+  {
+   "id": "books1",
+   "label": "没放回去的书",
+   "x": 185,
+   "y": 161,
+   "w": 18,
+   "h": 14,
+   "ax": 384,
+   "ay": 0,
+   "depth": 135.0
+  },
+  {
+   "id": "books2",
+   "label": "一摞书",
+   "x": 124,
+   "y": 109,
+   "w": 19,
+   "h": 18,
+   "ax": 403,
+   "ay": 0,
+   "depth": 39.0
+  },
+  {
+   "id": "cush",
+   "label": "读书坐垫",
+   "x": 119,
+   "y": 196,
+   "w": 22,
+   "h": 15,
+   "ax": 423,
+   "ay": 0,
+   "depth": 202.0
+  },
+  {
+   "id": "trash",
+   "label": "废纸篓",
+   "x": 233,
+   "y": 182,
+   "w": 14,
+   "h": 16,
+   "ax": 446,
+   "ay": 0,
+   "depth": 180.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "desk1",
+   "x": 233,
+   "y": 162,
+   "depth": 135.5,
+   "pose": "sit",
+   "activities": [
+    "working",
+    "reading"
+   ]
+  },
+  {
+   "id": "desk2",
+   "x": 95,
+   "y": 144,
+   "depth": 99.5,
+   "pose": "sit",
+   "activities": [
+    "working",
+    "drawing",
+    "reading"
+   ]
+  },
+  {
+   "id": "armchair",
+   "x": 144,
+   "y": 163,
+   "depth": 134.5,
+   "pose": "sit",
+   "activities": [
+    "reading",
+    "tea_time",
+    "resting"
+   ]
+  },
+  {
+   "id": "easel",
+   "x": 176,
+   "y": 207,
+   "depth": 206.5,
+   "pose": "stand",
+   "activities": [
+    "drawing"
+   ]
+  },
+  {
+   "id": "shelf",
+   "x": 172,
+   "y": 137,
+   "depth": 66.5,
+   "pose": "stand",
+   "activities": [
+    "reading",
+    "chores_clean",
+    "idle"
+   ]
+  },
+  {
+   "id": "rug",
+   "x": 116,
+   "y": 189,
+   "depth": 170.5,
+   "pose": "sit",
+   "activities": [
+    "reading",
+    "phone",
+    "idle"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,174 @@
+{
+ "key": "bath",
+ "size": [
+  276,
+  244
+ ],
+ "objects": [
+  {
+   "id": "bathtub",
+   "label": "浴缸，热水刚放好",
+   "x": 165,
+   "y": 119,
+   "w": 72,
+   "h": 51,
+   "ax": 0,
+   "ay": 0,
+   "depth": 94.0
+  },
+  {
+   "id": "basin",
+   "label": "洗手台",
+   "x": 75,
+   "y": 104,
+   "w": 32,
+   "h": 34,
+   "ax": 73,
+   "ay": 0,
+   "depth": 51.0
+  },
+  {
+   "id": "washer",
+   "label": "洗衣机",
+   "x": 43,
+   "y": 120,
+   "w": 32,
+   "h": 35,
+   "ax": 106,
+   "ay": 0,
+   "depth": 85.0
+  },
+  {
+   "id": "basket",
+   "label": "脏衣篮",
+   "x": 45,
+   "y": 148,
+   "w": 22,
+   "h": 22,
+   "ax": 139,
+   "ay": 0,
+   "depth": 118.0
+  },
+  {
+   "id": "towels",
+   "label": "毛巾架",
+   "x": 145,
+   "y": 84,
+   "w": 20,
+   "h": 41,
+   "ax": 162,
+   "ay": 0,
+   "depth": 30.0
+  },
+  {
+   "id": "plant",
+   "label": "小盆栽",
+   "x": 229,
+   "y": 143,
+   "w": 18,
+   "h": 28,
+   "ax": 183,
+   "ay": 0,
+   "depth": 118.0
+  },
+  {
+   "id": "stool",
+   "label": "浴室小凳",
+   "x": 157,
+   "y": 117,
+   "w": 18,
+   "h": 19,
+   "ax": 202,
+   "ay": 0,
+   "depth": 60.0
+  },
+  {
+   "id": "slippers",
+   "label": "拖鞋",
+   "x": 106,
+   "y": 149,
+   "w": 15,
+   "h": 11,
+   "ax": 221,
+   "ay": 0,
+   "depth": 104.0
+  },
+  {
+   "id": "trash",
+   "label": "垃圾桶",
+   "x": 27,
+   "y": 147,
+   "w": 14,
+   "h": 16,
+   "ax": 237,
+   "ay": 0,
+   "depth": 110.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "tub",
+   "x": 200,
+   "y": 145,
+   "depth": 94.5,
+   "pose": "bath",
+   "activities": [
+    "bathing"
+   ]
+  },
+  {
+   "id": "basin",
+   "x": 103,
+   "y": 136,
+   "depth": 63.5,
+   "pose": "stand",
+   "activities": [
+    "chores_clean",
+    "idle"
+   ]
+  },
+  {
+   "id": "washer",
+   "x": 72,
+   "y": 153,
+   "depth": 98.5,
+   "pose": "stand",
+   "activities": [
+    "laundry"
+   ]
+  },
+  {
+   "id": "mat",
+   "x": 164,
+   "y": 167,
+   "depth": 126.5,
+   "pose": "stand",
+   "activities": [
+    "bathing",
+    "chores_clean"
+   ]
+  },
+  {
+   "id": "stand0",
+   "x": 106,
+   "y": 176,
+   "depth": 144.5,
+   "pose": "stand",
+   "activities": [
+    "chores_clean",
+    "laundry",
+    "idle"
+   ]
+  },
+  {
+   "id": "stand1",
+   "x": 156,
+   "y": 187,
+   "depth": 166.5,
+   "pose": "stand",
+   "activities": [
+    "idle"
+   ]
+  }
+ ]
+}

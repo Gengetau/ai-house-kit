@@ -22,9 +22,15 @@ AREA_LABELS = {
     "kazeminato": "风港",
     "city": "白帆市",
 }
+QINGKONG_AREA_LABELS = {
+    "hiyorizaka": "日和坂",
+    "ryokogai": "棱光街",
+    "kumominato": "云港",
+    "qingkong": "晴空都",
+}
 _ENTRANCE_RE = re.compile(
     # 白帆市 R1 ids: the R0 id oldpass stays covered, like oldtown, in case old rows still carry it.
-    r"(?:sakuraoka:ai-house:entrance|oldpass:ai-house:entrance|oldtown:ai-house:entrance|ai-house:entrance|sakuraoka_entrance|oldpass_entrance|oldtown_entrance|house_entrance|小屋门口)",
+    r"(?:hiyorizaka:ai-house:entrance|hiyorizaka_entrance|sakuraoka:ai-house:entrance|oldpass:ai-house:entrance|oldtown:ai-house:entrance|ai-house:entrance|sakuraoka_entrance|oldpass_entrance|oldtown_entrance|house_entrance|小屋门口)",
     re.IGNORECASE,
 )
 _ADDRESS_PATTERNS = (
@@ -70,13 +76,14 @@ def _area_label(raw):
     cleaned = redact_text(raw)
     if not cleaned:
         return ""
-    if cleaned.lower() in AREA_LABELS:
-        return AREA_LABELS[cleaned.lower()]
+    merged = {**QINGKONG_AREA_LABELS, **AREA_LABELS}
+    if cleaned.lower() in merged:
+        return merged[cleaned.lower()]
     if ":" in cleaned:
         head = cleaned.split(":", 1)[0].strip().lower()
-        if head in AREA_LABELS:
-            return AREA_LABELS[head]
-    return AREA_LABELS.get(cleaned.lower(), cleaned)
+        if head in merged:
+            return merged[head]
+    return merged.get(cleaned.lower(), cleaned)
 
 
 def _loads(text, default):

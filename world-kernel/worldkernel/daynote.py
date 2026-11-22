@@ -20,6 +20,7 @@ import datetime
 import json
 import re
 import sqlite3
+from pathlib import Path
 
 from . import daylog
 from . import vocab_life1 as V
@@ -77,7 +78,7 @@ def facts(db, world_db, day, now):
     start = t0(day)
     end = min(start + 86400, now)
     detail = [x for x in daylog.entries(db, start, start + 86400, now) if x["ts"] < end]
-    w = sqlite3.connect("file:" + world_db + "?mode=ro", uri=True, timeout=5)
+    w = sqlite3.connect(Path(world_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     w.row_factory = sqlite3.Row
     try:
         script = w.execute("SELECT id, ts, actors, text FROM script WHERE source='kernel' AND ts>=? AND ts<?"
@@ -108,20 +109,21 @@ def shown(lines):
     return keep[:MAX_FACTS], True
 
 
-def render(lines):
+def render(lines, names=None):
+    nmap = NAMES if names is None else names
     out = []
     for x in shown(lines)[0]:
         when = hm(x["ts"]) + (f"–{hm(x['end'])}" if x["end"] and hm(x["end"]) != hm(x["ts"]) else "")
-        who = f"（同在：{'、'.join(NAMES.get(a, a) for a in x['with'])}）" if x["with"] else ""
+        who = f"（同在：{'、'.join(nmap.get(a, a) for a in x['with'])}）" if x["with"] else ""
         out.append(f"{when} {x['text']}{who}")
     return "\n".join(out)
 
 
-def prompt(day, lines):
+def prompt(day, lines, names=None):
     wd = "一二三四五六日"[day.weekday()]
     cut = "（这天记下的事很多，清单略去了零碎的走动。）" if shown(lines)[1] else ""
     user = (f"日期：{day.year} 年 {day.month} 月 {day.day} 日（星期{wd}），日本时间。下面是小屋今天记下的事实，"
-            f"一行一件，按时间排{cut}：\n{render(lines)}\n\n{ASK}")
+            f"一行一件，按时间排{cut}：\n{render(lines, names=names)}\n\n{ASK}")
     return SYSTEM, user
 
 
@@ -132,11 +134,12 @@ def _names(label):
     return {n for n in names if len(n) >= 2}
 
 
-def _places():
+def _places(vocab=None):
     """Every room of the house and place in town, as {name: location id}."""
+    vc = V if vocab is None else vocab
     out = {}
-    for loc in V.LOCATIONS:
-        label = V.label(loc)
+    for loc in vc.LOCATIONS:
+        label = vc.label(loc)
         if label and label not in ("自己的卧室", "出门在外"):
             out.update({n: loc for n in _names(label)})
     return out
@@ -156,13 +159,15 @@ def read(answer):
     return text.strip() if isinstance(text, str) else ""
 
 
-def check(text, lines):
+def check(text, lines, names=None, vocab=None):
     """None when the note may be kept, else why not (a short code, no text of the note)."""
     if not text:
         return "no_text"
-    known = render(lines)
+    nmap = NAMES if names is None else names
+    vc = V if vocab is None else vocab
+    known = render(lines, names=nmap)
     if any(x.get("kind") == "script" and ("做了" in x["text"] or "吃了" in x["text"]) for x in shown(lines)[0]):
-        known += "\n" + V.label("kitchen")  # the cooking and the meals happen in the kitchen; their lines say no room
+        known += "\n" + vc.label("kitchen")  # the cooking and the meals happen in the kitchen; their lines say no room
     size = len(re.sub(r"\s", "", text))
     if size < LO:
         return "too_short"
@@ -173,14 +178,14 @@ def check(text, lines):
     words = text
     for w in NOT_WORDS:
         words = words.replace(w, "　")
-    for k, n in NAMES.items():
+    for k, n in nmap.items():
         if n in text and n not in known:
             return f"person_not_in_facts:{k}"
     if "房主" in text and "房主" not in known:
         return "owner_not_in_facts"
-    places = _places()
+    places = _places(vc)
     for p, loc in places.items():
-        if p in words and not any(n in known for n in _names(V.label(loc))):
+        if p in words and not any(n in known for n in _names(vc.label(loc))):
             return "place_not_in_facts"
     for f in FEELINGS:
         if f in words and f not in known:
@@ -195,6 +200,8 @@ class DayNote:
     def __init__(self, life, world_db, chat, log=print):
         self.life, self.s, self.world_db, self.chat, self.log = life, life.s, world_db, chat, log
         self.budget = Budget(self.s, pool=POOL, limits=LIMITS)
+        self.names = dict(getattr(life, "names", NAMES))
+        self.vocab = getattr(life, "V", V)
 
     def due(self, now=None):
         """The day whose note is due now (23:30 that day until 03:00 the next morning), or None."""
@@ -233,7 +240,7 @@ class DayNote:
         rid = self.budget.reserve("system", "day_note")
         if rid is None:
             return self._result(day, "no_budget", facts=len(lines))
-        system, user = prompt(day, lines)
+        system, user = prompt(day, lines, names=self.names)
         try:  # outside any transaction
             answer, tokens = self.chat(system, user)
         except Exception as e:  # unknown cost: keep counting it, never ask again for this day
@@ -241,7 +248,7 @@ class DayNote:
             return self._result(day, "model_error", error=type(e).__name__, facts=len(lines))
         self.budget.settle(rid, tokens)
         text = read(answer)
-        why = check(text, lines)
+        why = check(text, lines, names=self.names, vocab=self.vocab)
         if why:
             # the answer's size tells a cut-off answer (max_tokens) from a refused one; never its words
             return self._result(day, "refused", reason=why, facts=len(lines), answer_chars=len(answer or ""))

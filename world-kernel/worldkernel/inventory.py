@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import time
+from pathlib import Path
 
 OTHER = "other_snack"
 PREFIX = "legacy_item:"
@@ -82,7 +83,7 @@ def legacy_items(world_db):
     owner's console adds that put it there. [] when the file is not there."""
     if not world_db or not os.path.exists(world_db):
         return []
-    c = sqlite3.connect(f"file:{world_db}?mode=ro", uri=True, timeout=5)
+    c = sqlite3.connect(Path(world_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     c.row_factory = sqlite3.Row
     try:
         c.execute("PRAGMA query_only=1")
@@ -273,7 +274,7 @@ def queue_food(world_db, principal, channel, message_id, text):
 
 def process_food_queue(kernel, world_db):
     """Scheduler owns all physical writes. Replay covers a crash between kernel commit and input ack."""
-    c = sqlite3.connect(f'file:{world_db}?mode=rw', uri=True, timeout=5)
+    c = sqlite3.connect(Path(world_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
     try:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE name='food_input_queue'").fetchone():
             return
@@ -348,7 +349,7 @@ def stock_rows(kernel_db, since=None, empty=False, vocab=None):
     if not kernel_db or not os.path.exists(kernel_db):
         raise FileNotFoundError(kernel_db)
     items = vocab.CATALOG["items"]
-    c = sqlite3.connect(f"file:{kernel_db}?mode=ro", uri=True, timeout=5)
+    c = sqlite3.connect(Path(kernel_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     c.row_factory = sqlite3.Row
     try:
         c.execute("PRAGMA query_only=1")
@@ -408,7 +409,7 @@ def stock_takes(kernel_db, since, limit=60):
     Raises FileNotFoundError when the kernel db is not there."""
     if not kernel_db or not os.path.exists(kernel_db):
         raise FileNotFoundError(kernel_db)
-    c = sqlite3.connect(f"file:{kernel_db}?mode=ro", uri=True, timeout=5)
+    c = sqlite3.connect(Path(kernel_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     try:
         c.execute("PRAGMA query_only=1")
         got = {}
@@ -581,7 +582,7 @@ def receive_owner_stock(kernel, principal, key, op, args):
 def process_owner_stock_queue(kernel, world_db):
     """Scheduler side of queue_owner_stock (same crash story as process_food_queue: the kernel receipt makes a
     replay after a crash between the two commits a no-op)."""
-    c = sqlite3.connect(f"file:{world_db}?mode=rw", uri=True, timeout=5)
+    c = sqlite3.connect(Path(world_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
     try:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE name='owner_stock_queue'").fetchone():
             return

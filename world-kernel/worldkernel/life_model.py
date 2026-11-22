@@ -241,7 +241,7 @@ class LiveLifeModel:
         return out
 
 
-NIGHT_OWLS = {"alma": 0.7, "mina": 0.8, "wanda": 0.5, "yuki": 0.4, "elsa": 0.15, "nell": 0.1}
+NIGHT_OWLS = dict(V.NIGHT_OWLS)
 # the fake model's no after the world refused her yes, by the refusal's reason
 NO_BECAUSE = {"outing_schedule_conflict": "那天已经有安排了", "monthly_overnight_limit": "这个月已经出去住过一次了",
               "insufficient_funds": "这个月钱不太够", "avoid_place_in_rain": "下雨天就不去那儿了"}
@@ -250,8 +250,8 @@ NO_BECAUSE = {"outing_schedule_conflict": "那天已经有安排了", "monthly_o
 class FakeLifeModel:
     """Persona-shaped, deterministic stand-in for the fast-forward week (no network, zero cost)."""
 
-    def __init__(self, seed="life1"):
-        self.seed, self.calls = seed, 0
+    def __init__(self, seed="life1", vocab=None):
+        self.seed, self.calls, self.V = seed, 0, (vocab or V)
 
     def rng(self, *parts):
         return random.Random(hashlib.sha256(":".join(map(str, (self.seed,) + parts)).encode()).hexdigest())
@@ -270,7 +270,7 @@ class FakeLifeModel:
             return {"text": "嗯。", "tokens": 0}
         r = self.rng(me, kind, life.get("now"))
         steps = []
-        prefs = V.PEOPLE[me]["activities"]["prefer"]
+        prefs = self.V.PEOPLE[me]["activities"]["prefer"]
         if kind in ("owner_entered", "owner_said"):  # 房主化身: a word to the room
             steps = [{"action_type": "say", "args": {}, "about": []}]
         elif kind == "owner_gave":  # thanks him, then eats it now or keeps it
@@ -283,8 +283,8 @@ class FakeLifeModel:
             talk = life.get("qq_chat") or []
             plans = " ".join(i["text"] for t in talk for i in t.get("你的打算", []) if me in i.get("答应了的", []))
             if "睡" in plans:
-                if ctx.get("location") != V.bed(me):
-                    steps.append({"action_type": "move", "args": {"to": V.bed(me)}})
+                if ctx.get("location") != self.V.bed(me):
+                    steps.append({"action_type": "move", "args": {"to": self.V.bed(me)}})
                 steps.append({"action_type": "sleep", "args": {"seconds": 8 * 3600}})
         elif kind.startswith("invitation:"):
             inv = next((i for i in life.get("invitations", ()) if i["inv_id"] == kind.split(":", 1)[1]), None)
@@ -298,13 +298,13 @@ class FakeLifeModel:
         elif kind.startswith("head_cook:"):
             opts = life.get("cook_options") or []
             need = len(life.get("eaters") or ()) or 1
-            good = V.PEOPLE[me]["cooking"]["good_at"]
-            ranked = sorted(opts, key=lambda o: (V.RECIPES[o]["makes"][o] >= need, o in good, r.random()), reverse=True)
+            good = self.V.PEOPLE[me]["cooking"]["good_at"]
+            ranked = sorted(opts, key=lambda o: (self.V.RECIPES[o]["makes"][o] >= need, o in good, r.random()), reverse=True)
             pick = ranked[0] if ranked else None
             others = [e for e in life.get("eaters", ()) if e != me]
             if others:
                 t = dt.datetime.strptime(life["now"], "%Y-%m-%d %H:%M") + dt.timedelta(
-                    minutes=V.RECIPES[pick]["seconds"] // 60 if pick else 20)
+                    minutes=self.V.RECIPES[pick]["seconds"] // 60 if pick else 20)
                 steps.append({"action_type": "invite", "args": {"to": others, "kind": "meal", "what": pick or "",
                                                                 "location": "kitchen",
                                                                 "start": t.strftime("%Y-%m-%d %H:%M")}})
@@ -343,19 +343,19 @@ class FakeLifeModel:
                     steps = [{"action_type": "invite", "args": {"to": who, "kind": "activity", "what": what,
                                                                 "location": where, "start": start}}]
         elif kind == "bedtime":
-            if r.random() < NIGHT_OWLS.get(me, 0.3):
+            if r.random() < getattr(self.V, 'NIGHT_OWLS', NIGHT_OWLS).get(me, 0.3):
                 # staying up with her phone where that is allowed (living or her room): from the study or the yard
                 # she goes to her room first (the stale retry used to hide 6 guard refusals a week)
                 if not V.activity_allowed_at("phone_browsing", me, ctx.get("location")):
-                    steps.append({"action_type": "move", "args": {"to": V.bed(me)}})
+                    steps.append({"action_type": "move", "args": {"to": self.V.bed(me)}})
                 steps.append({"action_type": "begin_activity", "args": {"activity": "phone_browsing", "seconds": 1800}})
         elif kind.startswith("scheduled_meal") or kind.startswith("hungry"):
             shown = life.get("cook_options")
             if shown is not None:  # life1 shows what she could still make in time: a quick one, or wait
-                good = V.PEOPLE[me]["cooking"]["good_at"]
-                opts = sorted(shown, key=lambda o: (V.RECIPES[o]["seconds"], o not in good))
+                good = self.V.PEOPLE[me]["cooking"]["good_at"]
+                opts = sorted(shown, key=lambda o: (self.V.RECIPES[o]["seconds"], o not in good))
             else:
-                opts = [x for x in ("omelette", "omelette_rice", "yakisoba", "cooked_rice") if x in V.RECIPES]
+                opts = [x for x in ("omelette", "omelette_rice", "yakisoba", "cooked_rice") if x in self.V.RECIPES]
             if opts:
                 steps = ([] if ctx.get("location") == "kitchen" else [{"action_type": "move", "args": {"to": "kitchen"}}])
                 steps.append({"action_type": "cook", "args": {"recipe": opts[0]}})

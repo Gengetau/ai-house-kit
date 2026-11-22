@@ -27,6 +27,7 @@ JST = dt.timezone(dt.timedelta(hours=9))
 
 _MONTH_TEMP = (5.5, 6.5, 9.5, 14.5, 19.0, 22.0, 26.0, 27.5, 23.5, 18.0, 12.5, 8.0)
 _AREA_ORDER = ("sakuraoka", "rurigai", "kazeminato")
+QINGKONG_AREA_ORDER = ("hiyorizaka", "ryokogai", "kumominato")
 
 
 def _utf16_key(s):
@@ -89,7 +90,7 @@ def city_fallback_weather(at_ms, area="sakuraoka"):
     base = _MONTH_TEMP[d.month - 1]
     swing = math.cos(((d.hour - 14) / 24.0) * 2.0 * math.pi) * 3.5
     temp_c = math.floor((base + swing) * 10.0 + 0.5) / 10.0
-    idx = _AREA_ORDER.index(area) if area in _AREA_ORDER else -1
+    idx = _AREA_ORDER.index(area) if area in _AREA_ORDER else (QINGKONG_AREA_ORDER.index(area) if area in QINGKONG_AREA_ORDER else -1)
     code = (1, 2, 3, 2)[(d.day + idx) % 4]
     return {
         "area": area,

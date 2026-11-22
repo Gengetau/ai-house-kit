@@ -139,7 +139,7 @@ def _history(k, actor, garments, now):
     return got
 
 
-def cards(k, w, now):
+def cards(k, w, now, names_map=None):
     """All six residents. k: life1.db, w: world.db (both opened read-only by the caller); now: epoch seconds."""
     today = datetime.datetime.fromtimestamp(now, JST).date()
     midnight = datetime.datetime.combine(today, datetime.time(), JST).timestamp()
@@ -159,7 +159,7 @@ def cards(k, w, now):
         nxt = {r["actor"]: _loads(r["data"], {}).get("next") for r in w.execute("SELECT actor, data FROM kernel_card")}
     except Exception as e:  # noqa: BLE001
         out["next_error"] = type(e).__name__
-    for actor, name in NAMES.items():
+    for actor, name in (names_map or NAMES).items():
         rec = {"actor": actor, "name": name}
         _part(rec, "kernel", lambda: _kernel(k, actor))
         r = reality.get(actor)

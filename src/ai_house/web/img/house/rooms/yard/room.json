@@ -1,0 +1,231 @@
+{
+ "key": "yard",
+ "size": [
+  340,
+  268
+ ],
+ "objects": [
+  {
+   "id": "tree",
+   "label": "院子里的老树",
+   "x": 141,
+   "y": 40,
+   "w": 42,
+   "h": 75,
+   "ax": 0,
+   "ay": 0,
+   "depth": 26.0
+  },
+  {
+   "id": "flowers1",
+   "label": "花圃，开着各色小花",
+   "x": 189,
+   "y": 105,
+   "w": 74,
+   "h": 48,
+   "ax": 43,
+   "ay": 0,
+   "depth": 76.0
+  },
+  {
+   "id": "flowers2",
+   "label": "花圃",
+   "x": 71,
+   "y": 107,
+   "w": 64,
+   "h": 41,
+   "ax": 118,
+   "ay": 0,
+   "depth": 71.0
+  },
+  {
+   "id": "bench",
+   "label": "长椅，晴天可以在这晒太阳",
+   "x": 255,
+   "y": 131,
+   "w": 48,
+   "h": 44,
+   "ax": 183,
+   "ay": 0,
+   "depth": 137.0
+  },
+  {
+   "id": "ttable",
+   "label": "户外小茶桌",
+   "x": 151,
+   "y": 146,
+   "w": 42,
+   "h": 34,
+   "ax": 232,
+   "ay": 0,
+   "depth": 150.0
+  },
+  {
+   "id": "tchair1",
+   "label": "折叠椅",
+   "x": 142,
+   "y": 135,
+   "w": 24,
+   "h": 32,
+   "ax": 275,
+   "ay": 0,
+   "depth": 133.0
+  },
+  {
+   "id": "tchair2",
+   "label": "折叠椅",
+   "x": 180,
+   "y": 165,
+   "w": 24,
+   "h": 21,
+   "ax": 300,
+   "ay": 0,
+   "depth": 169.0
+  },
+  {
+   "id": "rack",
+   "label": "晾衣架",
+   "x": 143,
+   "y": 166,
+   "w": 40,
+   "h": 55,
+   "ax": 325,
+   "ay": 0,
+   "depth": 227.0
+  },
+  {
+   "id": "pot1",
+   "label": "盆栽",
+   "x": 263,
+   "y": 160,
+   "w": 18,
+   "h": 30,
+   "ax": 366,
+   "ay": 0,
+   "depth": 178.0
+  },
+  {
+   "id": "pot2",
+   "label": "盆栽",
+   "x": 251,
+   "y": 180,
+   "w": 18,
+   "h": 26,
+   "ax": 385,
+   "ay": 0,
+   "depth": 210.0
+  },
+  {
+   "id": "can",
+   "label": "洒水壶",
+   "x": 239,
+   "y": 147,
+   "w": 14,
+   "h": 16,
+   "ax": 404,
+   "ay": 0,
+   "depth": 126.0
+  },
+  {
+   "id": "ball",
+   "label": "皮球",
+   "x": 100,
+   "y": 160,
+   "w": 12,
+   "h": 10,
+   "ax": 419,
+   "ay": 0,
+   "depth": 142.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "bench0",
+   "x": 270,
+   "y": 153,
+   "depth": 137.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "phone",
+    "idle",
+    "tea_time"
+   ]
+  },
+  {
+   "id": "bench1",
+   "x": 284,
+   "y": 160,
+   "depth": 137.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "phone",
+    "tea_time"
+   ]
+  },
+  {
+   "id": "chair1",
+   "x": 154,
+   "y": 153,
+   "depth": 133.5,
+   "pose": "sit",
+   "activities": [
+    "tea_time",
+    "drawing"
+   ]
+  },
+  {
+   "id": "chair2",
+   "x": 191,
+   "y": 172,
+   "depth": 169.5,
+   "pose": "sit",
+   "activities": [
+    "tea_time"
+   ]
+  },
+  {
+   "id": "garden",
+   "x": 210,
+   "y": 142,
+   "depth": 92.5,
+   "pose": "stand",
+   "activities": [
+    "gardening"
+   ]
+  },
+  {
+   "id": "garden2",
+   "x": 120,
+   "y": 139,
+   "depth": 86.5,
+   "pose": "stand",
+   "activities": [
+    "gardening"
+   ]
+  },
+  {
+   "id": "rack",
+   "x": 156,
+   "y": 203,
+   "depth": 214.5,
+   "pose": "stand",
+   "activities": [
+    "laundry"
+   ]
+  },
+  {
+   "id": "lawn",
+   "x": 82,
+   "y": 176,
+   "depth": 160.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "idle",
+    "drawing"
+   ]
+  }
+ ]
+}

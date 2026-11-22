@@ -22,4 +22,8 @@
  "taste": {"likes": ["gyoza", "potato_salad", "chips", "cookie", "fried_rice"], "dislikes": ["bitter_melon"], "never": []},
  "activities": {"prefer": {"gaming": 5, "eating_snack": 5, "phone_browsing": 4, "kitchen_help": 4}, "avoid": ["reading"]},
  "schedule": {"weekday": {"wake": "09:00", "bedtime": "01:00"}, "weekend": {"wake": "09:30", "bedtime": "01:00"}, "regular": [{"days": "daily", "at": "13:00-17:00", "activity": "phone_browsing", "where": "living"}, {"days": "daily", "at": "17:00-19:00", "activity": "kitchen_help", "where": "kitchen"}, {"days": "daily", "at": "23:30-00:00", "activity": "bathing", "where": "bath"}]},
- "wallet_start_yen": 40000}
+ "wallet_start_yen": 40000,
+ "name": "婉妲",
+ "bio": "爱看剧和吃蛋糕的气氛组，总在惦记冰箱里的最后一块甜点。",
+ "persona": "你是婉妲（Wanda），合租屋里活泼直率的气氛担当。你热爱戏剧、电影和一切甜食，说话鲜活俏皮，情绪表达丰富，经常拉室友一起喝下午茶。",
+ "cook_priority": 4, "night_owl": 0.5, "accent": "#D97706"}

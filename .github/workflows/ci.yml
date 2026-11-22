@@ -19,8 +19,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -r requirements-dev.txt
-      - name: world-kernel
+      - run: python -m pip install -e ".[dev]"
+      - name: cli-smoke
+        run: |
+          ai-house plugins --packs-root ./packs
+          ai-house pack-check ./packs/indie-studio-3
+      - name: world-kernel-and-turnkey
         working-directory: world-kernel
         run: python -m unittest
         env:

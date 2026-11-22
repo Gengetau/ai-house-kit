@@ -41,7 +41,8 @@ def rooms():
     return [k for k, loc in V.LOCATIONS.items() if loc.get("kind") == "room"]
 
 
-def check(body):
+def check(body, vocab=None):
+    _V = vocab or V
     """Validate one console command; returns the clean dict (raises AvatarError with words for the page)."""
     if not isinstance(body, dict) or body.get("op") not in OPS:
         raise AvatarError("不认识的操作")
@@ -56,7 +57,7 @@ def check(body):
         if isinstance(said, (int, float)) and not isinstance(said, bool) and said > 0:
             out["said_at"] = said
     if body["op"] in ("enter", "move"):
-        if body.get("location") not in rooms():
+        if body.get("location") not in [k for k, loc in _V.LOCATIONS.items() if loc.get("kind") == "room"]:
             raise AvatarError("没有这个房间")
         out["location"] = body["location"]
     elif body["op"] == "say":
@@ -65,7 +66,7 @@ def check(body):
             raise AvatarError(f"要说的话不能是空的，也不能超过 {TEXT_MAX} 字")
         out["text"] = text.strip()
     elif body["op"] == "give":
-        if body.get("to") not in V.PEOPLE or not isinstance(body.get("resource_id"), str) \
+        if body.get("to") not in _V.PEOPLE or not isinstance(body.get("resource_id"), str) \
                 or not 1 <= len(body["resource_id"]) <= 200:
             raise AvatarError("要选给谁、给什么")
         out["to"], out["resource_id"] = body["to"], body["resource_id"]
@@ -122,7 +123,7 @@ class Avatar:
     """Life extension: drains the owner's inbox, applies it in the kernel, wakes the people who perceived it."""
 
     def __init__(self, life, world_db=None):
-        self.life, self.k, self.s = life, life.k, life.s
+        self.life, self.k, self.s, self.V = life, life.k, life.s, getattr(life, 'V', V)
         self.world_db = world_db
         with self.s.tx() as db:
             db.execute("CREATE TABLE IF NOT EXISTS avatar_applied (cmd_id TEXT PRIMARY KEY, receipt TEXT NOT NULL)")
@@ -141,7 +142,7 @@ class Avatar:
     def drain(self):
         if not self.world_db or not Path(self.world_db).exists():
             return
-        c = sqlite3.connect(f"file:{self.world_db}?mode=rw", uri=True, timeout=5)
+        c = sqlite3.connect(Path(self.world_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
         try:
             if not c.execute("SELECT 1 FROM sqlite_master WHERE name='owner_avatar_queue'").fetchone():
                 return
@@ -180,7 +181,7 @@ class Avatar:
         """Apply one checked command in one kernel transaction; replay after a crash returns the first receipt."""
         if principal != "cmd:owner":
             return {"status": "failed", "reason": "owner_only"}
-        cmd = check(cmd)
+        cmd = check(cmd, vocab=self.V)
         with self.s.tx() as db:
             prior = db.execute("SELECT receipt FROM avatar_applied WHERE cmd_id=?", (cmd["cmd_id"],)).fetchone()
             if prior:
@@ -292,7 +293,7 @@ class Avatar:
         rank = {"owner_entered": 0, "owner_said": 1, "owner_gave": 2}
         for r in rows:
             a = r["observer_id"]
-            if a not in V.PEOPLE:
+            if a not in self.V.PEOPLE:
                 continue
             kind = KINDS[r["kind"]]
             if kind == "owner_gave" and json.loads(r["payload"]).get("to") != a:

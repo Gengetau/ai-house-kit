@@ -4,6 +4,7 @@ Covers S1 and F1-F14 + shared budget pool graceful degradation + 6-roommate roll
 using Store(synthetic=True) and an in-memory spec-compliant mock bridge transport
 (zero network, zero paid calls, runs in ai-house-cc:20261007.2 --network none).
 """
+import contextlib
 import datetime as dt
 import json
 import os
@@ -739,7 +740,7 @@ class CityBridgeM1ATests(unittest.TestCase):
         self.proj = Projector(self.life, self.world_db)
 
     def _cards(self):
-        with sqlite3.connect(self.world_db) as w:
+        with contextlib.closing(sqlite3.connect(self.world_db)) as w:
             w.row_factory = sqlite3.Row
             return cards(self.s.db, w, self.clock.now())
 

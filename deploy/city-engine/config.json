@@ -1,0 +1,15 @@
+{
+  "city": {
+    "enabled": true,
+    "dbFile": "/data/city.db",
+    "weather": false,
+    "house": [
+      { "actorId": "alma", "name": "阿尔玛" },
+      { "actorId": "elsa", "name": "艾莎" },
+      { "actorId": "mina", "name": "米娜" },
+      { "actorId": "nell", "name": "奈尔" },
+      { "actorId": "wanda", "name": "婉妲" },
+      { "actorId": "yuki", "name": "由纪" }
+    ]
+  }
+}

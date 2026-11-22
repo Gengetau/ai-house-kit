@@ -33,6 +33,7 @@ import threading
 import time
 import traceback
 import urllib.request
+from pathlib import Path
 
 from worldkernel import admin
 from worldkernel import vocab as vocab_p1a
@@ -134,7 +135,7 @@ def legacy_reality(world_db):
     """Read-only look at world.db reality; {} when the file is not there."""
     if not os.path.exists(world_db):
         return {}
-    c = sqlite3.connect(f"file:{world_db}?mode=ro", uri=True, timeout=5)
+    c = sqlite3.connect(Path(world_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     c.row_factory = sqlite3.Row
     try:
         return {r["actor"]: dict(r) for r in c.execute(
@@ -482,10 +483,20 @@ def report(runtime_dir, day, profile="p1a"):
     lo = datetime.datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=JST).timestamp()
     hi = lo + 86400
     kernel_db, samples_db = PROFILES[profile]["files"]
-    s = sqlite3.connect(f"file:{os.path.join(runtime_dir, samples_db)}?mode=ro", uri=True)
+    s = sqlite3.connect(Path(os.path.join(runtime_dir, samples_db)).resolve().as_uri() + "?mode=ro", uri=True)
     s.row_factory = sqlite3.Row
-    k = sqlite3.connect(f"file:{os.path.join(runtime_dir, kernel_db)}?mode=ro", uri=True)
+    k = sqlite3.connect(Path(os.path.join(runtime_dir, kernel_db)).resolve().as_uri() + "?mode=ro", uri=True)
     k.row_factory = sqlite3.Row
+    try:
+        return _render_report(runtime_dir, day, profile, s, k)
+    finally:
+        s.close()
+        k.close()
+
+
+def _render_report(runtime_dir, day, profile, s, k):
+    lo = datetime.datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=JST).timestamp()
+    hi = lo + 86400
     if profile == "p1a":
         intro = ("第一版只比两件事：在不在公共区（厨房/客厅），睡没睡。P1a 目录只有三个地方，书房、院子、浴室、"
                  "卧室和出门都算「别处」。")

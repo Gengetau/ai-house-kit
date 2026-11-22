@@ -81,6 +81,7 @@ class Base(unittest.TestCase):
         self.chat = Chat(GOOD)
         self.a = authority.Authority(self.kpath, self.wpath, self.chat, {}, clock=self.clock, model=FakeLifeModel(),
                                      migrate_items=False, day_note=True)
+        self.addCleanup(self.a.store.close)
         self.addCleanup(self.a.store.release)
         self.note = self.a.note
         self.note.log = lambda m: None
@@ -137,7 +138,7 @@ class DueTests(Base):
                 a = self.authority.Authority(self.kpath, self.wpath, chat, {}, clock=self.clock,
                                              model=FakeLifeModel(), migrate_items=False)
             self.assertEqual(a.note is not None, want, env)
-            a.store.release()
+            a.close()
             self.a.store.acquire()
 
 
@@ -200,6 +201,7 @@ class WriteTests(Base):
         chat = Chat(GOOD)
         a = self.authority.Authority(self.kpath, self.wpath, chat, {}, clock=self.clock, model=FakeLifeModel(),
                                      migrate_items=False, day_note=True)
+        self.addCleanup(a.store.close)
         self.addCleanup(a.store.release)
         self.at(23, 40)
         self.assertIsNone(a.note.step())

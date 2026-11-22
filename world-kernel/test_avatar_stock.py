@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,7 +60,7 @@ class Base(unittest.TestCase):
         return {r["id"]: r for r in inventory.stock_rows(self.kdb, since=DAY, empty=True)}
 
     def snacks(self):
-        db = sqlite3.connect(f"file:{self.kdb}?mode=ro", uri=True)
+        db = sqlite3.connect(Path(self.kdb).resolve().as_uri() + "?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         try:
             return {s["label"]: s for s in inventory.giveable_snacks(db, V)}
@@ -187,6 +188,7 @@ class AuthorityStep(unittest.TestCase):
         self.clock = VirtualClock(dt.datetime(2026, 11, 7, 10, 0, tzinfo=JST).timestamp())
         self.a = authority.Authority(self.kpath, self.wpath, None, {}, clock=self.clock, model=FakeLifeModel(),
                                      migrate_items=False)
+        self.addCleanup(self.a.store.close)
         self.addCleanup(self.a.store.release)
 
     def test_extensions_installed(self):

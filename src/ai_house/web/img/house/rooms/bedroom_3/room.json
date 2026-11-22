@@ -1,0 +1,189 @@
+{
+ "key": "bedroom_3",
+ "size": [
+  252,
+  232
+ ],
+ "objects": [
+  {
+   "id": "bed",
+   "label": "床",
+   "x": 63,
+   "y": 98,
+   "w": 68,
+   "h": 57,
+   "ax": 0,
+   "ay": 0,
+   "depth": 63.0
+  },
+  {
+   "id": "nightstand",
+   "label": "床头柜和台灯",
+   "x": 91,
+   "y": 93,
+   "w": 24,
+   "h": 35,
+   "ax": 69,
+   "ay": 0,
+   "depth": 34.0
+  },
+  {
+   "id": "slippers",
+   "label": "拖鞋",
+   "x": 109,
+   "y": 149,
+   "w": 15,
+   "h": 10,
+   "ax": 94,
+   "ay": 0,
+   "depth": 101.5
+  },
+  {
+   "id": "desk",
+   "label": "电竞桌，双屏",
+   "x": 163,
+   "y": 109,
+   "w": 56,
+   "h": 51,
+   "ax": 110,
+   "ay": 0,
+   "depth": 83.0
+  },
+  {
+   "id": "gchair",
+   "label": "电竞椅",
+   "x": 149,
+   "y": 124,
+   "w": 26,
+   "h": 39,
+   "ax": 167,
+   "ay": 0,
+   "depth": 100.0
+  },
+  {
+   "id": "snacks",
+   "label": "零食堆",
+   "x": 212,
+   "y": 149,
+   "w": 17,
+   "h": 20,
+   "ax": 194,
+   "ay": 0,
+   "depth": 114.0
+  },
+  {
+   "id": "shelf",
+   "label": "手办架",
+   "x": 13,
+   "y": 127,
+   "w": 34,
+   "h": 37,
+   "ax": 212,
+   "ay": 0,
+   "depth": 105.0
+  },
+  {
+   "id": "bean",
+   "label": "懒人沙发",
+   "x": 119,
+   "y": 178,
+   "w": 30,
+   "h": 19,
+   "ax": 247,
+   "ay": 0,
+   "depth": 170.0
+  },
+  {
+   "id": "manga",
+   "label": "漫画堆",
+   "x": 64,
+   "y": 138,
+   "w": 17,
+   "h": 19,
+   "ax": 278,
+   "ay": 0,
+   "depth": 99.0
+  },
+  {
+   "id": "trash",
+   "label": "垃圾桶（满了）",
+   "x": 185,
+   "y": 160,
+   "w": 14,
+   "h": 16,
+   "ax": 296,
+   "ay": 0,
+   "depth": 136.0
+  },
+  {
+   "id": "guitar",
+   "label": "电吉他",
+   "x": 130,
+   "y": 173,
+   "w": 13,
+   "h": 32,
+   "ax": 311,
+   "ay": 0,
+   "depth": 193.5
+  }
+ ],
+ "anchors": [
+  {
+   "id": "bed",
+   "x": 84,
+   "y": 119,
+   "depth": 63.5,
+   "pose": "sleep",
+   "activities": [
+    "sleeping",
+    "resting"
+   ]
+  },
+  {
+   "id": "gchair",
+   "x": 162,
+   "y": 149,
+   "depth": 100.5,
+   "pose": "sit",
+   "activities": [
+    "gaming",
+    "working",
+    "phone"
+   ]
+  },
+  {
+   "id": "rug",
+   "x": 122,
+   "y": 174,
+   "depth": 140.5,
+   "pose": "sit",
+   "activities": [
+    "phone",
+    "drama",
+    "resting",
+    "idle"
+   ]
+  },
+  {
+   "id": "snacks",
+   "x": 198,
+   "y": 166,
+   "depth": 124.5,
+   "pose": "stand",
+   "activities": [
+    "eating",
+    "idle"
+   ]
+  },
+  {
+   "id": "stand",
+   "x": 70,
+   "y": 170,
+   "depth": 132.5,
+   "pose": "stand",
+   "activities": [
+    "idle"
+   ]
+  }
+ ]
+}

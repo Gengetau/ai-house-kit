@@ -2,7 +2,8 @@
 import itertools
 import re
 
-BOTS = frozenset(("nell", "elsa", "alma", "mina", "yuki", "wanda"))
+from . import vocab_life1 as _V
+BOTS = frozenset(_V.ROSTER)
 KINDS = {"arrived", "activity", "purchased", "brought_home", "handoff"}
 NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 UNITS = r"[份包袋瓶个块杯盒]"

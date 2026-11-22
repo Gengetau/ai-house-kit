@@ -1,0 +1,339 @@
+{
+ "key": "kitchen",
+ "size": [
+  324,
+  268
+ ],
+ "objects": [
+  {
+   "id": "fridge",
+   "label": "冰箱，门上贴着大家的便签",
+   "x": 133,
+   "y": 58,
+   "w": 32,
+   "h": 63,
+   "ax": 0,
+   "ay": 0,
+   "depth": 17.0
+  },
+  {
+   "id": "counter1",
+   "label": "料理台",
+   "x": 151,
+   "y": 95,
+   "w": 50,
+   "h": 44,
+   "ax": 33,
+   "ay": 0,
+   "depth": 44.0
+  },
+  {
+   "id": "sink",
+   "label": "水槽",
+   "x": 185,
+   "y": 110,
+   "w": 36,
+   "h": 39,
+   "ax": 84,
+   "ay": 0,
+   "depth": 71.0
+  },
+  {
+   "id": "stove",
+   "label": "灶台，锅里炖着东西",
+   "x": 205,
+   "y": 122,
+   "w": 34,
+   "h": 36,
+   "ax": 121,
+   "ay": 0,
+   "depth": 90.0
+  },
+  {
+   "id": "counter2",
+   "label": "料理台和调料架",
+   "x": 223,
+   "y": 127,
+   "w": 56,
+   "h": 51,
+   "ax": 156,
+   "ay": 0,
+   "depth": 119.0
+  },
+  {
+   "id": "cabinet",
+   "label": "吊柜",
+   "x": 233,
+   "y": 103,
+   "w": 46,
+   "h": 38,
+   "ax": 213,
+   "ay": 0,
+   "depth": 112.0
+  },
+  {
+   "id": "cabinet2",
+   "label": "吊柜",
+   "x": 157,
+   "y": 65,
+   "w": 42,
+   "h": 36,
+   "ax": 260,
+   "ay": 0,
+   "depth": 34.0
+  },
+  {
+   "id": "chairf0",
+   "label": "餐椅",
+   "x": 138,
+   "y": 133,
+   "w": 24,
+   "h": 32,
+   "ax": 303,
+   "ay": 0,
+   "depth": 111.0
+  },
+  {
+   "id": "chairf1",
+   "label": "餐椅",
+   "x": 156,
+   "y": 142,
+   "w": 24,
+   "h": 32,
+   "ax": 328,
+   "ay": 0,
+   "depth": 129.0
+  },
+  {
+   "id": "chairf2",
+   "label": "餐椅",
+   "x": 174,
+   "y": 151,
+   "w": 24,
+   "h": 32,
+   "ax": 353,
+   "ay": 0,
+   "depth": 147.0
+  },
+  {
+   "id": "dtable",
+   "label": "六人餐桌",
+   "x": 107,
+   "y": 142,
+   "w": 84,
+   "h": 55,
+   "ax": 378,
+   "ay": 0,
+   "depth": 147.0
+  },
+  {
+   "id": "chairn0",
+   "label": "餐椅",
+   "x": 98,
+   "y": 164,
+   "w": 24,
+   "h": 21,
+   "ax": 463,
+   "ay": 0,
+   "depth": 151.0
+  },
+  {
+   "id": "chairn1",
+   "label": "餐椅",
+   "x": 116,
+   "y": 173,
+   "w": 24,
+   "h": 21,
+   "ax": 488,
+   "ay": 0,
+   "depth": 169.0
+  },
+  {
+   "id": "chairn2",
+   "label": "餐椅",
+   "x": 134,
+   "y": 182,
+   "w": 24,
+   "h": 21,
+   "ax": 0,
+   "ay": 64,
+   "depth": 187.0
+  },
+  {
+   "id": "plant",
+   "label": "香草盆栽",
+   "x": 37,
+   "y": 135,
+   "w": 18,
+   "h": 32,
+   "ax": 25,
+   "ay": 64,
+   "depth": 116.0
+  },
+  {
+   "id": "trash",
+   "label": "分类垃圾桶",
+   "x": 275,
+   "y": 167,
+   "w": 22,
+   "h": 20,
+   "ax": 44,
+   "ay": 64,
+   "depth": 154.0
+  },
+  {
+   "id": "veg",
+   "label": "今天买的菜",
+   "x": 175,
+   "y": 213,
+   "w": 22,
+   "h": 22,
+   "ax": 67,
+   "ay": 64,
+   "depth": 250.0
+  },
+  {
+   "id": "dtable2",
+   "label": "餐桌上的杯子",
+   "x": 136,
+   "y": 145,
+   "w": 38,
+   "h": 34,
+   "ax": 90,
+   "ay": 64,
+   "depth": 147.2
+  }
+ ],
+ "anchors": [
+  {
+   "id": "dinef0",
+   "x": 149,
+   "y": 150,
+   "depth": 111.5,
+   "pose": "sit",
+   "activities": [
+    "eating",
+    "tea_time",
+    "socializing",
+    "phone"
+   ]
+  },
+  {
+   "id": "dinef1",
+   "x": 167,
+   "y": 160,
+   "depth": 129.5,
+   "pose": "sit",
+   "activities": [
+    "eating",
+    "tea_time",
+    "socializing",
+    "phone"
+   ]
+  },
+  {
+   "id": "dinef2",
+   "x": 185,
+   "y": 168,
+   "depth": 147.5,
+   "pose": "sit",
+   "activities": [
+    "eating",
+    "tea_time",
+    "socializing",
+    "phone"
+   ]
+  },
+  {
+   "id": "dinen0",
+   "x": 111,
+   "y": 170,
+   "depth": 151.5,
+   "pose": "sit",
+   "activities": [
+    "eating",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "dinen1",
+   "x": 129,
+   "y": 178,
+   "depth": 169.5,
+   "pose": "sit",
+   "activities": [
+    "eating",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "dinen2",
+   "x": 147,
+   "y": 188,
+   "depth": 187.5,
+   "pose": "sit",
+   "activities": [
+    "eating",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "stove",
+   "x": 205,
+   "y": 158,
+   "depth": 107.5,
+   "pose": "stand",
+   "activities": [
+    "cooking"
+   ]
+  },
+  {
+   "id": "counter",
+   "x": 226,
+   "y": 168,
+   "depth": 128.5,
+   "pose": "stand",
+   "activities": [
+    "cooking",
+    "chores_clean"
+   ]
+  },
+  {
+   "id": "sink",
+   "x": 186,
+   "y": 148,
+   "depth": 88.5,
+   "pose": "stand",
+   "activities": [
+    "chores_dishes",
+    "cooking"
+   ]
+  },
+  {
+   "id": "fridge",
+   "x": 134,
+   "y": 122,
+   "depth": 36.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "eating"
+   ]
+  },
+  {
+   "id": "stand",
+   "x": 206,
+   "y": 204,
+   "depth": 200.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "phone",
+    "chores_clean"
+   ]
+  }
+ ]
+}

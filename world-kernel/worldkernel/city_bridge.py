@@ -36,6 +36,7 @@ from .city_client import (
     MAPPINGS_VERSION,
     SUPPORTED_MAPPINGS_VERSIONS,
     _AREA_ORDER,
+    QINGKONG_AREA_ORDER,
     CityBridgeError,
     CityBridgeHttpClient,
     CityConflictError,
@@ -91,9 +92,13 @@ OUTBOUND_ITEM_MAP = {
     if row.get("direction") != "home"
 }
 
+MAPPINGS_V3_EXTRA = (
+    {"kernel": {"kind": "wardrobe_asset", "item": "*"}, "engine_type": "apparel_bundle", "stack": False, "edible": False, "direction": "home"},
+)
+
 INBOUND_ITEM_MAP = {
     row["engine_type"]: (row["kernel"]["kind"], row["kernel"]["item"])
-    for row in MAPPINGS_V2["items"]
+    for row in (MAPPINGS_V2["items"] + MAPPINGS_V3_EXTRA)
 }
 
 # Optional K5 place-id bridge for life1 outings when city routing is enabled.
@@ -110,9 +115,22 @@ DEFAULT_CITY_PLACE_TARGETS = {
     "kamitsuki": "kazeminato:kamitsuki",
 }
 
+QINGKONG_CITY_PLACE_TARGETS = {
+    "ryokogai": "ryokogai:kissa-tomoshibi",
+    "kumominato": "kumominato:muginohi",
+    "rurigai": "ryokogai:kissa-tomoshibi",
+    "kazeminato": "kumominato:muginohi",
+    "kissa_tomoshibi": "ryokogai:kissa-tomoshibi",
+    "shiorido": "ryokogai:shiorido",
+    "minami_park": "ryokogai:minami-park",
+    "muginohi": "kumominato:muginohi",
+    "southern_terrace": "kumominato:southern-terrace",
+    "kamitsuki": "kumominato:kamitsuki",
+}
+
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 _VALID_CITY_ACTION_TYPES = frozenset(
-    ("travel", "say", "buy", "consume", "give", "go_home", "store_locker", "take_locker")
+    ("travel", "say", "buy", "consume", "give", "go_home", "store_locker", "take_locker", "drift_book", "take_book")
 )
 
 
@@ -196,6 +214,20 @@ def normalize_city_actions(raw_actions, max_actions=4):
                 if not 1 <= qty <= 9:
                     continue
                 act["qty"] = qty
+        elif atype == "drift_book":
+            if isinstance(raw.get("item_id"), str) and raw["item_id"].strip():
+                act["item_id"] = raw["item_id"].strip()
+            elif isinstance(raw.get("item"), str) and raw["item"].strip():
+                act["item"] = raw["item"].strip()
+            else:
+                continue
+            note = sanitize_untrusted(raw.get("note"), max_len=50)
+            if note:
+                act["note"] = note
+        elif atype == "take_book":
+            if not (isinstance(raw.get("item_id"), str) and raw["item_id"].strip()):
+                continue
+            act["item_id"] = raw["item_id"].strip()
         out.append(act)
         if len(out) >= max_actions:
             break
@@ -330,12 +362,13 @@ class CityBridgeAdapter:
 
     # ------------------------------------------------------------------ roster & rain helpers
     def enable_actor(self, actor_id):
-        if actor_id not in ROSTER:
+        roster = getattr(self.l, 'roster', ROSTER)
+        if actor_id not in roster:
             raise ValueError(f"Unknown house actor: {actor_id}")
         self.allowed_actors.add(actor_id)
 
     def enable_all_roommates(self):
-        self.allowed_actors = set(ROSTER)
+        self.allowed_actors = set(getattr(self.l, 'roster', ROSTER))
 
     def owns(self, actor_id):
         return not self.v.home_allowed(actor_id)
@@ -345,7 +378,7 @@ class CityBridgeAdapter:
             return None
         places = {k: p["label"] for k, p in self.k.V.PLACES.items()}
         for area_key in self.city_place_targets:
-            places.setdefault(area_key, city_projection.AREA_LABELS.get(area_key, area_key))
+            places.setdefault(area_key, city_projection._area_label(area_key) or area_key)
         return {"places": places}
 
     def hold_until(self, actor_id, now):
@@ -398,7 +431,7 @@ class CityBridgeAdapter:
         pid = loc.split(":", 1)[1] if loc.startswith("place:") else loc
         if not pid or "ai-house:entrance" in pid or pid in self.city_place_targets or ":" not in pid:
             return
-        valid_areas = set(_AREA_ORDER) | {
+        valid_areas = set(_AREA_ORDER) | set(QINGKONG_AREA_ORDER) | {
             str(t).split(":", 1)[0] for t in self.city_place_targets.values() if ":" in str(t)
         }
         if pid.split(":", 1)[0] not in valid_areas:
@@ -479,6 +512,11 @@ class CityBridgeAdapter:
             raise Refused("BAD_CITY_CATALOG")
         self._catalog_cache = cat
         self._places_by_id = {p["id"]: p for p in places if isinstance(p, dict) and isinstance(p.get("id"), str)}
+        areas_seen = {p.get("area") for p in places if isinstance(p, dict)}
+        if ("hiyorizaka" in areas_seen or "ryokogai" in areas_seen) and self.city_place_targets == DEFAULT_CITY_PLACE_TARGETS:
+            self.city_place_targets = dict(QINGKONG_CITY_PLACE_TARGETS)
+            if hasattr(self.weather, "home_area") and self.weather.home_area == "sakuraoka":
+                self.weather.home_area = "hiyorizaka"
         return cat
 
     def _estimate_transit_reserve(self, catalog, destination_id):
@@ -2271,15 +2309,30 @@ def install_from_env(life, chat=None, selves=None, env=None):
     if env.get("WORLD_KERNEL_CITY_BRIDGE", "0") != "1":
         return None
     base_url = env.get("CITY_BRIDGE_URL", "http://127.0.0.1:17654/city/bridge/v1")
-    bridge_key = env.get("CITY_BRIDGE_KEY", "")
+    bridge_key = env.get("CITY_BRIDGE_KEY", "").strip()
     if not bridge_key:
+        raise ValueError("WORLD_KERNEL_CITY_BRIDGE=1 needs CITY_BRIDGE_KEY (an independent random secret, at least 24 characters)")
+    # 桥密钥必须是独立随机串：太短、占位串、或与房主令牌相同都拒绝启动，不悄悄用着。
+    if len(bridge_key) < 24 or bridge_key.lower().startswith("please-change"):
+        raise ValueError("CITY_BRIDGE_KEY must be an independent random secret of at least 24 characters")
+    for name in ("AI_HOUSE_OWNER_TOKEN", "AI_HOUSE_READ_TOKEN", "AI_HOUSE_WRITE_TOKEN", "AI_HOUSE_PRIVATE_TOKEN"):
+        if bridge_key == env.get(name, "").strip():
+            raise ValueError(f"CITY_BRIDGE_KEY must differ from {name}")
+    roster = getattr(life, "roster", ROSTER)
+    # 默认关闭：没有明确列出室友就没有人进城；要全员必须显式写 all。
+    raw_actors = env.get("WORLD_KERNEL_CITY_ACTORS", "").strip()
+    if not raw_actors:
         return None
-    raw_actors = env.get("WORLD_KERNEL_CITY_ACTORS", "nell").strip()
     if raw_actors in ("all", "*"):
-        actors = ROSTER
+        actors = roster
     else:
-        actors = tuple(a.strip() for a in raw_actors.split(",") if a.strip() in ROSTER) or DEFAULT_PILOT_ACTORS
+        actors = tuple(a.strip() for a in raw_actors.split(",") if a.strip() in roster)
+        if not actors:
+            return None
+    profile = env.get("CITY_PROFILE", "").strip().lower()
     client = CityBridgeHttpClient(base_url, bridge_key)
+    weather = CityWeatherProvider(life.s, client, home_area="hiyorizaka") if profile == "qingkong" else None
+    targets = dict(QINGKONG_CITY_PLACE_TARGETS) if profile == "qingkong" else None
     model = LiveCityDecisionModel(chat, selves) if chat else DeterministicCityModel()
     intercept = env.get("WORLD_KERNEL_CITY_PLANS", "0") == "1"
     return CityBridgeAdapter(
@@ -2287,5 +2340,7 @@ def install_from_env(life, chat=None, selves=None, env=None):
         client,
         city_model=model,
         allowed_actors=actors,
+        weather_provider=weather,
+        city_place_targets=targets,
         intercept_plans=intercept,
     )

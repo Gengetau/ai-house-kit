@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 
-import shadow  # chat_completion, legacy_reality, log helpers (same model route as the shadow)
+import shadow  # packaged via py-modules alongside worldkernel
 from worldkernel import daynote  # 今天的小屋, one note a night (WORLD_KERNEL_DAY_NOTE=1; off by default)
 from worldkernel.store import Store, WallClock, LockHeld
 from worldkernel.life import Life
@@ -30,7 +30,7 @@ def log(msg):
 
 class Authority:
     def __init__(self, path, world_db, chat, selves, clock=None, model=None, migrate_items=None, day_note=None,
-                 browse=None, env=None):
+                 browse=None, env=None, vocab=None, extra_extensions=(), intents_mod=None):
         self.clock = clock or WallClock()
         self.store = Store(path, self.clock, world_id=WORLD, synthetic=False, holder=HOLDER)
         self.store.acquire()
@@ -54,20 +54,24 @@ class Authority:
                          weather=city_weather,
                          seed_reality=shadow.legacy_reality(world_db) if fresh else None,
                          seed_items=inventory.legacy_items(world_db) if fresh and migrate_items else None,
-                         # 奈尔 outings, wallet, trips, shopping; 房主化身: the house page's inbox
-                         # 聊天介入生活: QQ talk with the owner reaches her day
                          extensions=[outings.install, avatar.install(world_db), chatlink.install(world_db)]
-                         + ([browsing] if browsing else []))
+                         + ([browsing] if browsing else []) + list(extra_extensions),
+                         vocab=vocab)
         self.city_bridge = city_bridge.install_from_env(self.life, chat=chat, selves=selves, env=eff_env)
         if self.city_bridge is not None:
             self.life.extensions.append(self.city_bridge)
         self.proj = Projector(self.life, world_db)
         self.world_db = world_db
         self.promises = None
-        if promises.enabled():
-            import intents
-            intents.init()
-            self.promises = promises.Promises(self.life, world_db, self.proj, intents)
+        if promises.enabled(eff_env):
+            if intents_mod is None:
+                try:
+                    import intents as intents_mod
+                except ImportError:
+                    from worldkernel.intents_lite import IntentsLite
+                    intents_mod = IntentsLite(world_db, vocab=getattr(self.life, "V", vocab))
+            intents_mod.init()
+            self.promises = promises.Promises(self.life, world_db, self.proj, intents_mod, env=eff_env)
             self.life.promise_source = self.promises
             self.life.extensions.append(self.promises)
         last = self.store.meta("last_step")
@@ -81,8 +85,17 @@ class Authority:
             except Exception as e:
                 log(f"city_bridge recover deferred: {type(e).__name__}: {e}")
         if day_note is None:
-            day_note = daynote.enabled(os.environ)
+            day_note = daynote.enabled(eff_env)
         self.note = daynote.DayNote(self.life, world_db, chat, log=log) if day_note and chat else None
+
+    def close(self):
+        """Release the scheduler lease if still held and close the kernel Store."""
+        try:
+            if self.store.epoch is not None:
+                self.store.release()
+        except Exception:
+            pass
+        self.store.close()
 
     def step(self):
         # owner input first; a failing queue (a locked world.db, a bad row) never stops her day

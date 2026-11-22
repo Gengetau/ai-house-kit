@@ -1,0 +1,322 @@
+{
+ "key": "living",
+ "size": [
+  340,
+  276
+ ],
+ "objects": [
+  {
+   "id": "bookshelf",
+   "label": "客厅书架：大家的漫画和游戏攻略",
+   "x": 160,
+   "y": 57,
+   "w": 37,
+   "h": 70,
+   "ax": 0,
+   "ay": 0,
+   "depth": 24.5
+  },
+  {
+   "id": "sofa",
+   "label": "米白色大沙发，大家都爱窝在这儿",
+   "x": 185,
+   "y": 105,
+   "w": 86,
+   "h": 64,
+   "ax": 38,
+   "ay": 0,
+   "depth": 86.0
+  },
+  {
+   "id": "piano",
+   "label": "立式钢琴",
+   "x": 263,
+   "y": 136,
+   "w": 52,
+   "h": 51,
+   "ax": 125,
+   "ay": 0,
+   "depth": 143.0
+  },
+  {
+   "id": "tv",
+   "label": "电视和游戏机",
+   "x": 65,
+   "y": 102,
+   "w": 52,
+   "h": 56,
+   "ax": 178,
+   "ay": 0,
+   "depth": 81.0
+  },
+  {
+   "id": "plant",
+   "label": "大叶植物",
+   "x": 43,
+   "y": 131,
+   "w": 22,
+   "h": 40,
+   "ax": 231,
+   "ay": 0,
+   "depth": 124.0
+  },
+  {
+   "id": "lamp",
+   "label": "落地灯",
+   "x": 181,
+   "y": 83,
+   "w": 18,
+   "h": 48,
+   "ax": 254,
+   "ay": 0,
+   "depth": 38.0
+  },
+  {
+   "id": "table",
+   "label": "茶几，上面有两只马克杯",
+   "x": 157,
+   "y": 142,
+   "w": 58,
+   "h": 38,
+   "ax": 273,
+   "ay": 0,
+   "depth": 124.0
+  },
+  {
+   "id": "armchair",
+   "label": "单人扶手椅",
+   "x": 65,
+   "y": 141,
+   "w": 42,
+   "h": 42,
+   "ax": 332,
+   "ay": 0,
+   "depth": 136.0
+  },
+  {
+   "id": "game_box",
+   "label": "桌游收纳箱",
+   "x": 241,
+   "y": 169,
+   "w": 34,
+   "h": 34,
+   "ax": 375,
+   "ay": 0,
+   "depth": 183.0
+  },
+  {
+   "id": "side",
+   "label": "小边几，放着遥控器和纸巾",
+   "x": 77,
+   "y": 171,
+   "w": 22,
+   "h": 21,
+   "ax": 410,
+   "ay": 0,
+   "depth": 172.0
+  },
+  {
+   "id": "cush1",
+   "label": "坐垫",
+   "x": 155,
+   "y": 186,
+   "w": 22,
+   "h": 15,
+   "ax": 433,
+   "ay": 0,
+   "depth": 182.0
+  },
+  {
+   "id": "cush2",
+   "label": "坐垫",
+   "x": 187,
+   "y": 186,
+   "w": 22,
+   "h": 15,
+   "ax": 456,
+   "ay": 0,
+   "depth": 182.0
+  },
+  {
+   "id": "mags",
+   "label": "一摞杂志和游戏攻略",
+   "x": 218,
+   "y": 186,
+   "w": 18,
+   "h": 16,
+   "ax": 479,
+   "ay": 0,
+   "depth": 189.0
+  },
+  {
+   "id": "trash",
+   "label": "垃圾桶",
+   "x": 179,
+   "y": 231,
+   "w": 14,
+   "h": 16,
+   "ax": 498,
+   "ay": 0,
+   "depth": 278.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "sofa0",
+   "x": 203,
+   "y": 130,
+   "depth": 86.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "idle",
+    "phone",
+    "drama",
+    "movie_night",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "sofa1",
+   "x": 219,
+   "y": 138,
+   "depth": 86.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "idle",
+    "phone",
+    "drama",
+    "movie_night",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "sofa2",
+   "x": 235,
+   "y": 146,
+   "depth": 86.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "idle",
+    "phone",
+    "drama",
+    "movie_night",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "sofa3",
+   "x": 249,
+   "y": 152,
+   "depth": 86.5,
+   "pose": "sit",
+   "activities": [
+    "resting",
+    "idle",
+    "phone",
+    "drama",
+    "movie_night",
+    "tea_time",
+    "socializing"
+   ]
+  },
+  {
+   "id": "armchair",
+   "x": 88,
+   "y": 163,
+   "depth": 136.5,
+   "pose": "sit",
+   "activities": [
+    "reading",
+    "tea_time",
+    "resting",
+    "movie_night"
+   ]
+  },
+  {
+   "id": "game0",
+   "x": 120,
+   "y": 155,
+   "depth": 102.5,
+   "pose": "sit",
+   "activities": [
+    "gaming",
+    "movie_night",
+    "board_game"
+   ]
+  },
+  {
+   "id": "game1",
+   "x": 104,
+   "y": 163,
+   "depth": 118.5,
+   "pose": "sit",
+   "activities": [
+    "gaming",
+    "board_game"
+   ]
+  },
+  {
+   "id": "rug0",
+   "x": 166,
+   "y": 176,
+   "depth": 144.5,
+   "pose": "sit",
+   "activities": [
+    "board_game",
+    "movie_night",
+    "tea_time"
+   ]
+  },
+  {
+   "id": "rug1",
+   "x": 204,
+   "y": 181,
+   "depth": 154.5,
+   "pose": "sit",
+   "activities": [
+    "board_game",
+    "tea_time"
+   ]
+  },
+  {
+   "id": "piano",
+   "x": 272,
+   "y": 183,
+   "depth": 158.5,
+   "pose": "stand",
+   "activities": [
+    "music"
+   ]
+  },
+  {
+   "id": "stand0",
+   "x": 186,
+   "y": 208,
+   "depth": 208.5,
+   "pose": "stand",
+   "activities": [
+    "chores_clean",
+    "idle",
+    "walking"
+   ]
+  },
+  {
+   "id": "stand1",
+   "x": 120,
+   "y": 195,
+   "depth": 182.5,
+   "pose": "stand",
+   "activities": [
+    "chores_clean",
+    "idle",
+    "browsing"
+   ]
+  }
+ ]
+}

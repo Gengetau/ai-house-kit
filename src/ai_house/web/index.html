@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>AI 小屋 · AI House Studio</title>
+<link rel="stylesheet" href="/web/css/app.css">
+<script>
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"":"&quot;", "'": "&#39;"}[c]));
+window.__aiHouseEsc = esc;
+</script>
+<script type="module" src="/web/js/main.js"></script>
+</head>
+<body>
+<div id="login" class="hidden"></div>
+<div id="app" class="shell hidden">
+  <aside id="side" class="side" aria-label="小屋导航"></aside>
+  <div id="shade" class="shade" aria-hidden="true"></div>
+  <header id="mtop" class="mtop"></header>
+  <main id="main" class="main">
+    <div id="view" tabindex="-1"></div>
+  </main>
+  <nav id="tabbar" class="tabbar" aria-label="小屋导航（手机）"></nav>
+  <div id="sheet" class="sheet hidden"></div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<dialog id="modal"></dialog>
+</body>
+</html>

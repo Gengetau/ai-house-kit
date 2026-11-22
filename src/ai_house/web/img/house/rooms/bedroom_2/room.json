@@ -1,0 +1,188 @@
+{
+ "key": "bedroom_2",
+ "size": [
+  324,
+  268
+ ],
+ "objects": [
+  {
+   "id": "bed",
+   "label": "软蓬蓬的靠枕和暖毯大床",
+   "x": 79,
+   "y": 96,
+   "w": 97,
+   "h": 69,
+   "ax": 0,
+   "ay": 0,
+   "depth": 71.0
+  },
+  {
+   "id": "nightstand",
+   "label": "床头柜和台灯",
+   "x": 119,
+   "y": 91,
+   "w": 24,
+   "h": 35,
+   "ax": 98,
+   "ay": 0,
+   "depth": 30.0
+  },
+  {
+   "id": "slippers",
+   "label": "拖鞋",
+   "x": 137,
+   "y": 159,
+   "w": 15,
+   "h": 10,
+   "ax": 123,
+   "ay": 0,
+   "depth": 121.5
+  },
+  {
+   "id": "crystal",
+   "label": "水晶摆件（微弱发光）",
+   "x": 181,
+   "y": 198,
+   "w": 16,
+   "h": 24,
+   "ax": 139,
+   "ay": 0,
+   "depth": 250.0
+  },
+  {
+   "id": "case1",
+   "label": "收藏柜：宝石和银器",
+   "x": 191,
+   "y": 91,
+   "w": 38,
+   "h": 60,
+   "ax": 156,
+   "ay": 0,
+   "depth": 74.0
+  },
+  {
+   "id": "case2",
+   "label": "收藏柜：古书和鳞片",
+   "x": 219,
+   "y": 105,
+   "w": 38,
+   "h": 60,
+   "ax": 195,
+   "ay": 0,
+   "depth": 102.0
+  },
+  {
+   "id": "chest",
+   "label": "宝箱（别碰）",
+   "x": 253,
+   "y": 151,
+   "w": 34,
+   "h": 34,
+   "ax": 234,
+   "ay": 0,
+   "depth": 144.0
+  },
+  {
+   "id": "chest2",
+   "label": "又一个宝箱",
+   "x": 21,
+   "y": 139,
+   "w": 34,
+   "h": 34,
+   "ax": 269,
+   "ay": 0,
+   "depth": 120.0
+  },
+  {
+   "id": "coins",
+   "label": "金币堆",
+   "x": 230,
+   "y": 176,
+   "w": 17,
+   "h": 20,
+   "ax": 304,
+   "ay": 0,
+   "depth": 160.0
+  },
+  {
+   "id": "cush1",
+   "label": "银色靠垫",
+   "x": 179,
+   "y": 182,
+   "w": 22,
+   "h": 15,
+   "ax": 322,
+   "ay": 0,
+   "depth": 174.0
+  },
+  {
+   "id": "cush2",
+   "label": "紫色靠垫",
+   "x": 111,
+   "y": 178,
+   "w": 22,
+   "h": 15,
+   "ax": 345,
+   "ay": 0,
+   "depth": 166.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "bed",
+   "x": 106,
+   "y": 120,
+   "depth": 71.5,
+   "pose": "sleep",
+   "activities": [
+    "sleeping",
+    "resting"
+   ]
+  },
+  {
+   "id": "case",
+   "x": 202,
+   "y": 154,
+   "depth": 100.5,
+   "pose": "stand",
+   "activities": [
+    "idle",
+    "chores_clean"
+   ]
+  },
+  {
+   "id": "rug",
+   "x": 160,
+   "y": 183,
+   "depth": 158.5,
+   "pose": "sit",
+   "activities": [
+    "reading",
+    "phone",
+    "idle",
+    "resting"
+   ]
+  },
+  {
+   "id": "chest",
+   "x": 250,
+   "y": 182,
+   "depth": 156.5,
+   "pose": "stand",
+   "activities": [
+    "idle"
+   ]
+  },
+  {
+   "id": "stand",
+   "x": 76,
+   "y": 179,
+   "depth": 150.5,
+   "pose": "stand",
+   "activities": [
+    "working",
+    "idle"
+   ]
+  }
+ ]
+}

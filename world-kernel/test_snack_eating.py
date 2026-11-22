@@ -37,6 +37,7 @@ class Snack163(unittest.TestCase):
 
     def tearDown(self):
         self.s.release()
+        self.s.close()
         self.tmp.cleanup()
 
     def walk(self, a, to):

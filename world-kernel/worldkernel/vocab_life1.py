@@ -4,17 +4,22 @@ import sys
 from . import vocab as _p1a  # noqa: F401  (puts world-catalog on sys.path)
 from .vocab import edible
 
-from worldcatalog.kernel_vocab_life1 import (ACTIONS, ACTIVITIES, BASE_DRIFT, BEDROOM, BODY_KEYS, BODY_RANGE,  # noqa
-                                             CATALOG, CLOTHING, GARMENT_ASSETS, HOUSE, INGREDIENTS, INSTANT,
-                                             LOCATIONS, MAIN_FOODS, MENU, MONEY, PEOPLE, PLACE, PLACES, RECIPES,
-                                             RENDER, ROUTES, SNACKS, VOCAB_VERSION, activity_allowed_at, bed, guard,
-                                             label, next_hop, owner_of, place_id, public_location, route_seconds,
-                                             snack_ok, validate, validate_garment_assets)
+from worldcatalog.kernel_vocab_life1 import (
+    ACTIONS, ACTIVITIES, BASE_DRIFT, BEDROOM, BODY_KEYS, BODY_RANGE,
+    CATALOG, CLOTHING, COOK_ORDER, GARMENT_ASSETS, HOUSE, INGREDIENTS, INSTANT,
+    LOCATIONS, MAIN_FOODS, MANIFEST, MENU, MONEY, NAMES, NIGHT_OWLS, PEOPLE, PLACE, PLACES, RECIPES,
+    RENDER, ROSTER, ROUTES, SELVES, SNACKS, VOCAB_VERSION, activity_allowed_at, bed, guard,
+    label, load_pack, next_hop, owner_of, place_id, public_location, route_seconds,
+    snack_ok, validate, validate_garment_assets,
+)
 
 EDIBLE = edible(sys.modules[__name__])
 
-__all__ = ["ACTIONS", "ACTIVITIES", "BASE_DRIFT", "BEDROOM", "BODY_KEYS", "BODY_RANGE", "CATALOG", "CLOTHING", "EDIBLE",
-           "GARMENT_ASSETS", "HOUSE", "INGREDIENTS", "INSTANT", "LOCATIONS", "MAIN_FOODS", "MENU", "MONEY", "PEOPLE",
-           "PLACE", "PLACES", "RECIPES", "RENDER", "ROUTES", "SNACKS", "VOCAB_VERSION", "activity_allowed_at", "bed",
-           "edible", "guard", "label", "next_hop", "owner_of", "place_id", "public_location", "route_seconds",
-           "snack_ok", "validate", "validate_garment_assets"]
+__all__ = [
+    "ACTIONS", "ACTIVITIES", "BASE_DRIFT", "BEDROOM", "BODY_KEYS", "BODY_RANGE", "CATALOG", "CLOTHING",
+    "COOK_ORDER", "EDIBLE", "GARMENT_ASSETS", "HOUSE", "INGREDIENTS", "INSTANT", "LOCATIONS", "MAIN_FOODS",
+    "MANIFEST", "MENU", "MONEY", "NAMES", "NIGHT_OWLS", "PEOPLE", "PLACE", "PLACES", "RECIPES", "RENDER",
+    "ROSTER", "ROUTES", "SELVES", "SNACKS", "VOCAB_VERSION", "activity_allowed_at", "bed", "edible", "guard",
+    "label", "load_pack", "next_hop", "owner_of", "place_id", "public_location", "route_seconds", "snack_ok",
+    "validate", "validate_garment_assets",
+]

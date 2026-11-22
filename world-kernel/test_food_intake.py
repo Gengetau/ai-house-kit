@@ -1,4 +1,5 @@
 """authenticated explicit deliveries, bounded full lists and exact counts."""
+import contextlib
 import json
 import os
 import tempfile
@@ -21,6 +22,7 @@ class Intake(unittest.TestCase):
 
     def tearDown(self):
         self.s.release()
+        self.s.close()
         self.tmp.cleanup()
 
     def give(self, text, mid='1', principal='cmd:owner'):
@@ -94,9 +96,10 @@ class Intake(unittest.TestCase):
         inventory.process_food_queue(self.l.k, path)
         self.assertEqual(sum(r['qty'] for r in self.resources()), 9)
         import sqlite3
-        with sqlite3.connect(path) as c:
-            self.assertEqual(json.loads(c.execute('SELECT receipt FROM food_input_queue').fetchone()[0])['qty'], 9)
-            c.execute("UPDATE food_input_queue SET state='queued'")  # kernel committed, queue ack was lost
+        with contextlib.closing(sqlite3.connect(path)) as c:
+            with c:
+                self.assertEqual(json.loads(c.execute('SELECT receipt FROM food_input_queue').fetchone()[0])['qty'], 9)
+                c.execute("UPDATE food_input_queue SET state='queued'")  # kernel committed, queue ack was lost
         inventory.process_food_queue(self.l.k, path)
         self.assertEqual(sum(r['qty'] for r in self.resources()), 9)
 

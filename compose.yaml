@@ -1,0 +1,71 @@
+# 默认只在本机可访问：端口只发布到 127.0.0.1。
+# 容器里的服务监听 0.0.0.0（否则宿主连不进来），所以必须设置 AI_HOUSE_OWNER_TOKEN，不设就拒绝启动。
+# 生成令牌：python3 -c "import secrets; print(secrets.token_urlsafe(24))"，写进 .env。
+services:
+  ai-house:
+    build: .
+    ports:
+      - "127.0.0.1:${AI_HOUSE_PORT:-8780}:8780"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # 访问控制
+      AI_HOUSE_OWNER_TOKEN: ${AI_HOUSE_OWNER_TOKEN:-}
+      AI_HOUSE_READ_TOKEN: ${AI_HOUSE_READ_TOKEN:-}
+      AI_HOUSE_WRITE_TOKEN: ${AI_HOUSE_WRITE_TOKEN:-}
+      AI_HOUSE_PRIVATE_TOKEN: ${AI_HOUSE_PRIVATE_TOKEN:-}
+      # 模型配置
+      AI_HOUSE_API_KEY: ${AI_HOUSE_API_KEY:-}
+      AI_HOUSE_BASE_URL: ${AI_HOUSE_BASE_URL:-https://api.openai.com}
+      AI_HOUSE_MODEL: ${AI_HOUSE_MODEL:-gpt-4o-mini}
+      AI_HOUSE_FALLBACK_API_KEY: ${AI_HOUSE_FALLBACK_API_KEY:-}
+      AI_HOUSE_FALLBACK_BASE_URL: ${AI_HOUSE_FALLBACK_BASE_URL:-}
+      AI_HOUSE_FALLBACK_MODEL: ${AI_HOUSE_FALLBACK_MODEL:-}
+      AI_HOUSE_PACK_DIR: ${AI_HOUSE_PACK_DIR:-}
+      # 本地双容器（--profile city）：这几个开关 README 里写了，这里真的转进容器
+      WORLD_KERNEL_CITY_BRIDGE: ${WORLD_KERNEL_CITY_BRIDGE:-0}
+      WORLD_KERNEL_CITY_ACTORS: ${WORLD_KERNEL_CITY_ACTORS:-}
+      WORLD_KERNEL_CITY_PLANS: ${WORLD_KERNEL_CITY_PLANS:-0}
+      CITY_PROFILE: ${CITY_PROFILE:-qingkong}
+      CITY_BRIDGE_KEY: ${CITY_BRIDGE_KEY:-}
+      CITY_BRIDGE_URL: ${CITY_BRIDGE_URL:-http://qingkong-city:7700/city/bridge/v1}
+      # 公共城市远足（每个室友一把令牌，名称见 docs/PLUGINS-AND-CITY.md）
+      CITY_FEDERATION_MCP_URL: ${CITY_FEDERATION_MCP_URL:-}
+      CITY_FEDERATION_HOUSE_TAG: ${CITY_FEDERATION_HOUSE_TAG:-}
+      CITY_FEDERATION_ACTORS: ${CITY_FEDERATION_ACTORS:-}
+      CITY_FEDERATION_TOKEN: ${CITY_FEDERATION_TOKEN:-}
+    volumes:
+      # 命名卷默认继承镜像内 house(1000) 权限，避免宿主机 UID≠1000 导致 SQLite 无法建库
+      - house-data:/app/runtime
+      - ./packs:/app/packs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [frontend, citynet]
+    restart: on-failure:5
+
+  # 可选：docker compose --profile city up -d  拉起本地「晴空都」城市引擎。
+  # 镜像在构建时固定到 bot-game-mcp main@971484c13004e14ee6e91e9a9a75c0bd5ec65020；运行时只挂内部网络（无外网、不发布端口），
+  # 只有同一个 compose 里的小屋能通过 http://qingkong-city:7700 访问它。
+  qingkong-city:
+    profiles: ["city"]
+    build:
+      context: ./deploy/city-engine
+      args:
+        BOT_GAME_MCP_REF: 971484c13004e14ee6e91e9a9a75c0bd5ec65020
+    environment:
+      BOTGAME_CITY_BRIDGE_KEY: ${CITY_BRIDGE_KEY:-}
+      BOTGAME_HOUSE_ROSTER_JSON: ${BOTGAME_HOUSE_ROSTER_JSON:-}
+    volumes:
+      - city-data:/data
+    networks: [citynet]
+    restart: unless-stopped
+
+networks:
+  frontend: {}
+  citynet:
+    internal: true
+
+volumes:
+  house-data: {}
+  city-data: {}

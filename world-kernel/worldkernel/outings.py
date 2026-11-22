@@ -227,6 +227,10 @@ class Outings:
         if action=='move' and (outside or outbound):
             if self.k.city_visits.is_door_move(actor['actor_id'], here, args):
                 return []
+            for ext in getattr(self.l, 'extensions', ()):
+                is_door = getattr(ext, 'is_door_move', None)
+                if is_door and is_door(actor['actor_id'], here, args):
+                    return []
             j=self.job(actor['actor_id'])
             if not j or j['state'] not in ('running','returning'):
                 return ['outing_plan_required']

@@ -6,3 +6,11 @@ __pycache__/
 traces/
 verdict.json
 .venv/
+.env
+.env.*
+!.env.example
+build/
+dist/
+*.egg-info/
+runtime/
+runtime-*/

@@ -18,7 +18,7 @@ import time
 from . import vocab_life1 as V
 from . import city_projection
 
-NAMES = {"nell": "奈尔", "elsa": "艾莎", "alma": "阿尔玛", "mina": "米娜", "yuki": "由纪", "wanda": "婉妲"}
+NAMES = dict(V.NAMES)
 PLACE_LEGACY = {"supermarket": "shop", "konbini": "shop", "shotengai": "street", "cafe": "cafe", "riverside": "river",
                 "park": "river", "bakery": "shop", "bookshop": "shop"}
 ACT_LEGACY = {"reading": "reading", "working": "working", "gaming": "gaming", "phone": "phone", "drawing": "hobby",
@@ -55,26 +55,29 @@ create table if not exists emotions(id integer primary key, actor text not null,
 """
 
 
-def offline_world(path):
+def offline_world(path, roster=None):
     """A legacy-shaped world.db with the six in bed (offline runs only; the live one belongs to world.py)."""
     c = sqlite3.connect(path)
     c.executescript(LEGACY_SCHEMA)
     for s in BIND_SCHEMA:
         c.execute(s)
     c.execute("insert or ignore into kernel_bind values('mode', 'offline')")  # synthetic worlds may write here
-    for a in V.PEOPLE:
+    for a in (roster or V.PEOPLE):
         c.execute("insert or ignore into reality values(?, 'room', '卧室', 'sleeping', '睡觉', '平静', 60, 30, 70,"
                   " 'sleeping', 0, 0, 'routine', null, 0, 0, 0, 0, '{}')", (a,))
     c.commit()
     c.close()
 
 
-def _who(ids):
-    return "、".join(NAMES.get(i, i) for i in ids)
+def _who(ids, names=None):
+    nm = names or NAMES
+    return "、".join(nm.get(i, i) for i in ids)
 
 
 class Projector:
     def __init__(self, life, world_db):
+        self.names = dict(getattr(life, 'names', NAMES))
+        self.V = getattr(life, 'V', V)
         self.life, self.k, self.path = life, life.k, world_db
         s = self.k.s
         self.world = f"{s.world_id}#{s.meta('stream_epoch', '1')}"
@@ -129,7 +132,7 @@ class Projector:
                             " AS loc FROM actions a WHERE a.action_type='begin_activity' AND a.action_id!=?"
                             " AND json_extract(a.args,'$.party')=? AND json_extract(a.args,'$.activity')=?"
                             " AND a.started_at IS NOT NULL", (action_id, party, activity)):
-            if r["actor_id"] == actor or r["actor_id"] not in members or r["actor_id"] not in V.PEOPLE or not me \
+            if r["actor_id"] == actor or r["actor_id"] not in members or r["actor_id"] not in self.V.PEOPLE or not me \
                     or r["loc"] != me[0]:
                 continue
             their_end = r["finished_at"] if r["finished_at"] is not None else self.life.clock.now()
@@ -146,7 +149,7 @@ class Projector:
             return None
         steps = job.get("steps") or []
         idx = int(job.get("index", 0))
-        dest = V.label(job["place"])
+        dest = self.V.label(job["place"])
         if idx >= len(steps):
             return ("away", "路上", "outing", f"从{dest}回家的路上") if loc == "away" else None
         step = steps[idx]
@@ -161,8 +164,8 @@ class Projector:
                         and (s.get("args") or {}).get("to") in ("away", "living")), None)
         if job["state"] == "running" and arr_idx is not None and idx <= arr_idx:
             plan = self.life.plans.plan(job.get("plan_id")) or {}
-            others = [m for m in (plan.get("members") or []) if m != a and m in V.PEOPLE]
-            doing = f"去{dest}的路上" + (f"（和{_who(others)}约好一起）" if others else "")
+            others = [m for m in (plan.get("members") or []) if m != a and m in self.V.PEOPLE]
+            doing = f"去{dest}的路上" + (f"（和{_who(others, self.names)}约好一起）" if others else "")
             return ("away", "路上", "outing", doing)
         if job["state"] == "returning" or (dep_idx is not None and idx >= dep_idx):
             return ("away", "路上", "outing", f"从{dest}回家的路上")
@@ -171,14 +174,14 @@ class Projector:
     def now_row(self, a):
         me = self.k.actor(a)
         loc = me["location"]
-        if loc.startswith(V.PLACE):
-            legacy, place = PLACE_LEGACY.get(V.place_id(loc), "away"), V.label(loc)
-        elif loc.startswith(V.BEDROOM):
+        if loc.startswith(self.V.PLACE):
+            legacy, place = PLACE_LEGACY.get(self.V.place_id(loc), "away"), self.V.label(loc)
+        elif loc.startswith(self.V.BEDROOM):
             legacy, place = "room", "自己的卧室"
         elif loc == "away":
             legacy, place = "street", "家门外"
         else:
-            legacy, place = loc, V.label(loc)
+            legacy, place = loc, self.V.label(loc)
         now = self.life.clock.now()
         act, doing, started, until = "idle", "发呆", now, now + 1800
         if me["action_id"]:
@@ -189,9 +192,9 @@ class Projector:
             started, until = x["started_at"] or started, x["due_at"] or until
             t = x["action_type"]
             if t == "cook":
-                act, doing = "cooking", f"在厨房做{V.RECIPES[args['recipe']]['label']}"
+                act, doing = "cooking", f"在厨房做{self.V.RECIPES[args['recipe']]['label']}"
             elif t == "eat":
-                act, doing = "eating", f"吃{V.CATALOG['items'].get(args['item'], {}).get('label', args['item'])}"
+                act, doing = "eating", f"吃{self.V.CATALOG['items'].get(args['item'], {}).get('label', args['item'])}"
             elif t == "sleep":
                 act, doing = "sleeping", "睡觉"
             elif t == "rest":
@@ -200,14 +203,14 @@ class Projector:
                 act, doing = "idle", "等着"
             elif t == "move":
                 to = args.get("to", "")
-                act = "outing" if to.startswith(V.PLACE) or loc.startswith(V.PLACE) else "idle"
-                doing = f"去{V.label(to)}的路上"
-                if to.startswith(V.PLACE):
+                act = "outing" if to.startswith(self.V.PLACE) or loc.startswith(self.V.PLACE) else "idle"
+                doing = f"去{self.V.label(to)}的路上"
+                if to.startswith(self.V.PLACE):
                     legacy, place = "away", "路上"
             elif t == "begin_activity":
                 name = args.get("activity")
                 act = ACT_LEGACY.get(name, "hobby")
-                doing = V.ACTIVITIES.get(name, {}).get("label", name)
+                doing = self.V.ACTIVITIES.get(name, {}).get("label", name)
                 if args.get("party"):
                     # only who is actually doing it with her right now, here
                     with self.k.s.read() as c:
@@ -217,10 +220,10 @@ class Projector:
                             "SELECT x.actor_id FROM actions x JOIN actors b ON b.action_id=x.action_id"
                             " WHERE x.state='running' AND x.action_type='begin_activity' AND x.actor_id!=?"
                             " AND json_extract(x.args,'$.party')=? AND json_extract(x.args,'$.activity')=?"
-                            " AND b.location=?", (a, args["party"], name, me["location"]))} & set(V.PEOPLE) & members)
+                            " AND b.location=?", (a, args["party"], name, me["location"]))} & set(self.V.PEOPLE) & members)
                     if others and a in members:
-                        doing = f"和{_who(others)}一起{_bare(doing)}"
-                elif loc.startswith(V.PLACE):
+                        doing = f"和{_who(others, self.names)}一起{_bare(doing)}"
+                elif loc.startswith(self.V.PLACE):
                     job = self.life.get(f"outing:active:{a}") or {}
                     plan = self.life.plans.plan(job.get("plan_id")) if job.get("plan_id") else None
                     members = set((plan or {}).get("members") or [])
@@ -230,9 +233,9 @@ class Projector:
                                 "SELECT b.actor_id FROM actors b"
                                 " LEFT JOIN actions x ON x.action_id=b.action_id AND x.state='running'"
                                 " WHERE b.location=? AND b.actor_id!=? AND b.activity!='sleeping'"
-                                " AND COALESCE(x.action_type,'')!='move'", (loc, a))} & set(V.PEOPLE) & members)
+                                " AND COALESCE(x.action_type,'')!='move'", (loc, a))} & set(self.V.PEOPLE) & members)
                         if others:
-                            doing = f"和{_who(others)}一起{_bare(doing)}"
+                            doing = f"和{_who(others, self.names)}一起{_bare(doing)}"
         phase = self._outing_phase(a, loc, legacy, place, me["action_id"])
         if phase:
             legacy, place, act, doing = phase
@@ -254,7 +257,7 @@ class Projector:
         now = self.life.clock.now()
         c = self._conn()
         try:
-            for a in V.PEOPLE:
+            for a in self.V.PEOPLE:
                 r = self.now_row(a)
                 c.execute("update reality set location=?, place=?, activity=?, doing=?, availability=?, started=?,"
                           " until=?, energy=?, hunger=?, sleepiness=?, source='kernel', updated=? where actor=?",
@@ -280,17 +283,17 @@ class Projector:
             ate = {}
             for r in db.execute("SELECT item, slot FROM meal_consumption WHERE actor=? AND day=? AND slot IS NOT NULL",
                                 (a, day)):
-                ate[r["slot"]] = V.CATALOG["items"].get(r["item"], {}).get("label", r["item"])
-            if me["location"].startswith(V.PLACE):
+                ate[r["slot"]] = self.V.CATALOG["items"].get(r["item"], {}).get("label", r["item"])
+            if me["location"].startswith(self.V.PLACE):
                 own_act = db.execute("SELECT action_type FROM actions WHERE action_id=? AND state='running'",
                                      (me["action_id"],)).fetchone() if me["action_id"] else None
                 if not (own_act and own_act[0] == "move"):
-                    near = [NAMES[r[0]] for r in db.execute(
+                    near = [self.names[r[0]] for r in db.execute(
                         "SELECT b.actor_id FROM actors b"
                         " LEFT JOIN actions x ON x.action_id=b.action_id AND x.state='running'"
                         " WHERE b.location=? AND b.actor_id!=? AND b.activity!='sleeping'"
                         " AND COALESCE(x.action_type,'')!='move' ORDER BY b.actor_id",
-                        (me["location"], a)) if r[0] in NAMES]
+                        (me["location"], a)) if r[0] in self.names]
             day_map = self._day_outings_map(db, day_start, now, live=True)
             outings_today = day_map.get(a, "")
             city_proj = city_projection.resolve_projection_conn(db, a)
@@ -335,12 +338,12 @@ class Projector:
                     continue
             elif p["start_at"] < now - 600:
                 continue
-            what = V.ACTIVITIES.get(p["what"], {}).get("label") or V.RECIPES.get(p["what"], {}).get("label") or p["what"]
+            what = self.V.ACTIVITIES.get(p["what"], {}).get("label") or self.V.RECIPES.get(p["what"], {}).get("label") or p["what"]
             loc_raw = str(p.get("location") or "")
-            if loc_raw.startswith(V.PLACE) or (":" in loc_raw and loc_raw.split(":", 1)[0] in city_projection.AREA_LABELS):
-                loc_label = V.label(loc_raw) if loc_raw.startswith(V.PLACE) else loc_raw
+            if loc_raw.startswith(self.V.PLACE) or (":" in loc_raw and loc_raw.split(":", 1)[0] in city_projection.AREA_LABELS):
+                loc_label = self.V.label(loc_raw) if loc_raw.startswith(self.V.PLACE) else loc_raw
                 if loc_label == loc_raw:
-                    pid = (V.place_id(loc_raw) if loc_raw.startswith(V.PLACE) else loc_raw) or ""
+                    pid = (self.V.place_id(loc_raw) if loc_raw.startswith(self.V.PLACE) else loc_raw) or ""
                     loc_label = city_projection.AREA_LABELS.get(pid.split(":", 1)[0], loc_label)
                 what = f"去{loc_label}{_bare(what)}"
             who = [m for m in p["members"] if m != a]
@@ -359,8 +362,8 @@ class Projector:
         max_eid = db.execute("SELECT COALESCE(MAX(event_id), 0) FROM events").fetchone()[0]
         actor_rows = {r["actor_id"]: r for r in db.execute(
             "SELECT b.actor_id, b.location, b.activity, x.action_type, x.args, x.started_at FROM actors b"
-            " LEFT JOIN actions x ON x.action_id=b.action_id AND x.state='running'") if r["actor_id"] in NAMES}
-        outside_open = any((r["location"] or "").startswith(V.PLACE) or r["location"] == "away"
+            " LEFT JOIN actions x ON x.action_id=b.action_id AND x.state='running'") if r["actor_id"] in self.names}
+        outside_open = any((r["location"] or "").startswith(self.V.PLACE) or r["location"] == "away"
                            for r in actor_rows.values()) if live else False
         sig = (max_eid, day_start, live, int(end // 60) if outside_open else -1,
                tuple((k, actor_rows[k]["location"], actor_rows[k]["action_type"]) for k in sorted(actor_rows)) if live else ())
@@ -372,8 +375,8 @@ class Projector:
             " WHERE occurred_at>=? AND occurred_at<=? AND kind IN ('arrived','departed','purchased','action_started')"
             " ORDER BY occurred_at, event_id",
             (day_start - 3 * 86400, end)).fetchall()
-        stay = {p: [] for p in NAMES}
-        arrs_by, deps_by, homes_by, purch_by, act_loc = {p: [] for p in NAMES}, {p: [] for p in NAMES}, {p: [] for p in NAMES}, {p: [] for p in NAMES}, {}
+        stay = {p: [] for p in self.names}
+        arrs_by, deps_by, homes_by, purch_by, act_loc = {p: [] for p in self.names}, {p: [] for p in self.names}, {p: [] for p in self.names}, {p: [] for p in self.names}, {}
         for ev in evs:
             aid = ev["actor_id"]
             knd, loc, ts = ev["kind"], ev["location"] or "", ev["occurred_at"]
@@ -381,17 +384,17 @@ class Projector:
                 stay[aid].append((ts, loc))
             if knd == "action_started" and ev["action_id"]:
                 act_loc[ev["action_id"]] = loc
-            if aid not in NAMES or ts < day_start - 86400:
+            if aid not in self.names or ts < day_start - 86400:
                 continue
-            if knd == "arrived" and loc.startswith(V.PLACE):
+            if knd == "arrived" and loc.startswith(self.V.PLACE):
                 arrs_by[aid].append(ev)
-            elif knd == "departed" and loc.startswith(V.PLACE):
+            elif knd == "departed" and loc.startswith(self.V.PLACE):
                 deps_by[aid].append(ev)
-            elif knd == "arrived" and loc and loc != "away" and not loc.startswith(V.PLACE):
+            elif knd == "arrived" and loc and loc != "away" and not loc.startswith(self.V.PLACE):
                 homes_by[aid].append(ev)
-            elif knd == "purchased" and loc.startswith(V.PLACE):
+            elif knd == "purchased" and loc.startswith(self.V.PLACE):
                 purch_by[aid].append(ev)
-        acts_by = {p: [] for p in NAMES}
+        acts_by = {p: [] for p in self.names}
         if any(arrs_by.values()):
             for ac in db.execute(
                     "SELECT action_id, actor_id, args, COALESCE(started_at, finished_at) AS t FROM actions"
@@ -427,7 +430,7 @@ class Projector:
                 if arr_ts >= day_start + 86400:
                     continue
                 span_end = dep_ts if dep_ts is not None else end
-                mates = [m for m in daylog._with(stay, a, ploc, arr_ts, span_end) if m in NAMES]
+                mates = [m for m in daylog._with(stay, a, ploc, arr_ts, span_end) if m in self.names]
                 if dep_ts is None and live:
                     here_now = {oid for oid, r in actor_rows.items()
                                 if oid != a and r["location"] == ploc and r["activity"] != "sleeping"
@@ -447,10 +450,10 @@ class Projector:
                 for ac in acts_a:
                     if act_loc.get(ac["action_id"]) == ploc and arr_ts - 1 <= ac["t"] <= span_end + 1:
                         act_name = json.loads(ac["args"] or "{}").get("activity")
-                        lbl = daylog.SAY.get(act_name) or _bare(V.ACTIVITIES.get(act_name, {}).get("label") or str(act_name or ""))
+                        lbl = daylog.SAY.get(act_name) or _bare(self.V.ACTIVITIES.get(act_name, {}).get("label") or str(act_name or ""))
                         if lbl and lbl not in acts:
                             acts.append(lbl)
-                who_s = f"和{_who(mates)}一起" if mates else ""
+                who_s = f"和{_who(mates, self.names)}一起" if mates else ""
                 if bought:
                     b_txt = "买了" + "、".join(bought[:3]) + (f"等{len(bought)}样" if len(bought) > 3 else "")
                     what_s = f"{who_s}{b_txt}"
@@ -459,8 +462,8 @@ class Projector:
                 elif menus:
                     what_s = f"{who_s}吃了{menus[0]}"
                 else:
-                    what_s = f"（和{_who(mates)}同在）" if mates else ""
-                pname = V.label(ploc)
+                    what_s = f"（和{_who(mates, self.names)}同在）" if mates else ""
+                pname = self.V.label(ploc)
                 if dep_ts is None:
                     sep = "，" if what_s and not what_s.startswith("（") else ""
                     parts.append(f"{_hhmm(arr_ts)} 到了{pname}{sep}{what_s}")
@@ -492,16 +495,16 @@ class Projector:
                 if e["kind"] == "invite_expired":  # nobody's act, so no actor; both of them get to know
                     self._expired(c, db, e, p)
                     continue
-                if actor not in V.PEOPLE:
+                if actor not in self.V.PEOPLE:
                     continue
                 args = json.loads(e["a_args"] or "{}")
-                knowers = [k for k in json.loads(e["knowers"] or "[]") if k in V.PEOPLE]
+                knowers = [k for k in json.loads(e["knowers"] or "[]") if k in self.V.PEOPLE]
                 line, feel = None, None
                 line_actors = [actor]
                 if e["kind"] == "action_succeeded" and e["a_type"] == "cook":
-                    line = f"{NAMES[actor]}做了{V.RECIPES[args['recipe']]['label']}"
-                elif e["kind"] == "action_succeeded" and e["a_type"] == "eat" and args.get("item") in V.MAIN_FOODS:
-                    dish = V.CATALOG["items"][args["item"]]["label"]
+                    line = f"{self.names[actor]}做了{self.V.RECIPES[args['recipe']]['label']}"
+                elif e["kind"] == "action_succeeded" and e["a_type"] == "eat" and args.get("item") in self.V.MAIN_FOODS:
+                    dish = self.V.CATALOG["items"][args["item"]]["label"]
                     rid = args.get("resource_id") or ""
                     _, _, act = rid.partition("@")
                     cook = db.execute("SELECT actor_id FROM actions WHERE action_id=?", (act,)).fetchone() if act else None
@@ -509,16 +512,16 @@ class Projector:
                         "SELECT x.actor_id FROM events x JOIN actions y ON y.action_id=x.action_id WHERE"
                         " x.kind='action_succeeded' AND y.action_type='eat' AND x.actor_id!=? AND x.location=? AND"
                         " ABS(x.occurred_at-?)<900 AND json_extract(y.args,'$.item') IN (%s)" %
-                        ",".join("?" * len(V.MAIN_FOODS)),
-                        (actor, e["location"], e["occurred_at"], *sorted(V.MAIN_FOODS)))} & set(V.PEOPLE))
-                    by = f"（{NAMES[cook[0]]}做的）" if cook and cook[0] != actor else ""
+                        ",".join("?" * len(self.V.MAIN_FOODS)),
+                        (actor, e["location"], e["occurred_at"], *sorted(self.V.MAIN_FOODS)))} & set(self.V.PEOPLE))
+                    by = f"（{self.names[cook[0]]}做的）" if cook and cook[0] != actor else ""
                     # one line per shared meal: whoever was already named in a line about it is not written again
                     told = c.execute("select 1 from script where source='kernel' and abs(ts-?)<900 and text like ?"
-                                     " and text like ?", (e["occurred_at"], f"%{NAMES[actor]}%", "%吃了%")).fetchone()
+                                     " and text like ?", (e["occurred_at"], f"%{self.names[actor]}%", "%吃了%")).fetchone()
                     if not (mates and told):
-                        line = f"{NAMES[actor]}{'和' + _who(mates) + '一起' if mates else ''}吃了{dish}{by}"
+                        line = f"{self.names[actor]}{'和' + _who(mates, self.names) + '一起' if mates else ''}吃了{dish}{by}"
                         line_actors = sorted({actor, *mates})
-                    if args["item"] in V.PEOPLE[actor]["taste"]["likes"]:
+                    if args["item"] in self.V.PEOPLE[actor]["taste"]["likes"]:
                         feel = ("happy", 1, f"吃到了喜欢的{dish}")
                     elif len(mates) >= 2:
                         feel = ("cozy", 1, "和大家一起吃饭")
@@ -530,11 +533,11 @@ class Projector:
                                    (e["action_id"],)).fetchone()
                     others = self._together(db, args["party"], args.get("activity"), e["action_id"], actor,
                                             a["started_at"] or e["occurred_at"], a["finished_at"] or e["occurred_at"])
-                    label = _bare(V.ACTIVITIES.get(args["activity"], {}).get("label", args["activity"]))
+                    label = _bare(self.V.ACTIVITIES.get(args["activity"], {}).get("label", args["activity"]))
                     if others:
                         # one line per gathering: whoever an earlier line already named is not written again
                         if self._once(c, f"party:{args['party']}:{actor}"):
-                            line = f"{NAMES[actor]}和{_who(others)}一起{label}"
+                            line = f"{self.names[actor]}和{_who(others, self.names)}一起{label}"
                             line_actors = sorted({actor, *others})
                             for o in others:
                                 self._once(c, f"party:{args['party']}:{o}")
@@ -542,21 +545,21 @@ class Projector:
                         knowers = [actor, *others]
                         feel = ("happy", 1, f"和{_who(others[:2])}一起{label}")
                     elif e["kind"] == "action_succeeded" and self._once(c, f"party:{args['party']}:{actor}"):
-                        line = f"{NAMES[actor]}{label}"
-                elif e["kind"] == "arrived" and str(e["location"]).startswith(V.PLACE):
-                    line = f"{NAMES[actor]}到了{V.label(e['location'])}"
+                        line = f"{self.names[actor]}{label}"
+                elif e["kind"] == "arrived" and str(e["location"]).startswith(self.V.PLACE):
+                    line = f"{self.names[actor]}到了{self.V.label(e['location'])}"
                 elif e["kind"] == "invite_answered":
                     inv = db.execute("SELECT inviter FROM invitations WHERE inv_id=?", (p.get("inv_id"),)).fetchone()
                     plan = life.plans.plan(p.get("plan_id")) or {}
-                    if plan.get("what") in V.RECIPES:
-                        what = f"一起吃她做的{V.RECIPES[plan['what']]['label']}"
+                    if plan.get("what") in self.V.RECIPES:
+                        what = f"一起吃她做的{self.V.RECIPES[plan['what']]['label']}"
                     else:
-                        what = "一起" + _bare(V.ACTIVITIES.get(plan.get("what"), {}).get("label") or "吃饭")
+                        what = "一起" + _bare(self.V.ACTIVITIES.get(plan.get("what"), {}).get("label") or "吃饭")
                     if inv:
                         ok = p.get("answer") == "yes"
-                        line = f"{NAMES[inv[0]]}约{NAMES[actor]}{what}，{'她答应了' if ok else '她没答应'}"
+                        line = f"{self.names[inv[0]]}约{self.names[actor]}{what}，{'她答应了' if ok else '她没答应'}"
                         if not ok and plan.get("kind") != "meal":
-                            self._feel(c, inv[0], e, ("sad", 1, f"约{NAMES[actor]}{what}没约成"))
+                            self._feel(c, inv[0], e, ("sad", 1, f"约{self.names[actor]}{what}没约成"))
                 if line and self._once(c, f"{e['event_id']}:line"):
                     c.execute("insert into script(ts, actors, scene, text, source, created, knowers) values (?,?,?,?,?,?,?)",
                               (e["occurred_at"], json.dumps(line_actors), None, line, "kernel", life.clock.now(),
@@ -568,14 +571,14 @@ class Projector:
     def _expired(self, c, db, e, p):
         """an invitation nobody answered in time. A plain fact for the two who know (no refusal, no feeling)."""
         inv = db.execute("SELECT inviter, invitee FROM invitations WHERE inv_id=?", (p.get("inv_id"),)).fetchone()
-        if not inv or inv[0] not in V.PEOPLE or inv[1] not in V.PEOPLE or not self._once(c, f"{e['event_id']}:line"):
+        if not inv or inv[0] not in self.V.PEOPLE or inv[1] not in self.V.PEOPLE or not self._once(c, f"{e['event_id']}:line"):
             return
         plan = self.life.plans.plan(p.get("plan_id")) or {}
-        if plan.get("what") in V.RECIPES:
-            what = f"一起吃她做的{V.RECIPES[plan['what']]['label']}"
+        if plan.get("what") in self.V.RECIPES:
+            what = f"一起吃她做的{self.V.RECIPES[plan['what']]['label']}"
         else:
-            what = "一起" + _bare(V.ACTIVITIES.get(plan.get("what"), {}).get("label") or "吃饭")
-        line = f"{NAMES[inv[0]]}约{NAMES[inv[1]]}{what}，到点还没等到回复"
+            what = "一起" + _bare(self.V.ACTIVITIES.get(plan.get("what"), {}).get("label") or "吃饭")
+        line = f"{self.names[inv[0]]}约{self.names[inv[1]]}{what}，到点还没等到回复"
         c.execute("insert into script(ts, actors, scene, text, source, created, knowers) values (?,?,?,?,?,?,?)",
                   (e["occurred_at"], json.dumps([inv[0]]), None, line, "kernel", self.life.clock.now(),
                    json.dumps(sorted({inv[0], inv[1]}))))

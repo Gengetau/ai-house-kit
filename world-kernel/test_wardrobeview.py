@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from worldkernel import wardrobeview
 from worldkernel.store import SCHEMA
@@ -131,7 +132,7 @@ class WardrobeViewTests(unittest.TestCase):
             rw.commit()
             rw.close()
             mtime_before = os.stat(path).st_mtime_ns
-            ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            ro = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
             ro.row_factory = sqlite3.Row
             ro.execute("PRAGMA query_only=1")
             dv_before = ro.execute("PRAGMA data_version").fetchone()[0]

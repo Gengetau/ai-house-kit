@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-house-kit"
-version = "0.1.0"
-description = "A dependency-free world kernel for simulating AI characters living together in one house"
+version = "0.2.0"
+description = "Turnkey AI roommate sharehouse engine & studio with 4-axis plugin SDK and Qingkong City linkage"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -13,14 +13,30 @@ authors = [{ name = "Gengetau" }]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["jsonschema>=4"]
+onebot = ["websockets>=13"]
+dev = ["jsonschema>=4", "websockets>=13"]
+
+[project.scripts]
+ai-house = "ai_house.cli:main"
 
 [project.urls]
 Source = "https://github.com/Gengetau/ai-house-kit"
 
 [tool.setuptools]
-package-dir = { "worldkernel" = "world-kernel/worldkernel", "worldcatalog" = "world-catalog/worldcatalog" }
-packages = ["worldkernel", "worldcatalog"]
+package-dir = { "" = "world-kernel", "ai_house" = "src/ai_house", "worldkernel" = "world-kernel/worldkernel", "worldcatalog" = "world-catalog/worldcatalog" }
+py-modules = ["authority", "shadow", "simulate", "kitchen_night"]
+packages = ["ai_house", "ai_house.builtin_plugins", "worldkernel", "worldcatalog"]
 
 [tool.setuptools.package-data]
+ai_house = [
+  "web/*.html",
+  "web/css/*.css",
+  "web/js/*.js",
+  "web/js/pages/*.js",
+  "web/img/house/overview/*",
+  "web/img/house/rooms/*/*",
+  "web/img/house/chars/*",
+  "bundled_packs/*/*.json",
+  "bundled_packs/*/people/*.json",
+]
 worldcatalog = ["*.json", "life1/*.json", "life1/people/*.json", "life1/garment_images/*.png", "profiles/*.json"]

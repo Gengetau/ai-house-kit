@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI House · 聊天</title>
+<style>
+  :root { --bg:#f6f7f4; --card:#fff; --line:#d9ded6; --ink:#1f2a24; --muted:#66736b; --me:#0f766e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:720px; margin:0 auto; padding:16px; display:flex; flex-direction:column; height:100vh; }
+  header { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  header h1 { font-size:16px; margin:0 8px 0 0; }
+  select, input, button { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); }
+  button { cursor:pointer; background:var(--me); color:#fff; border-color:var(--me); }
+  button:disabled { opacity:.5; cursor:default; }
+  #log { flex:1; overflow-y:auto; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .msg { margin:0 0 10px; }
+  .who { font-size:12px; color:var(--muted); }
+  .body { white-space:pre-wrap; word-break:break-word; }
+  .msg.owner .who { color:var(--me); }
+  .msg.blocked .body { color:var(--muted); font-style:italic; }
+  form { display:flex; gap:8px; margin-top:8px; }
+  form input { flex:1; }
+  #status { min-height:1.4em; font-size:13px; color:var(--muted); margin-top:4px; }
+  #tokenbox { display:none; gap:8px; margin-bottom:8px; }
+  #tokenbox input { flex:1; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AI House 聊天</h1>
+    <select id="channel" aria-label="聊天对象"></select>
+    <a href="/" style="margin-left:auto;font-size:13px">返回小屋工作台</a>
+  </header>
+  <div id="tokenbox">
+    <input id="token" type="password" autocomplete="off" placeholder="访问令牌（私聊要用私聊档或房主令牌）">
+    <button type="button" id="savetoken">确定</button>
+  </div>
+  <div id="log" aria-live="polite"></div>
+  <div id="status"></div>
+  <form id="form">
+    <input id="text" autocomplete="off" placeholder="说点什么…" maxlength="2000">
+    <button type="submit" id="send">发送</button>
+  </form>
+</main>
+<script>
+(() => {
+  const KEY = "ai_house_token";
+  const $ = (id) => document.getElementById(id);
+  const tok = () => sessionStorage.getItem(KEY) || "";
+  let timer = null;
+
+  function setStatus(t) { $("status").textContent = t || ""; }
+  function needToken(msg) { $("tokenbox").style.display = "flex"; setStatus(msg); }
+
+  async function api(path, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    if (tok()) headers["Authorization"] = "Bearer " + tok();
+    if (opts.body) headers["Content-Type"] = "application/json";
+    const r = await fetch(path, Object.assign({}, opts, { headers }));
+    let doc = {};
+    try { doc = await r.json(); } catch (_) {}
+    if (r.status === 401) { needToken("需要访问令牌"); throw new Error("401"); }
+    if (r.status === 403) { setStatus("这个令牌没有权限做这件事（私聊需要私聊档令牌）"); throw new Error("403"); }
+    if (!r.ok) { setStatus("出错了：" + (doc.error || r.status)); throw new Error(String(r.status)); }
+    $("tokenbox").style.display = "none";
+    return doc;
+  }
+
+  function render(messages) {
+    const log = $("log");
+    const stick = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
+    log.textContent = "";
+    for (const m of messages) {
+      const row = document.createElement("div");
+      row.className = "msg " + (m.sender === "owner" ? "owner" : "") + (m.mode === "blocked" ? " blocked" : "");
+      const who = document.createElement("div");
+      who.className = "who";
+      who.textContent = (m.sender === "owner" ? "我" : m.sender_name) + (m.badge ? " · " + m.badge : "");
+      const body = document.createElement("div");
+      body.className = "body";
+      body.textContent = m.text;
+      row.append(who, body);
+      log.append(row);
+    }
+    if (stick) log.scrollTop = log.scrollHeight;
+  }
+
+  async function refresh() {
+    try {
+      const doc = await api("/api/chat?channel=" + encodeURIComponent($("channel").value));
+      render(doc.messages || []);
+      setStatus("");
+    } catch (_) {}
+  }
+
+  async function init() {
+    try {
+      const doc = await api("/api/chat/roster");
+      const sel = $("channel");
+      sel.textContent = "";
+      for (const r of doc.residents) sel.append(new Option("私聊：" + r.name, "private:" + r.actor));
+      sel.append(new Option("小屋群聊", "group"));
+      refresh();
+      clearInterval(timer);
+      timer = setInterval(refresh, 3000);
+    } catch (_) {}
+  }
+
+  $("channel").addEventListener("change", refresh);
+  $("savetoken").addEventListener("click", () => { sessionStorage.setItem(KEY, $("token").value.trim()); init(); });
+  $("form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = $("text").value.trim();
+    if (!text) return;
+    $("send").disabled = true;
+    try {
+      const doc = await api("/api/chat", { method: "POST", body: JSON.stringify({ channel: $("channel").value, text }) });
+      $("text").value = "";
+      render(doc.messages || []);
+    } catch (_) {
+    } finally { $("send").disabled = false; }
+  });
+  init();
+})();
+</script>
+</body>
+</html>

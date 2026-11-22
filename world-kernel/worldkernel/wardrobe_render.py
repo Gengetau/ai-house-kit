@@ -13,7 +13,6 @@ Design invariants:
 import contextlib
 import datetime
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +21,16 @@ import sqlite3
 import tempfile
 import time
 import uuid
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 from .statuscard import JST, outfit_id
 
@@ -365,6 +374,22 @@ def day_jst(ts: float | None = None) -> str:
     return datetime.datetime.fromtimestamp(t, JST).strftime("%Y-%m-%d")
 
 
+def _acquire_lock_nb(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+
+def _release_lock(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 def _is_executor_alive(lock_path: str | None) -> bool | None:
     """Check whether an external executor still holds lock_path.
 
@@ -379,13 +404,13 @@ def _is_executor_alive(lock_path: str | None) -> bool | None:
         return None
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _acquire_lock_nb(fd)
         except OSError as e:
             if e.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
                 return True
             return None
         with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _release_lock(fd)
         return False
     finally:
         os.close(fd)
@@ -477,7 +502,7 @@ class WardrobeRenderLedger:
         if isinstance(life_db, sqlite3.Connection):
             src = life_db
         else:
-            src = sqlite3.connect(f"file:{life_db}?mode=ro", uri=True, timeout=5)
+            src = sqlite3.connect(Path(life_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
             src.row_factory = sqlite3.Row
             src.execute("PRAGMA query_only=1")
             src.execute("BEGIN")

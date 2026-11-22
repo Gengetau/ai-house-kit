@@ -280,7 +280,7 @@ def _going(w, actor, merged):
 
 def _say(x, now):
     actor, kind = x["actor"], x["kind"]
-    name = NAMES[actor]
+    name = NAMES.get(actor, actor)
     if kind == "move":
         return name + _going({"from": x.get("frm"), "to": x["to"], "via": x.get("via")}, actor, False)
     w = x["walk"]

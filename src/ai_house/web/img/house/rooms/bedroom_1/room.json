@@ -1,0 +1,213 @@
+{
+ "key": "bedroom_1",
+ "size": [
+  276,
+  244
+ ],
+ "objects": [
+  {
+   "id": "bed",
+   "label": "床",
+   "x": 69,
+   "y": 98,
+   "w": 72,
+   "h": 59,
+   "ax": 0,
+   "ay": 0,
+   "depth": 65.0
+  },
+  {
+   "id": "nightstand",
+   "label": "床头柜和台灯",
+   "x": 99,
+   "y": 93,
+   "w": 24,
+   "h": 35,
+   "ax": 73,
+   "ay": 0,
+   "depth": 34.0
+  },
+  {
+   "id": "slippers",
+   "label": "拖鞋",
+   "x": 117,
+   "y": 151,
+   "w": 15,
+   "h": 10,
+   "ax": 98,
+   "ay": 0,
+   "depth": 105.5
+  },
+  {
+   "id": "shelf0",
+   "label": "书柜里的私人藏书",
+   "x": 126,
+   "y": 50,
+   "w": 37,
+   "h": 76,
+   "ax": 114,
+   "ay": 0,
+   "depth": 23.5
+  },
+  {
+   "id": "shelf1",
+   "label": "书柜里的私人藏书",
+   "x": 152,
+   "y": 63,
+   "w": 37,
+   "h": 76,
+   "ax": 152,
+   "ay": 0,
+   "depth": 49.5
+  },
+  {
+   "id": "ttable",
+   "label": "小圆茶桌和红茶",
+   "x": 131,
+   "y": 148,
+   "w": 34,
+   "h": 32,
+   "ax": 190,
+   "ay": 0,
+   "depth": 138.0
+  },
+  {
+   "id": "armchair",
+   "label": "天鹅绒扶手椅",
+   "x": 105,
+   "y": 131,
+   "w": 42,
+   "h": 42,
+   "ax": 225,
+   "ay": 0,
+   "depth": 120.0
+  },
+  {
+   "id": "vase",
+   "label": "橙花（系着黑缎带）",
+   "x": 227,
+   "y": 144,
+   "w": 18,
+   "h": 28,
+   "ax": 268,
+   "ay": 0,
+   "depth": 126.0
+  },
+  {
+   "id": "lamp",
+   "label": "落地灯",
+   "x": 135,
+   "y": 162,
+   "w": 18,
+   "h": 48,
+   "ax": 287,
+   "ay": 0,
+   "depth": 200.0
+  },
+  {
+   "id": "desk",
+   "label": "写字台，摊着读书笔记",
+   "x": 25,
+   "y": 114,
+   "w": 46,
+   "h": 50,
+   "ax": 306,
+   "ay": 0,
+   "depth": 96.0
+  },
+  {
+   "id": "dchair",
+   "label": "椅子",
+   "x": 52,
+   "y": 145,
+   "w": 24,
+   "h": 21,
+   "ax": 353,
+   "ay": 0,
+   "depth": 113.0
+  },
+  {
+   "id": "books",
+   "label": "待读的书",
+   "x": 60,
+   "y": 167,
+   "w": 18,
+   "h": 16,
+   "ax": 378,
+   "ay": 0,
+   "depth": 153.0
+  }
+ ],
+ "anchors": [
+  {
+   "id": "bed",
+   "x": 91,
+   "y": 120,
+   "depth": 65.5,
+   "pose": "sleep",
+   "activities": [
+    "sleeping",
+    "resting"
+   ]
+  },
+  {
+   "id": "desk",
+   "x": 65,
+   "y": 152,
+   "depth": 113.5,
+   "pose": "sit",
+   "activities": [
+    "working",
+    "reading",
+    "drawing"
+   ]
+  },
+  {
+   "id": "armchair",
+   "x": 126,
+   "y": 154,
+   "depth": 120.5,
+   "pose": "sit",
+   "activities": [
+    "reading",
+    "tea_time",
+    "resting",
+    "phone"
+   ]
+  },
+  {
+   "id": "shelf",
+   "x": 140,
+   "y": 129,
+   "depth": 50.5,
+   "pose": "stand",
+   "activities": [
+    "reading",
+    "idle",
+    "chores_clean"
+   ]
+  },
+  {
+   "id": "ttable",
+   "x": 158,
+   "y": 182,
+   "depth": 156.5,
+   "pose": "stand",
+   "activities": [
+    "tea_time",
+    "idle"
+   ]
+  },
+  {
+   "id": "stand",
+   "x": 118,
+   "y": 190,
+   "depth": 172.5,
+   "pose": "stand",
+   "activities": [
+    "working",
+    "idle"
+   ]
+  }
+ ]
+}

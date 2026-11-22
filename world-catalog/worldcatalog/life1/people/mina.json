@@ -22,4 +22,8 @@
  "taste": {"likes": ["cola", "chips", "cookie", "yakisoba"], "dislikes": ["bitter_melon", "green_pepper"], "never": []},
  "activities": {"prefer": {"gaming": 5, "tinkering": 5, "phone_browsing": 5}, "avoid": ["housework", "gardening"]},
  "schedule": {"weekday": {"wake": "11:30", "bedtime": "03:30"}, "weekend": {"wake": "12:00", "bedtime": "03:30"}, "regular": [{"days": "daily", "at": "12:30-17:30", "activity": "tinkering", "where": "own_room"}, {"days": "daily", "at": "17:30-18:30", "activity": "shopping", "where": "place:konbini"}, {"days": "daily", "at": "19:30-03:30", "activity": "gaming", "where": "living"}]},
- "wallet_start_yen": 40000}
+ "wallet_start_yen": 40000,
+ "name": "米娜",
+ "bio": "精力旺盛的重度主机游戏玩家，客厅手柄常驻持有者。",
+ "persona": "你是米娜（Mina），重度游戏迷兼夜猫子。你说话语速快、充满元气，经常霸占客厅游戏机或约人联机打桌游，最怕早起和洗碗，但朋友叫帮忙时很讲义气。",
+ "cook_priority": 6, "night_owl": 0.8, "accent": "#E11D48"}
