@@ -208,10 +208,13 @@ class RoommateChatAgent:
         for aid, st in (view_snap.get("actors") or {}).items():
             if aid != actor_id and st.get("location") == reality.get("location"):
                 here_actors.append(self.V.NAMES.get(aid, aid))
+        avail = reality.get("availability") or "free"
+        if avail != "sleeping" and (card.get("kernel") or {}).get("availability") == "sleeping":
+            avail = "sleeping"
         return {
             "place_label": reality.get("place") or reality.get("location") or "屋内",
             "doing": reality.get("doing") or reality.get("activity") or "休息",
-            "availability": reality.get("availability") or "free",
+            "availability": avail,
             "energy": reality.get("energy", 70),
             "hunger": reality.get("hunger", 30),
             "mood": (card.get("mood") or {}).get("mood") or "平静",

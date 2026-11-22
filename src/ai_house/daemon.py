@@ -37,6 +37,7 @@ from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_com
 from .chat_guard import ReplyGuard
 from .chat_identity import Speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
+from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .llm import ModelRouter
 from .memory import MemoryStore
@@ -172,6 +173,7 @@ class HouseDaemon:
         self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
         self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
         self.send_gate = SendGate(self)
+        self.group_behavior = GroupBehaviorController(self.runtime_dir, clock=self.clock)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
         self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env)
         stored_plugins = self.settings_store.get_plugins_map()
@@ -898,6 +900,30 @@ class HouseDaemon:
             "stats": self.send_gate.stats_view(),
         }
 
+    def get_group_behavior_view(self) -> Dict[str, Any]:
+        stored = self.settings_store.get_plugins_map()
+        enabled = "group_behavior" in {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored)}
+        cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored)
+        return {"ok": True, "enabled": enabled, "config": cfg, **self.group_behavior.status_view(now=self.clock.now())}
+
+    def mutate_group_behavior(self, spec: Mapping[str, Any]) -> Dict[str, Any]:
+        data = dict(spec or {})
+        op = str(data.get("op") or "").strip().lower()
+        ch = str(data.get("channel") or "group").strip() or "group"
+        now = self.clock.now()
+        if op == "mute":
+            stored = self.settings_store.get_plugins_map()
+            cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored)
+            mins = int(data.get("minutes") or cfg.get("mute_minutes") or 30)
+            self.group_behavior.mute(ch, minutes=mins, now=now)
+        elif op == "unmute":
+            self.group_behavior.unmute(ch)
+        elif op == "reset_streak":
+            self.group_behavior.reset_streak(ch if data.get("channel") else None)
+        else:
+            raise ValueError(f"不支持的群聊行为操作：{op or '(空)'}")
+        return self.get_group_behavior_view()
+
     def converse(
         self,
         channel: str,
@@ -956,6 +982,40 @@ class HouseDaemon:
                         "VALUES(?, ?, ?, ?, ?, '', ?, ?)",
                         (channel, sender_key, speaker.name, ",".join(targets), text, sender_key, now),
                     )
+
+            stored_plugins = self.settings_store.get_plugins_map()
+            active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_plugins)}
+            gb_enabled = (not is_private) and ("group_behavior" in active_pids)
+            gb_cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored_plugins) if gb_enabled else {}
+            if gb_enabled:
+                gb_reason, gb_detail = self.group_behavior.check_group_turn(
+                    channel, speaker, text, enabled=True, cfg=gb_cfg, now=now,
+                )
+                if gb_reason:
+                    self._broadcast("chat", {"channel": "group", "replies": 0, "ignored": gb_reason})
+                    return {
+                        "ok": True,
+                        "channel": channel,
+                        "replies": [],
+                        "ignored": gb_reason,
+                        "group_behavior": gb_detail,
+                        "messages": self.list_chat(channel, limit=40),
+                    }
+                if gb_cfg.get("sleep_silence", True) and not (speaker.is_owner and ("醒" in text or "起床" in text)):
+                    targets = [
+                        aid for aid in targets
+                        if ((residents[aid].get("reality") or {}).get("availability") != "sleeping")
+                        and ((residents[aid].get("kernel") or {}).get("availability") != "sleeping")
+                    ]
+                    if not targets:
+                        self._broadcast("chat", {"channel": "group", "replies": 0, "ignored": "sleep_silence"})
+                        return {
+                            "ok": True,
+                            "channel": channel,
+                            "replies": [],
+                            "ignored": "sleep_silence",
+                            "messages": self.list_chat(channel, limit=40),
+                        }
 
             recent = self.list_chat(channel, limit=8)
             snaps_by_target: Dict[str, Dict[str, Any]] = {}
@@ -1071,6 +1131,8 @@ class HouseDaemon:
                 extra_tools=extra_tools,
                 tool_runner=_run_tool,
             )
+            if rep["mode"] == "sleeping" and gb_enabled and gb_cfg.get("sleep_silence", True):
+                continue
             if rep["mode"] != "sleeping":
                 why = self.guard.check(channel, rep["text"])
                 if not why and not is_private:
@@ -1114,6 +1176,9 @@ class HouseDaemon:
                 replies.append(rep)
 
             self.authority.step()
+            if gb_enabled:
+                delivered_cnt = len([r for r in replies if r.get("mode") not in ("blocked", "sleeping")])
+                self.group_behavior.note_group_replies(channel, speaker, delivered_cnt, now=now)
 
         # the event stream is read-tier: it announces that something was said, not in which private room or QQ group
         self._broadcast("chat", {"channel": "group" if channel == "group" else "private", "replies": len(replies)})
@@ -1800,6 +1865,8 @@ class HouseDaemon:
             self._plugin_task_last_run.clear()
             if getattr(self, "send_gate", None) is not None:
                 self.send_gate.reset()
+            if getattr(self, "group_behavior", None) is not None:
+                self.group_behavior.reset()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():
@@ -2126,6 +2193,11 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     lim = 50
                 self._send_json(daemon.get_outbox_view(limit=lim))
                 return
+            if parsed.path == "/api/group/behavior":
+                if not self._need(parsed, "owner"):
+                    return
+                self._send_json(daemon.get_group_behavior_view())
+                return
             if parsed.path == "/api/usage":
                 if not self._need(parsed, "read"):
                     return
@@ -2308,6 +2380,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 "/api/settings/plugins",
                 "/api/identities",
                 "/api/outbox/flush",
+                "/api/group/behavior",
                 "/api/residents",
                 "/api/residents/update",
                 "/api/setup/reset",
@@ -2353,6 +2426,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 if parsed.path == "/api/outbox/flush":
                     self._send_json(daemon.flush_outbox())
+                    return
+                if parsed.path == "/api/group/behavior":
+                    self._send_json(daemon.mutate_group_behavior(body if isinstance(body, dict) else {}))
                     return
                 if parsed.path == "/api/residents":
                     self._send_json(daemon.add_resident(body if isinstance(body, dict) else {}))
