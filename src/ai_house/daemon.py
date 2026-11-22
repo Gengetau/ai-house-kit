@@ -712,11 +712,19 @@ class HouseDaemon:
                 if tname == "record_promise":
                     if not speaker.is_owner:
                         return {"recorded": False, "error": "owner_only"}
+                    summary = str(targs.get("summary") or text)[:80]
+                    kind = str(targs.get("kind") or "chat_promise")
+                    if kind == "cook" and any(w in f"{summary} {text}" for w in ("过敏", "忌口")) and not any(
+                        w in summary for w in ("做", "下厨", "煮", "餐", "饭")
+                    ):
+                        kind = "memo"
                     intent_obj: Dict[str, Any] = {
-                        "text": str(targs.get("summary") or text)[:80],
-                        "kind": str(targs.get("kind") or "chat_promise"),
+                        "text": summary,
+                        "kind": kind,
                         "答应了的": [_aid],
                     }
+                    if targs.get("qty") is not None:
+                        intent_obj["qty"] = max(1, min(3, int(targs.get("qty") or 1)))
                     if targs.get("item"):
                         intent_obj["item"] = str(targs["item"])
                         intent_obj["qty"] = max(1, min(3, int(targs.get("qty") or 1)))

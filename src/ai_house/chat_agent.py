@@ -178,6 +178,23 @@ class RoommateChatAgent:
     def live_llm_enabled(self) -> bool:
         return bool(self._llm_fn is not None or self.api_key or self.fallback_api_key)
 
+    def _builtin_tool_specs(self) -> List[Dict[str, Any]]:
+        specs = json.loads(json.dumps(_BUILTIN_TOOL_SPECS, ensure_ascii=False))
+        ingredients = getattr(self.V, "INGREDIENTS", None) or {}
+        if ingredients:
+            pairs = [
+                f"{k}={str((v or {}).get('label') or k).split('（', 1)[0]}"
+                for k, v in ingredients.items()
+            ]
+            item_desc = "需要采购的食材英文ID（kind=errand 时必填；可用ID：" + ", ".join(pairs) + "）"
+        else:
+            item_desc = "需要采购的食材英文ID（kind=errand 时必填）"
+        for s in specs:
+            if s.get("name") == "record_promise":
+                s["description"] = "记录答应房主去做的具体行动或食材采购（仅房主本人发言时有效；纯喜好、过敏等事实备忘无需调用此工具）。"
+                s["parameters"]["properties"]["item"]["description"] = item_desc
+        return specs
+
     def _endpoints(self) -> List[Tuple[str, str, str]]:
         eps: List[Tuple[str, str, str]] = []
         if self.api_key:
@@ -368,7 +385,7 @@ class RoommateChatAgent:
         if self.live_llm_enabled:
             try:
                 if self._llm_fn is None and self._endpoints() and tool_runner is not None and self.tools_enabled:
-                    all_specs = [*_BUILTIN_TOOL_SPECS, *extra_tools]
+                    all_specs = [*self._builtin_tool_specs(), *extra_tools]
                     raw_text, _ = self._run_tool_loop(system, user, all_specs, tool_runner, recorded_intents)
                 else:
                     fn = self.kernel_chat_fn()
