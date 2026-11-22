@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import importlib.util
 import json
 import os
@@ -86,8 +87,24 @@ def cmd_up(args: argparse.Namespace) -> int:
     except ChannelConfigError as exc:
         print(f"[ai-house] QQ 接入配置有问题，没有启动：{exc}", file=sys.stderr, flush=True)
         return 2
+    try:
+        srv = make_http_server(daemon, host=host, port=port)
+    except OSError as exc:
+        daemon.close()
+        winerr = getattr(exc, "winerror", None)
+        if exc.errno in (errno.EADDRINUSE, 48, 98, 10048) or winerr in (10048, 10013):
+            print(
+                f"[ai-house] 端口 {host}:{port} 已被占用（可能已有 AI House 实例正在运行，或被其他程序占用）；"
+                f"可改用 --port <端口> 启动，或先停止占用进程。",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(f"[ai-house] 无法监听 {host}:{port}：{exc}", file=sys.stderr, flush=True)
+        return 2
     daemon.start_background_loop()
-    srv = make_http_server(daemon, host=host, port=port)
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    listen_note = f"（监听 {host}:{port}，若在容器内请访问宿主机映射端口）" if display_host != host else ""
     mode_label = (
         f"真实大模型 ({daemon.chat_agent.model})"
         if daemon.chat_agent.live_llm_enabled
@@ -99,9 +116,10 @@ def cmd_up(args: argparse.Namespace) -> int:
         else f"{daemon.vocab.MANIFEST.get('profile')}（室友：{'、'.join(daemon.vocab.NAMES.values())}）"
     )
     print(
-        f"\n🏡 AI House Studio 已启动！\n"
-        f"   • 可视化工作台与群聊面板: http://{host}:{port}\n"
-        f"   • 标准 Streamable MCP 端点: http://{host}:{port}/mcp\n"
+        f"\n🏡 AI House Studio 已启动！{listen_note}\n"
+        f"   • 可视化工作台与群聊面板: http://{display_host}:{port}\n"
+        f"   • 标准 Streamable MCP 端点: http://{display_host}:{port}/mcp\n"
+        f"   • 健康检查接口:           http://{display_host}:{port}/api/health\n"
         f"   • 当前世界包: {pack_line}\n"
         f"   • 模型模式: {mode_label}\n",
         flush=True,
@@ -130,14 +148,18 @@ def _roster_json_for_pack(pack_spec: Any) -> str:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    env_path = Path(args.env_file)
+    env_path = Path(args.env_file).resolve()
     if env_path.exists() and not args.force:
         print(f"[ai-house] {env_path} 已存在；如需覆盖请加 --force", file=sys.stderr, flush=True)
         return 1
     pack_raw = (args.pack or "").strip()
     roster_json = ""
     if pack_raw:
-        v = vocab_life1.load_pack(pack_raw)
+        try:
+            v = vocab_life1.load_pack(pack_raw)
+        except FileNotFoundError as exc:
+            print(f"[ai-house] {exc}", file=sys.stderr, flush=True)
+            return 2
         roster_json = _roster_json_for_pack(v)
 
     owner_token = secrets.token_urlsafe(24)
@@ -170,18 +192,61 @@ def cmd_init(args: argparse.Namespace) -> int:
     except OSError:
         pass
 
-    rt = Path(args.data_dir)
+    rt = Path(args.data_dir).resolve()
     rt.mkdir(parents=True, exist_ok=True)
 
     print(
-        f"✅ 已初始化配置文件: {env_path} 与数据目录: {rt}\n"
-        f"   • 已自动生成 AI_HOUSE_OWNER_TOKEN 与 CITY_BRIDGE_KEY（切勿提交到 Git）\n"
+        f"✅ 已初始化配置文件: {env_path}\n"
+        f"   • 数据目录: {rt}\n"
+        f"   • 房主访问令牌 (AI_HOUSE_OWNER_TOKEN): {owner_token}\n"
+        f"   • 已自动生成 AI_HOUSE_OWNER_TOKEN 与 CITY_BRIDGE_KEY（切勿提交到 Git；后续可用 ai-house token 查看）\n"
         f"   • 下一步运行环境自检: ai-house doctor\n"
         f"   • 直接本地启动:       ai-house up\n"
         f"   • 容器一键启动:       docker compose up -d\n",
         flush=True,
     )
     return 0
+
+
+def cmd_token(args: argparse.Namespace) -> int:
+    env_path = Path(args.env_file).resolve()
+    vals, _errs, _warns = _parse_dotenv_file(env_path)
+    if vals.get("AI_HOUSE_OWNER_TOKEN"):
+        owner_token = vals["AI_HOUSE_OWNER_TOKEN"].strip()
+        source = "dotenv"
+    elif os.environ.get("AI_HOUSE_OWNER_TOKEN", "").strip():
+        owner_token = os.environ["AI_HOUSE_OWNER_TOKEN"].strip()
+        source = "env"
+    else:
+        owner_token = ""
+        source = "unset"
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": bool(owner_token),
+                    "env_file": str(env_path),
+                    "owner_token": owner_token,
+                    "source": source,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if owner_token else 1
+
+    if owner_token:
+        print(f"配置文件: {env_path}\nAI_HOUSE_OWNER_TOKEN: {owner_token}", flush=True)
+        return 0
+
+    print(
+        f"[ai-house] 未在 {env_path} 或环境变量中找到 AI_HOUSE_OWNER_TOKEN；"
+        f"可运行 `ai-house init` 生成，本机 127.0.0.1 默认免密钥直接访问。",
+        file=sys.stderr,
+        flush=True,
+    )
+    return 1
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -323,7 +388,11 @@ def cmd_plugins(args: argparse.Namespace) -> int:
 
 
 def cmd_pack_check(args: argparse.Namespace) -> int:
-    v = vocab_life1.load_pack(args.pack)
+    try:
+        v = vocab_life1.load_pack(args.pack)
+    except FileNotFoundError as exc:
+        print(f"[ai-house] {exc}", file=sys.stderr, flush=True)
+        return 2
     print(json.dumps({
         "ok": True,
         "profile": v.MANIFEST.get("profile"),
@@ -341,39 +410,44 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd")
 
     p_up = sub.add_parser("up", help="启动 AI 小屋守护进程、单页可视化工作台与 MCP 服务")
-    p_up.add_argument("--host", default=None)
-    p_up.add_argument("--port", type=int, default=None)
-    p_up.add_argument("--data-dir", default=None)
-    p_up.add_argument("--pack", default=None)
-    p_up.add_argument("--packs-root", default="./packs")
-    p_up.add_argument("--env-file", default=".env")
-    p_up.add_argument("--step-seconds", type=float, default=60.0)
-    p_up.add_argument("--virtual-clock", action="store_true")
+    p_up.add_argument("--host", default=None, help="监听主机地址（默认 127.0.0.1；公网/非回环绑定需先配置 AI_HOUSE_OWNER_TOKEN）")
+    p_up.add_argument("--port", type=int, default=None, help="监听 HTTP 端口（默认 8780）")
+    p_up.add_argument("--data-dir", default=None, help="运行时 SQLite 与状态持久化目录（默认 ./runtime）")
+    p_up.add_argument("--pack", default=None, help="世界与室友内容包名称或目录（如 life1、indie-studio-3）")
+    p_up.add_argument("--packs-root", default="./packs", help="自定义 WorldPack 扫描根目录（默认 ./packs）")
+    p_up.add_argument("--env-file", default=".env", help="启动前加载的 .env 配置文件路径（默认 .env）")
+    p_up.add_argument("--step-seconds", type=float, default=60.0, help="后台时钟推进步长（秒，默认 60.0）")
+    p_up.add_argument("--virtual-clock", action="store_true", help="使用可倍速/重启独立运行的虚拟时钟")
     p_up.set_defaults(func=cmd_up)
 
     p_in = sub.add_parser("init", help="生成带强随机令牌的 .env 配置与 runtime 目录")
-    p_in.add_argument("--env-file", default=".env")
-    p_in.add_argument("--data-dir", default="./runtime")
-    p_in.add_argument("--pack", default="")
-    p_in.add_argument("--port", type=int, default=8780)
-    p_in.add_argument("--force", action="store_true")
+    p_in.add_argument("--env-file", default=".env", help="生成的 .env 配置文件路径（默认 .env）")
+    p_in.add_argument("--data-dir", default="./runtime", help="预创建的运行时数据目录（默认 ./runtime）")
+    p_in.add_argument("--pack", default="", help="预设 WorldPack 名称或目录（留空则首次打开网页由向导建角）")
+    p_in.add_argument("--port", type=int, default=8780, help="写入 .env 的默认服务端口（默认 8780）")
+    p_in.add_argument("--force", action="store_true", help="强制覆盖已存在的 .env 文件并重新生成令牌")
     p_in.set_defaults(func=cmd_init)
 
+    p_tok = sub.add_parser("token", help="查看 .env 或环境变量中的房主访问令牌 (AI_HOUSE_OWNER_TOKEN)")
+    p_tok.add_argument("--env-file", default=".env", help="要读取的 .env 配置文件路径（默认 .env）")
+    p_tok.add_argument("--json", action="store_true", help="以 JSON 格式输出配置文件路径、来源与令牌")
+    p_tok.set_defaults(func=cmd_token)
+
     p_doc = sub.add_parser("doctor", help="检查 Python、.env、安全令牌、SQLite、WorldPack 与模型连通性")
-    p_doc.add_argument("--env-file", default=".env")
-    p_doc.add_argument("--host", default=None)
-    p_doc.add_argument("--data-dir", default=None)
-    p_doc.add_argument("--pack", default=None)
-    p_doc.add_argument("--json", action="store_true")
-    p_doc.add_argument("--live-ping", action="store_true")
+    p_doc.add_argument("--env-file", default=".env", help="待检测的 .env 配置文件路径（默认 .env）")
+    p_doc.add_argument("--host", default=None, help="覆盖待校验证监听地址的 host")
+    p_doc.add_argument("--data-dir", default=None, help="覆盖待检测的运行时数据目录")
+    p_doc.add_argument("--pack", default=None, help="指定待校验的 WorldPack 名称或路径")
+    p_doc.add_argument("--json", action="store_true", help="以 JSON 格式输出完整自检报告")
+    p_doc.add_argument("--live-ping", action="store_true", help="向当前配置的 OpenAI 兼容接口发起真实连通性测试")
     p_doc.set_defaults(func=cmd_doctor)
 
     p_pl = sub.add_parser("plugins", help="列出已发现的四轴插件与世界内容包")
-    p_pl.add_argument("--packs-root", default="./packs")
+    p_pl.add_argument("--packs-root", default="./packs", help="自定义 WorldPack 扫描根目录（默认 ./packs）")
     p_pl.set_defaults(func=cmd_plugins)
 
     p_pk = sub.add_parser("pack-check", help="校验自定义世界与室友内容包 (WorldPack)")
-    p_pk.add_argument("pack", help="WorldPack 目录路径")
+    p_pk.add_argument("pack", help="WorldPack 目录路径或内置名称（如 life1、indie-studio-3）")
     p_pk.set_defaults(func=cmd_pack_check)
 
     ns = ap.parse_args(argv)

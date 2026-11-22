@@ -263,7 +263,7 @@ function showLogin(msg = ''){
       e.preventDefault();
       err.textContent = '';
       const cand = pw.value.trim();
-      if (!cand){ err.textContent = '请先输入钥匙（可在 .env 中查看 AI_HOUSE_OWNER_TOKEN）'; pw.focus(); return; }
+      if (!cand){ err.textContent = '请先输入钥匙（可在 .env 中查看 AI_HOUSE_OWNER_TOKEN，或在终端运行 ai-house token）'; pw.focus(); return; }
       btn.disabled = true;
       try {
         const authDoc = await api('/api/auth', undefined, {quiet: true, token: cand});
@@ -272,7 +272,7 @@ function showLogin(msg = ''){
         await boot(authDoc);
       } catch (x){
         btn.disabled = false;
-        err.textContent = x.status === 401 ? '钥匙不对，请核对 .env 中的 AI_HOUSE_OWNER_TOKEN' : (x.message || '连不上控制台');
+        err.textContent = x.status === 401 ? '钥匙不对，请核对 .env 中的 AI_HOUSE_OWNER_TOKEN 或运行 ai-house token' : (x.message || '连不上控制台');
         pw.focus();
       }
     },
@@ -282,7 +282,7 @@ function showLogin(msg = ''){
     el('div', {class: 'lbox'},
       el('div', {class: 'logo'}, icon('home')),
       el('h1', {}, '欢迎回 AI 小屋'),
-      el('p', {}, '输入玄关钥匙（.env 中的 AI_HOUSE_OWNER_TOKEN），走进大家一起生活的小屋。'),
+      el('p', {}, '输入玄关钥匙（在 .env 查看 AI_HOUSE_OWNER_TOKEN，或在终端运行 ai-house token 获取），走进大家一起生活的小屋。'),
       form,
       err,
       el('p', {class: 'tiny muted', style: 'margin:10px 0 0'}, '钥匙仅保存在当前浏览器标签页会话中，通过 Bearer 请求头鉴权。')),
