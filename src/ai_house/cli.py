@@ -382,6 +382,8 @@ def cmd_plugins(args: argparse.Namespace) -> int:
         "extensions": ["outings", "avatar", "chatlink", "city_bridge"] + sorted(reg.extensions.keys()),
         "providers": sorted(reg.providers.keys()),
         "tools": sorted(reg.tools.keys()),
+        "manifests": [d.manifest.to_schema_dict() | {"source": d.source} for d in reg.definitions.values()],
+        "load_errors": [e.to_dict() for e in reg.load_errors],
     }
     print(json.dumps(doc, ensure_ascii=False, indent=2))
     return 0
