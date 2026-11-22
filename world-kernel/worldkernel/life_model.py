@@ -3,6 +3,7 @@ for the fast-forward week. Both return Cognition's {"steps": [...]} shape; every
 """
 import datetime as dt
 import hashlib
+import inspect
 import json
 import random
 import re
@@ -193,6 +194,17 @@ def life_format(me, life):
             "只替自己决定；邀请别人只是问，对方自己答。不要编没有的东西、没去过的地方。")
 
 
+def _invoke_chat(chat, system, user, actor):
+    try:
+        sig = inspect.signature(chat)
+        params = sig.parameters.values()
+        if "actor" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return chat(system, user, actor=actor)
+    except (TypeError, ValueError):
+        pass
+    return chat(system, user)
+
+
 class LiveLifeModel:
     """ctx -> {"steps"} via chat(system, user) -> (text, tokens)."""
 
@@ -214,7 +226,7 @@ class LiveLifeModel:
                 if names else ""
             user = (f"你决定对{who}说一句话。对方也能看到的：{json.dumps(seen, ensure_ascii=False)}\n{call}"
                     '用你自己的口吻说一句，不超过 40 字，只输出 {"text": "..."}。')
-            text, tokens = self.chat(system, user)
+            text, tokens = _invoke_chat(self.chat, system, user, me)
             m = re.search(r"\{.*\}", text, re.S)
             return {"text": str((json.loads(m.group(0)) if m else {}).get("text") or "")[:120], "tokens": tokens}
         seen = {k: ctx.get(k) for k in ("location", "activity", "body", "here", "items_here", "recent")}
@@ -233,7 +245,7 @@ class LiveLifeModel:
         kind = ctx.get("decision") or ""
         user = (f"你现在的情况：\n{json.dumps(seen, ensure_ascii=False)}\n让你想一想的原因：{kind}"
                 + (f"——{why(kind)}" if why(kind) else "") + "\n\n" + life_format(me, life))
-        text, tokens = self.chat(system, user)
+        text, tokens = _invoke_chat(self.chat, system, user, me)
         steps, unusable = read_answer(text)
         out = {"steps": steps[:4], "latency": 0, "tokens": tokens}
         if unusable:

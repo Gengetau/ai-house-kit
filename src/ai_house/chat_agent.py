@@ -11,190 +11,20 @@ import hashlib
 import json
 import os
 import re
-import urllib.error
-import urllib.request
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .chat_identity import Speaker, one_line, owner_speaker, quote_untrusted
+from .llm import LLMAPIError, ModelRouter, mask_secrets, openai_compatible_chat, post_openai_chat_json
 
 JST = dt.timezone(dt.timedelta(hours=9))
 
-
-_SK_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
-
-
-class LLMAPIError(RuntimeError):
-    """Structured error raised on HTTP failures from OpenAI-compatible endpoints."""
-
-    def __init__(self, status_code: int, message: str, detail: str = "") -> None:
-        self.status_code = int(status_code or 0)
-        self.detail = detail
-        super().__init__(message)
-
-
-def mask_secrets(text: str, api_key: str = "") -> str:
-    """Redact API keys and sk-* tokens before surfacing errors to logs or UI."""
-    cleaned = str(text or "")
-    key = str(api_key or "").strip()
-    if key:
-        cleaned = cleaned.replace(key, "[REDACTED]")
-    return _SK_SECRET_RE.sub("[REDACTED]", cleaned)
-
-
-def _extract_http_error_detail(exc: urllib.error.HTTPError, api_key: str = "") -> str:
-    raw = ""
-    try:
-        if exc.fp is not None:
-            raw = exc.fp.read(4096).decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        raw = ""
-    if raw:
-        try:
-            doc = json.loads(raw)
-            err = doc.get("error")
-            if isinstance(err, dict):
-                parts = [str(err.get("message") or "").strip()]
-                if err.get("param"):
-                    parts.append(f"param={err['param']}")
-                if err.get("code"):
-                    parts.append(f"code={err['code']}")
-                raw = "; ".join(p for p in parts if p)
-            elif isinstance(err, str):
-                raw = err
-            elif doc.get("message"):
-                raw = str(doc.get("message"))
-        except ValueError:
-            pass
-    detail = " ".join(str(raw or exc.reason or f"HTTP {exc.code}").split())
-    return mask_secrets(detail, api_key=api_key)[:280]
-
-
-def _compat_retry_payload(payload: Mapping[str, Any], detail: str) -> Optional[Dict[str, Any]]:
-    low = detail.lower()
-    if not any(tok in low for tok in ("max_tokens", "max_completion_tokens", "temperature")):
-        return None
-    adapted = dict(payload)
-    changed = False
-    if "max_tokens" in adapted:
-        old_max = adapted.pop("max_tokens")
-        try:
-            n = int(old_max or 0)
-        except (TypeError, ValueError):
-            n = 0
-        adapted["max_completion_tokens"] = max(n, 1024)
-        changed = True
-    elif "max_completion_tokens" in adapted:
-        try:
-            n = int(adapted["max_completion_tokens"] or 0)
-        except (TypeError, ValueError):
-            n = 0
-        if n < 1024:
-            adapted["max_completion_tokens"] = 1024
-            changed = True
-    if "temperature" in adapted:
-        adapted.pop("temperature", None)
-        changed = True
-    return adapted if changed else None
-
-
-def _chat_completions_url(base_url: str) -> str:
-    url = (base_url or "https://api.openai.com").strip().rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url = (url + "/chat/completions") if url.endswith("/v1") else (url + "/v1/chat/completions")
-    return url
-
-
-def _send_chat_request(url: str, api_key: str, payload: Mapping[str, Any], timeout_s: float) -> Dict[str, Any]:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(dict(payload), ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "ai-house-kit/0.2 (+https://github.com/Gengetau/ai-house-kit)",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
-
-
-def post_openai_chat_json(
-    *,
-    base_url: str,
-    api_key: str,
-    payload: Mapping[str, Any],
-    timeout_s: float = 25.0,
-) -> Dict[str, Any]:
-    """POST to `/v1/chat/completions`, auto-adapting GPT-5/o-series parameter limits on HTTP 400."""
-    url = _chat_completions_url(base_url)
-    try:
-        return _send_chat_request(url, api_key, payload, timeout_s)
-    except urllib.error.HTTPError as exc:
-        detail = _extract_http_error_detail(exc, api_key=api_key)
-        if exc.code == 400:
-            retry_payload = _compat_retry_payload(payload, detail)
-            if retry_payload is not None:
-                try:
-                    return _send_chat_request(url, api_key, retry_payload, timeout_s)
-                except urllib.error.HTTPError as retry_exc:
-                    retry_detail = _extract_http_error_detail(retry_exc, api_key=api_key)
-                    raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {retry_detail}", detail=retry_detail) from retry_exc
-        raise LLMAPIError(exc.code, f"HTTP {exc.code}: {detail}", detail=detail) from exc
-
-
-def openai_compatible_chat(
-    system: str,
-    user: str,
-    *,
-    api_key: str,
-    base_url: str = "https://api.openai.com",
-    model: str = "gpt-4o-mini",
-    timeout_s: float = 25.0,
-) -> Tuple[str, int]:
-    """Call any OpenAI-compatible `/v1/chat/completions` endpoint using Python stdlib."""
-    doc = post_openai_chat_json(
-        base_url=base_url,
-        api_key=api_key,
-        payload={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.7,
-            "max_tokens": 350,
-        },
-        timeout_s=timeout_s,
-    )
-    msg = (((doc.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
-    tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
-    return str(msg).strip(), tokens
-
-
-def _openai_messages_call(
-    messages: Sequence[Dict[str, Any]],
-    *,
-    api_key: str,
-    base_url: str,
-    model: str,
-    tools: Optional[Sequence[Dict[str, Any]]] = None,
-    timeout_s: float = 25.0,
-) -> Tuple[Dict[str, Any], int]:
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": list(messages),
-        "temperature": 0.7,
-        "max_tokens": 400,
-    }
-    if tools:
-        payload["tools"] = [{"type": "function", "function": t} for t in tools]
-        payload["tool_choice"] = "auto"
-    doc = post_openai_chat_json(base_url=base_url, api_key=api_key, payload=payload, timeout_s=timeout_s)
-    choice = (doc.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
-    return message, tokens
+__all__ = [
+    "LLMAPIError",
+    "RoommateChatAgent",
+    "mask_secrets",
+    "openai_compatible_chat",
+    "post_openai_chat_json",
+]
 
 
 _BUILTIN_TOOL_SPECS: List[Dict[str, Any]] = [
@@ -241,9 +71,17 @@ class RoommateChatAgent:
         base_url: str = "",
         model: str = "",
         llm_fn: Optional[Callable[[str, str], Tuple[str, int]]] = None,
+        router: Optional[ModelRouter] = None,
     ):
         self.V = vocab
-        src = os.environ if env is None else env
+        src = dict(os.environ if env is None else env)
+        if api_key:
+            src["AI_HOUSE_API_KEY"] = api_key
+        if base_url:
+            src["AI_HOUSE_BASE_URL"] = base_url
+        if model:
+            src["AI_HOUSE_MODEL"] = model
+        self.router = router if router is not None else ModelRouter(src)
         self.api_key = (
             api_key
             or src.get("AI_HOUSE_API_KEY")
@@ -272,7 +110,7 @@ class RoommateChatAgent:
 
     @property
     def live_llm_enabled(self) -> bool:
-        return bool(self._llm_fn is not None or self.api_key or self.fallback_api_key)
+        return bool(self._llm_fn is not None or self.router.has_live_endpoint(purpose="chat"))
 
     def _builtin_tool_specs(self) -> List[Dict[str, Any]]:
         specs = json.loads(json.dumps(_BUILTIN_TOOL_SPECS, ensure_ascii=False))
@@ -291,32 +129,22 @@ class RoommateChatAgent:
                 s["parameters"]["properties"]["item"]["description"] = item_desc
         return specs
 
-    def _endpoints(self) -> List[Tuple[str, str, str]]:
-        eps: List[Tuple[str, str, str]] = []
-        if self.api_key:
-            eps.append((self.api_key, self.base_url, self.model))
-        if self.fallback_api_key:
-            eps.append((self.fallback_api_key, self.fallback_base_url, self.fallback_model))
-        return eps
+    def _endpoints(self, *, purpose: str = "chat", actor: str = "") -> List[Tuple[str, str, str]]:
+        return [
+            (ep.api_key, ep.base_url, ep.model)
+            for ep, _ in self.router.resolve_endpoints(purpose=purpose, actor=actor)
+        ]
 
-    def _chat_with_failover(self, system: str, user: str) -> Tuple[str, int]:
-        last_exc: Optional[BaseException] = None
-        for key, url, mdl in self._endpoints():
-            try:
-                return openai_compatible_chat(system, user, api_key=key, base_url=url, model=mdl)
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("no API key configured")
+    def _chat_with_failover(self, system: str, user: str, *, actor: str = "") -> Tuple[str, int]:
+        return self.router.complete_text(system, user, purpose="chat", actor=actor)
 
-    def kernel_chat_fn(self) -> Optional[Callable[[str, str], Tuple[str, int]]]:
+    def kernel_chat_fn(self) -> Optional[Callable[..., Tuple[str, int]]]:
         """Adapter passed into `Authority` / `LiveLifeModel` when an API key is configured."""
         if self._llm_fn is not None:
             return self._llm_fn
-        if not self._endpoints():
+        if not self.router.has_live_endpoint(purpose="chat"):
             return None
-        return self._chat_with_failover
+        return self.router.chat_fn(purpose="chat")
 
     def _run_tool_loop(
         self,
@@ -325,43 +153,24 @@ class RoommateChatAgent:
         tool_specs: Sequence[Dict[str, Any]],
         tool_runner: Callable[[str, Dict[str, Any]], Dict[str, Any]],
         recorded_intents: List[Dict[str, Any]],
+        *,
+        actor_id: str = "",
     ) -> Tuple[str, int]:
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        eps = self._endpoints()
-        if not eps:
-            raise RuntimeError("no API key configured")
         total_tokens = 0
         for _round in range(3):
-            msg: Optional[Dict[str, Any]] = None
-            toks = 0
-            last_exc: Optional[BaseException] = None
-            for key, url, mdl in eps:
-                try:
-                    msg, toks = _openai_messages_call(
-                        messages, api_key=key, base_url=url, model=mdl, tools=tool_specs if self.tools_enabled else None
-                    )
-                    break
-                except (urllib.error.HTTPError, LLMAPIError) as exc:
-                    status = getattr(exc, "status_code", getattr(exc, "code", 0))
-                    if status == 400 and self.tools_enabled:
-                        try:
-                            msg, toks = _openai_messages_call(
-                                messages, api_key=key, base_url=url, model=mdl, tools=None
-                            )
-                            break
-                        except Exception as inner_exc:  # noqa: BLE001
-                            last_exc = inner_exc
-                            continue
-                    last_exc = exc
-                except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
-            if msg is None:
-                assert last_exc is not None
-                raise last_exc
-            total_tokens += toks
+            res = self.router.complete_messages(
+                messages,
+                purpose="chat",
+                actor=actor_id,
+                tools=tool_specs if self.tools_enabled else None,
+                retry_without_tools_on_400=bool(self.tools_enabled),
+            )
+            msg = res.message
+            total_tokens += res.total_tokens
             tcalls = msg.get("tool_calls") or []
             if not tcalls:
                 return str(msg.get("content") or "").strip(), total_tokens
@@ -388,10 +197,8 @@ class RoommateChatAgent:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
         # Final plain call after max tool rounds so we always get a spoken reply
-        final_msg, toks = _openai_messages_call(
-            messages, api_key=eps[0][0], base_url=eps[0][1], model=eps[0][2], tools=None
-        )
-        return str(final_msg.get("content") or "").strip(), total_tokens + toks
+        final_res = self.router.complete_messages(messages, purpose="chat", actor=actor_id, tools=None)
+        return str(final_res.content or "").strip(), total_tokens + final_res.total_tokens
 
     def build_actor_context(self, actor_id: str, card: Dict[str, Any], view_snap: Dict[str, Any]) -> Dict[str, Any]:
         reality = card.get("reality") or {}
@@ -479,11 +286,16 @@ class RoommateChatAgent:
         user = f"{user_prefix}{speaker.label}刚刚说：{said}"
 
         recorded_intents: List[Dict[str, Any]] = []
-        if self.live_llm_enabled:
+        if self.live_llm_enabled or self.router.has_live_endpoint(purpose="chat", actor=actor_id):
             try:
-                if self._llm_fn is None and self._endpoints() and tool_runner is not None and self.tools_enabled:
-                    all_specs = [*self._builtin_tool_specs(), *extra_tools]
-                    raw_text, _ = self._run_tool_loop(system, user, all_specs, tool_runner, recorded_intents)
+                if self._llm_fn is None and self.router.has_live_endpoint(purpose="chat", actor=actor_id):
+                    if tool_runner is not None and self.tools_enabled:
+                        all_specs = [*self._builtin_tool_specs(), *extra_tools]
+                        raw_text, _ = self._run_tool_loop(
+                            system, user, all_specs, tool_runner, recorded_intents, actor_id=actor_id
+                        )
+                    else:
+                        raw_text, _ = self.router.complete_text(system, user, purpose="chat", actor=actor_id)
                 else:
                     fn = self.kernel_chat_fn()
                     assert fn is not None
@@ -499,7 +311,10 @@ class RoommateChatAgent:
                         "tool_intents": recorded_intents,
                     }
             except Exception as exc:  # noqa: BLE001
-                err_msg = mask_secrets(str(exc), api_key=self.api_key)
+                err_msg = str(exc)
+                for sec in [self.api_key, self.fallback_api_key, *self.router.collect_secrets()]:
+                    err_msg = mask_secrets(err_msg, api_key=sec)
+                err_msg = mask_secrets(err_msg)
                 if len(err_msg) > 140:
                     err_msg = err_msg[:137] + "..."
                 detail_str = err_msg if isinstance(exc, LLMAPIError) else f"{type(exc).__name__}: {err_msg}"
