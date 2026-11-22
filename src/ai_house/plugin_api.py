@@ -364,6 +364,7 @@ class ChannelPlugin(ABC):
     """External messaging channel adapter (`ai_house.channels`)."""
 
     channel_id: str = "custom"
+    idempotent_delivery: bool = False
 
     @abstractmethod
     def start(self, host: Any) -> None:
@@ -374,6 +375,10 @@ class ChannelPlugin(ABC):
 
     def deliver(self, delivery_id: str, payload: Dict[str, Any]) -> Optional[str]:
         """Optional outbox relay hook for proactive roommate messages or nightly notes."""
+        return None
+
+    def lookup_delivery(self, delivery_id: str) -> Optional[str]:
+        """Return external receipt reference if `delivery_id` is already known to the channel."""
         return None
 
 

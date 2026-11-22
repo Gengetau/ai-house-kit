@@ -6,6 +6,7 @@ delivery_id. Receipts are taken by delivery_id even from an older runtime_epoch,
 kept once. In P1a only system template notices exist and every channel is fake.
 """
 import json
+import uuid
 
 from .store import dumps
 
@@ -17,6 +18,40 @@ TEMPLATES = {
 
 class NotSent(Exception):
     """The channel refused before anything left (provably not delivered); safe to try again."""
+
+
+class BlockedDelivery(Exception):
+    """Blocked permanently by the outbound send gate (e.g. leak guard or bot recipient)."""
+
+    def __init__(self, reason="blocked"):
+        self.reason = str(reason or "blocked")
+        super().__init__(self.reason)
+
+
+def enqueue_outbound(store, *, channel, payload, event_id=0, delivery_id=None, db=None):
+    """Write a rich outbound delivery into `outbox` inside the caller's tx or a fresh one."""
+    did = str(delivery_id or "").strip() or f"out-{int(event_id)}-{channel}-{uuid.uuid4().hex[:10]}"
+    now = store.clock.now()
+    row = (
+        did,
+        int(event_id or 0),
+        str(channel),
+        dumps(dict(payload or {})),
+        "pending",
+        now,
+        now,
+        store.epoch or 0,
+    )
+    sql = (
+        "INSERT OR IGNORE INTO outbox(delivery_id,event_id,channel,payload,state,created_at,updated_at,runtime_epoch) "
+        "VALUES(?,?,?,?,?,?,?,?)"
+    )
+    if db is not None:
+        db.execute(sql, row)
+    else:
+        with store.tx() as tx_db:
+            tx_db.execute(sql, row)
+    return did
 
 
 def request_delivery(store, event_id, channel, template, to):
@@ -73,15 +108,20 @@ class Dispatcher:
         with self.s.read() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state='pending' ORDER BY created_at").fetchall()
         for r in rows:
+            ch = self.channels.get(r["channel"])
+            if ch is None:
+                continue
             with self.s.tx() as db:
                 cur = db.execute("UPDATE outbox SET state='sending', attempts=attempts+1, updated_at=? WHERE delivery_id=?"
                                  " AND state='pending'", (self.s.clock.now(), r["delivery_id"]))
                 if not cur.rowcount:
                     continue
-            ch = self.channels[r["channel"]]
+            reason_ref = None
             try:
                 ref = ch.send(r["delivery_id"], json.loads(r["payload"]))
                 state = "sent"
+            except BlockedDelivery as exc:
+                ref, state, reason_ref = None, "blocked", exc.reason[:64]
             except NotSent:
                 ref, state = None, "pending"
             except TimeoutError:
@@ -91,6 +131,8 @@ class Dispatcher:
                            " WHERE delivery_id=?", (state, ref, self.s.clock.now(), r["delivery_id"]))
                 if ref:
                     self._receipt(db, r["delivery_id"], "delivered", ref, self.s.epoch or 0)
+                elif reason_ref:
+                    self._receipt(db, r["delivery_id"], "blocked", reason_ref, self.s.epoch or 0)
             out[r["delivery_id"]] = state
         return out
 
@@ -100,7 +142,9 @@ class Dispatcher:
         with self.s.read() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state IN ('unknown','sending')").fetchall()
         for r in rows:
-            ch = self.channels[r["channel"]]
+            ch = self.channels.get(r["channel"])
+            if ch is None:
+                continue
             ref = ch.lookup(r["delivery_id"])
             with self.s.tx() as db:
                 if ref:

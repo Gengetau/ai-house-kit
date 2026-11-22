@@ -11,12 +11,21 @@
 | **LifeExtension（生活与世界扩展）** | `ai_house.extensions` | 实现 `step() / owns(actor) / hold_until(actor, now) / context(actor, kind) / shops`（可选 `is_door_move`）即可挂载新日常机制，例如内置 `book_nook` 与 `city_mcp_outing`。 |
 | **StudioProvider（换装渲染与记忆）** | `ai_house.providers` | 幂等消费 `wardrobe_render_outbox`（内置 `svg_wardrobe`）或接入 `AI_HOUSE_MEMORY_EMBED_URL` 构建语义向量索引；聊天工具则通过 `AI_HOUSE_TOOLS` 挂载（内置 `sticker_pack`、`dice_tabletop`、`book_nook`）。 |
 
-第三方包只需在自己的 `pyproject.toml` 声明入口点，安装进同一环境即会被 `ai-house plugins` 自动发现：
+第三方包只需在自己的 `pyproject.toml` 声明入口点，安装进同一环境即会被 `ai-house plugins` 自动发现；参考完整示例包 `examples/hello-tea-plugin`：
 
 ```toml
-[project.entry-points."ai_house.extensions"]
-boardgame_night = "my_house_plugin:BoardgameNightExtension"
+[project.entry-points."ai_house.bundles"]
+hello_tea = "hello_tea_plugin:PLUGIN_DEF"
 ```
+
+### 0.2.x → 0.3.0 插件迁移说明
+
+- **推荐统一导出 `PluginDefinition`（`PLUGIN_DEF`）并挂载到 `ai_house.bundles`**（旧四轴独立 Entry Point 仍作发现与降级兼容，但建议迁至单包声明）：
+  - 用 `PluginManifest` + `ConfigField`（最多 8 个字段，标注 `secret=True` 的字段不会回显明文并自动纳入 `ReplyGuard`）声明配置；
+  - `channel_factory` / `extension_factory` / `provider_factory` 按配置按需启用，配置缺失或抛出 `ChannelConfigError` 时隔离记录到 `load_errors`，不阻断宿主启动；
+  - 聊天工具迁移到 `ToolRegistration(..., takes_context=True)` 即可注入 `ToolContext`（`actor / scope / channel / speaker / now / plugin_config / daemon`）；
+  - 可额外声明 `PluginRoute`（挂载 `/api/plugins/<plugin_id>/<subpath>`）与 `PluginTask`（周期任务）；
+  - 实现 `ChannelPlugin.deliver(delivery_id, payload)` 与 `lookup_delivery(delivery_id)` 即可接入 `outbox.Dispatcher` 与 `SendGate`：发前失败抛 `worldkernel.outbox.NotSent`，发送后超时或断线抛 `TimeoutError`（保持 `unknown` 待对账，不盲目重发）。
 
 ## 2. 访问控制
 
