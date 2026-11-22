@@ -28,10 +28,12 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+from ..channel_spool import ChannelSpool, split_bubbles
 from ..chat_identity import Speaker, member_speaker, owner_speaker
 from worldkernel.outbox import NotSent
 from ..plugin_api import ChannelPlugin, ConfigField, PluginDefinition, PluginManifest
@@ -86,6 +88,9 @@ class OneBotConfig:
     reconnect_max_s: float = 30.0
     max_part_chars: int = 400
     max_parts: int = 3
+    debounce_ms: int = 0
+    send_retries: int = 2
+    retry_backoff_s: float = 0.15
 
     @property
     def where(self) -> str:
@@ -146,6 +151,12 @@ class OneBotChannel(ChannelPlugin):
         self._echo = 0
         self._events: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=200)  # group @ messages
         self._owner_events: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=50)  # owner private chat, served first
+        self._owner_backlog: Deque[Dict[str, Any]] = deque()
+        self._group_backlog: Deque[Dict[str, Any]] = deque()
+        self._spool: Optional[ChannelSpool] = None
+        self._inflight_spool_ids: set[int] = set()
+        self._mem_dedup: Dict[str, float] = {}
+        self._dedup_lock = threading.Lock()
         self._last_reply: Dict[str, float] = {}
         self._window: Dict[str, List[float]] = {}
         self._rate_lock = threading.Lock()
@@ -155,7 +166,7 @@ class OneBotChannel(ChannelPlugin):
         self._stats_lock = threading.Lock()
         self.stats: Dict[str, int] = {
             "connects": 0, "received": 0, "replied": 0, "ignored": 0, "rate_limited": 0,
-            "send_failed": 0, "blocked": 0, "dropped": 0, "demo_skipped": 0,
+            "send_failed": 0, "blocked": 0, "dropped": 0, "demo_skipped": 0, "duplicates": 0,
         }
 
     # ---- configuration -------------------------------------------------------------------------------------------
@@ -194,6 +205,11 @@ class OneBotChannel(ChannelPlugin):
             send_timeout_s=_num(eff, "ONEBOT_SEND_TIMEOUT_S", 10.0, 0.05, 120.0),
             reconnect_min_s=_num(eff, "ONEBOT_RECONNECT_MIN_S", 1.0, 0.01, 600.0),
             reconnect_max_s=_num(eff, "ONEBOT_RECONNECT_MAX_S", 30.0, 0.01, 3600.0),
+            max_part_chars=int(_num(eff, "ONEBOT_MAX_PART_CHARS", 400, 40, 2000)),
+            max_parts=int(_num(eff, "ONEBOT_MAX_PARTS", 3, 1, 8)),
+            debounce_ms=int(_num(eff, "ONEBOT_DEBOUNCE_MS", 0, 0, 5000)),
+            send_retries=int(_num(eff, "ONEBOT_SEND_RETRIES", 2, 0, 5)),
+            retry_backoff_s=_num(eff, "ONEBOT_RETRY_BACKOFF_S", 0.15, 0.01, 10.0),
         )
         return cls(cfg)
 
@@ -209,6 +225,10 @@ class OneBotChannel(ChannelPlugin):
         self._host = host
         if getattr(host, "identity_store", None) is not None:
             host.identity_store.sync_onebot_owners(self.cfg.owners)
+        rt_dir = getattr(host, "runtime_dir", None)
+        if rt_dir is not None:
+            self._spool = ChannelSpool(rt_dir)
+            self._enqueue_recovered(only_ready=False)
         roster = list(host.vocab.ROSTER)
         if not self.actor:
             self.actor = roster[0]
@@ -234,10 +254,55 @@ class OneBotChannel(ChannelPlugin):
         self._fail_pending()
         for t in self._threads:
             t.join(timeout=3.0)
+        if self._spool is not None:
+            self._spool.close()
 
     def _bump(self, key: str) -> None:
         with self._stats_lock:
             self.stats[key] += 1
+
+    def _enqueue_recovered(self, *, only_ready: bool) -> None:
+        if self._spool is None:
+            return
+        rows = self._spool.recover_unfinished("onebot_v11", stale_s=self.cfg.stale_s, only_ready=only_ready)
+        for row in rows:
+            sid = int(row["spool_id"])
+            with self._dedup_lock:
+                if sid in self._inflight_spool_ids:
+                    continue
+                self._inflight_spool_ids.add(sid)
+            if row["state"] == "reply_ready":
+                ev: Dict[str, Any] = {
+                    "_resume_plan": row["plan"],
+                    "_sent_parts": row["sent_parts"],
+                    "_spool_ids": [sid],
+                    "message_type": row["kind"],
+                    "user_id": row["uid"],
+                }
+            else:
+                ev = dict(row["raw_event"])
+                ev["_spool_id"] = sid
+            q = self._owner_events if row["kind"] == "private" else self._events
+            try:
+                q.put_nowait(ev)
+            except queue.Full:
+                with self._dedup_lock:
+                    self._inflight_spool_ids.discard(sid)
+
+    def _check_standalone_dedup(self, mid: str) -> bool:
+        if not mid:
+            return False
+        now = time.monotonic()
+        with self._dedup_lock:
+            cutoff = now - 3600.0
+            for k in [k for k, t in self._mem_dedup.items() if t < cutoff]:
+                self._mem_dedup.pop(k, None)
+            if mid in self._mem_dedup:
+                return True
+            if len(self._mem_dedup) > 512:
+                self._mem_dedup.clear()
+            self._mem_dedup[mid] = now
+            return False
 
     # ---- connection (reader thread) ------------------------------------------------------------------------------
     def _run(self) -> None:
@@ -256,6 +321,7 @@ class OneBotChannel(ChannelPlugin):
                     started = time.monotonic()
                     self._bump("connects")
                     self._log("connected")
+                    self._enqueue_recovered(only_ready=True)
                     try:
                         if not self._stop.is_set():
                             self._read(ws)
@@ -300,13 +366,47 @@ class OneBotChannel(ChannelPlugin):
                 self.self_id = sid
             if data.get("post_type") == "message":
                 # Cheap filters run here so unrelated chatter can never push the owner's message out of the queue.
-                why, _ = self._classify(data)
+                why, info = self._classify(data)
                 if why:
                     self._bump("ignored")
                     continue
+                mid = str(data.get("message_id") or "").strip()
+                target_q = self._owner_events if data.get("message_type") == "private" else self._events
+                if target_q.full():
+                    self._bump("dropped")
+                    continue
+                ev_item = dict(data)
+                if self._spool is not None:
+                    kind = info["kind"]
+                    tgt = info["gid"] if kind == "group" else info["uid"]
+                    spool_id = self._spool.enqueue_event(
+                        "onebot_v11",
+                        data,
+                        message_id=mid,
+                        session_key=f"{kind}:{tgt}",
+                        kind=kind,
+                        target=tgt,
+                        uid=info["uid"],
+                        nick=info["nick"],
+                        actor=self.actor,
+                    )
+                    if spool_id is None:
+                        self._bump("duplicates")
+                        continue
+                    with self._dedup_lock:
+                        self._inflight_spool_ids.add(spool_id)
+                    ev_item["_spool_id"] = spool_id
+                elif mid and self._check_standalone_dedup(mid):
+                    self._bump("duplicates")
+                    continue
                 try:
-                    (self._owner_events if data.get("message_type") == "private" else self._events).put_nowait(data)
+                    target_q.put_nowait(ev_item)
                 except queue.Full:
+                    if self._spool is not None and ev_item.get("_spool_id"):
+                        sp_id = int(ev_item["_spool_id"])
+                        self._spool.ack([sp_id], state="dropped")
+                        with self._dedup_lock:
+                            self._inflight_spool_ids.discard(sp_id)
                     self._bump("dropped")
 
     def _fail_pending(self) -> None:
@@ -317,17 +417,114 @@ class OneBotChannel(ChannelPlugin):
                 fut.set_exception(ConnectionError("disconnected"))
 
     # ---- handling (worker thread) --------------------------------------------------------------------------------
+    def _pop_next_event(self) -> Optional[Tuple[Dict[str, Any], bool]]:
+        if self._owner_backlog:
+            return self._owner_backlog.popleft(), True
+        try:
+            return self._owner_events.get_nowait(), True
+        except queue.Empty:
+            pass
+        if self._group_backlog:
+            return self._group_backlog.popleft(), False
+        try:
+            return self._events.get(timeout=0.2), False
+        except queue.Empty:
+            return None
+
+    def _resume_ready_event(self, ev: Mapping[str, Any]) -> None:
+        spool_ids = [int(x) for x in (ev.get("_spool_ids") or ()) if x]
+        plan = ev.get("_resume_plan") or {}
+        bubbles = [str(x) for x in (plan.get("bubbles") or ()) if str(x).strip()]
+        start_idx = max(0, int(ev.get("_sent_parts") or 0))
+        kind = str(plan.get("kind") or ev.get("message_type") or "private")
+        target = str(plan.get("target") or ev.get("user_id") or "")
+        at_uid = str(plan.get("at") or "") or None
+        try:
+            if not bubbles or start_idx >= len(bubbles) or not target:
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="done")
+                return
+            sent_any = self._send_bubbles(
+                kind,
+                target,
+                bubbles,
+                at=at_uid,
+                start_idx=start_idx,
+                spool_ids=spool_ids,
+                save_plan=False,
+            )
+            if sent_any:
+                self._bump("replied")
+        finally:
+            if spool_ids:
+                with self._dedup_lock:
+                    for sp_id in spool_ids:
+                        self._inflight_spool_ids.discard(sp_id)
+
+    def _collect_debounced_batch(
+        self,
+        first_ev: Dict[str, Any],
+        is_owner_q: bool,
+    ) -> List[Dict[str, Any]]:
+        batch = [first_ev]
+        if self.cfg.debounce_ms <= 0:
+            return batch
+        src_q = self._owner_events if is_owner_q else self._events
+        dst_backlog = self._owner_backlog if is_owner_q else self._group_backlog
+        session_sig = (first_ev.get("message_type"), _id(first_ev.get("user_id")), _id(first_ev.get("group_id")))
+        deadline = time.monotonic() + (self.cfg.debounce_ms / 1000.0)
+        while not self._stop.is_set() and len(batch) < 10:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            try:
+                nxt = src_q.get(timeout=min(0.05, rem))
+            except queue.Empty:
+                continue
+            if "_resume_plan" in nxt:
+                dst_backlog.append(nxt)
+                continue
+            nxt_sig = (nxt.get("message_type"), _id(nxt.get("user_id")), _id(nxt.get("group_id")))
+            if nxt_sig == session_sig:
+                batch.append(nxt)
+            else:
+                dst_backlog.append(nxt)
+        return batch
+
+    def _handle_batch(self, batch: Sequence[Dict[str, Any]]) -> str:
+        if len(batch) == 1:
+            return self.handle_event(batch[0])
+        texts: List[str] = []
+        spool_ids: List[int] = []
+        last_ev = dict(batch[-1])
+        for item in batch:
+            if item.get("_spool_id"):
+                spool_ids.append(int(item["_spool_id"]))
+            why, info = self._classify(item)
+            if not why and info.get("text"):
+                texts.append(str(info["text"]))
+        merged = dict(last_ev)
+        merged["_spool_ids"] = spool_ids
+        if texts:
+            merged["message"] = [{"type": "text", "data": {"text": "\n".join(texts)}}]
+            if merged.get("message_type") == "group":
+                sid = _id(merged.get("self_id")) or self.self_id
+                if sid:
+                    merged["message"] = [{"type": "at", "data": {"qq": sid}}, {"type": "text", "data": {"text": " " + "\n".join(texts)}}]
+        return self.handle_event(merged)
+
     def _work(self) -> None:
         while not self._stop.is_set():
+            pulled = self._pop_next_event()
+            if pulled is None:
+                continue
+            ev, is_owner_q = pulled
             try:
-                ev = self._owner_events.get_nowait()
-            except queue.Empty:
-                try:
-                    ev = self._events.get(timeout=0.2)
-                except queue.Empty:
+                if "_resume_plan" in ev:
+                    self._resume_ready_event(ev)
                     continue
-            try:
-                self.handle_event(ev)
+                batch = self._collect_debounced_batch(ev, is_owner_q)
+                self._handle_batch(batch)
             except Exception as exc:  # never log message text
                 self._log(f"event failed: {type(exc).__name__}")
 
@@ -384,81 +581,168 @@ class OneBotChannel(ChannelPlugin):
 
     def handle_event(self, ev: Mapping[str, Any]) -> str:
         """Decide what to do with one message event; returns a short outcome label (used by tests and stats)."""
-        why, info = self._classify(ev)
-        if why:
-            return self._ignore(why)
-        self._bump("received")
-        stamp = ev.get("time")
-        if self.cfg.stale_s > 0 and isinstance(stamp, (int, float)) and time.time() - stamp > self.cfg.stale_s:
-            return self._ignore("stale")  # backlog from before a reconnect or a slow model: do not answer late
-        uid, kind, text, nick = info["uid"], info["kind"], info["text"], info["nick"]
-        id_store = getattr(self._host, "identity_store", None)
-        is_cfg_owner = uid in self.cfg.owners
-        if id_store is not None:
-            speaker = id_store.resolve_speaker(
-                "onebot",
-                uid,
-                fallback_name=nick or ("房主" if is_cfg_owner else ""),
-                default_owner=is_cfg_owner,
-            )
-        else:
-            speaker = owner_speaker(nick or "房主", uid) if (kind == "private" or is_cfg_owner) else member_speaker(nick, uid)
-        if speaker.is_bot:
-            return self._ignore("bot_speaker")
-        if kind == "private":
-            channel, key, target, actor = f"private:{self.actor}", f"private:{uid}", uid, None
-        else:
-            gid = info["gid"]
-            # the owner has their own budget in a group, so members cannot use it up
-            channel, key, target, actor = f"qq-group:{gid}", f"group:{gid}:{'owner' if speaker.is_owner else 'member'}", gid, self.actor
+        spool_ids: List[int] = [int(x) for x in (ev.get("_spool_ids") or ()) if x]
+        if not spool_ids and ev.get("_spool_id"):
+            spool_ids = [int(ev["_spool_id"])]
+        try:
+            why, info = self._classify(ev)
+            if why:
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped")
+                return self._ignore(why)
+            if not spool_ids:
+                mid = str(ev.get("message_id") or "").strip()
+                if mid:
+                    is_dup = (
+                        self._spool.check_and_mark_dedup("onebot_v11", mid)
+                        if self._spool is not None
+                        else self._check_standalone_dedup(mid)
+                    )
+                    if is_dup:
+                        self._bump("duplicates")
+                        return self._ignore("duplicate")
+            self._bump("received")
+            stamp = ev.get("time")
+            if self.cfg.stale_s > 0 and isinstance(stamp, (int, float)) and time.time() - stamp > self.cfg.stale_s:
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="expired")
+                return self._ignore("stale")  # backlog from before a reconnect or a slow model: do not answer late
+            uid, kind, text, nick = info["uid"], info["kind"], info["text"], info["nick"]
+            id_store = getattr(self._host, "identity_store", None)
+            is_cfg_owner = uid in self.cfg.owners
+            if id_store is not None:
+                speaker = id_store.resolve_speaker(
+                    "onebot",
+                    uid,
+                    fallback_name=nick or ("房主" if is_cfg_owner else ""),
+                    default_owner=is_cfg_owner,
+                )
+            else:
+                speaker = owner_speaker(nick or "房主", uid) if (kind == "private" or is_cfg_owner) else member_speaker(nick, uid)
+            if speaker.is_bot:
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped")
+                return self._ignore("bot_speaker")
+            if kind == "private":
+                channel, key, target, actor = f"private:{self.actor}", f"private:{uid}", uid, None
+            else:
+                gid = info["gid"]
+                # the owner has their own budget in a group, so members cannot use it up
+                channel, key, target, actor = f"qq-group:{gid}", f"group:{gid}:{'owner' if speaker.is_owner else 'member'}", gid, self.actor
+                if not text:
+                    text = "（只@了你一下，没说别的）"
             if not text:
-                text = "（只@了你一下，没说别的）"
-        if not text:
-            return self._ignore("empty")
-        why = self._rate_ok(key, owner_dm=(kind == "private"))
-        if why:
-            self._bump("rate_limited")
-            return f"ignored:{why}"
-        res = self._host.converse(channel, text, speaker, actor=actor)
-        sent = 0
-        for rep in res.get("replies") or ():
-            if rep.get("mode") == "blocked":
-                self._bump("blocked")
-                continue
-            if rep.get("mode") == "demo":
-                self._bump("demo_skipped")  # a canned stand-in line (and maybe an exception name) is not for QQ
-                continue
-            if rep.get("mode") == "sleeping" or not str(rep.get("text") or "").strip():
-                continue  # asleep: stay quiet on QQ
-            if self._send(kind, target, str(rep["text"]), at=uid if kind == "group" else None):
-                sent += 1
-        if sent:
-            self._bump("replied")
-        return "replied" if sent else "no_reply"
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped")
+                return self._ignore("empty")
+            why = self._rate_ok(key, owner_dm=(kind == "private"))
+            if why:
+                self._bump("rate_limited")
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped")
+                return f"ignored:{why}"
+            if self._spool is not None and spool_ids:
+                self._spool.mark_processing(spool_ids)
+            res = self._host.converse(channel, text, speaker, actor=actor)
+            sent = 0
+            send_groups: List[List[str]] = []
+            for rep in res.get("replies") or ():
+                if rep.get("mode") == "blocked":
+                    self._bump("blocked")
+                    continue
+                if rep.get("mode") == "demo":
+                    self._bump("demo_skipped")  # a canned stand-in line (and maybe an exception name) is not for QQ
+                    continue
+                if rep.get("mode") == "sleeping" or not str(rep.get("text") or "").strip():
+                    continue  # asleep: stay quiet on QQ
+                parts = self._split(str(rep["text"]))
+                if parts:
+                    send_groups.append(parts)
+            if not send_groups:
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped")
+                return "no_reply"
+            at_uid = uid if kind == "group" else None
+            for idx, parts in enumerate(send_groups):
+                attach_ids = spool_ids if idx == len(send_groups) - 1 else ()
+                if self._send_bubbles(kind, target, parts, at=at_uid, spool_ids=attach_ids):
+                    sent += 1
+            if sent:
+                self._bump("replied")
+            return "replied" if sent else "no_reply"
+        finally:
+            if spool_ids:
+                with self._dedup_lock:
+                    for sp_id in spool_ids:
+                        self._inflight_spool_ids.discard(sp_id)
 
     # ---- sending -------------------------------------------------------------------------------------------------
     def _split(self, text: str) -> List[str]:
-        n = self.cfg.max_part_chars
-        t = text.strip()
-        return [t[i : i + n] for i in range(0, len(t), n)][: self.cfg.max_parts]
+        return split_bubbles(text, max_part_chars=self.cfg.max_part_chars, max_parts=self.cfg.max_parts)
 
-    def _send(self, kind: str, target: str, text: str, at: Optional[str] = None) -> bool:
-        """True if at least one part went out (a later part failing still leaves the first one delivered)."""
-        sent_any = False
-        for i, part in enumerate(self._split(text)):
+    def _send_bubbles(
+        self,
+        kind: str,
+        target: str,
+        bubbles: Sequence[str],
+        *,
+        at: Optional[str] = None,
+        start_idx: int = 0,
+        spool_ids: Sequence[int] = (),
+        save_plan: bool = True,
+    ) -> bool:
+        """Deliver bubble chunks, retrying only pre-wire `not_connected` failures cleanly."""
+        parts = [str(p).strip() for p in bubbles if str(p).strip()]
+        if not parts:
+            if self._spool is not None and spool_ids:
+                self._spool.ack(spool_ids, state="done")
+            return False
+        if save_plan and self._spool is not None and spool_ids:
+            self._spool.save_reply_plan(spool_ids, parts, target=target, kind=kind, at=at or "")
+
+        sent_any = start_idx > 0
+        for i in range(start_idx, len(parts)):
+            part = parts[i]
             segs: List[Dict[str, Any]] = [{"type": "text", "data": {"text": part}}]
             if at and i == 0:
                 segs = [{"type": "at", "data": {"qq": at}}, {"type": "text", "data": {"text": " " + part}}]
-            if kind == "group":
-                ok, code = self._call("send_group_msg", {"group_id": int(target), "message": segs})
-            else:
-                ok, code = self._call("send_private_msg", {"user_id": int(target), "message": segs})
+            action = "send_group_msg" if kind == "group" else "send_private_msg"
+            params = {("group_id" if kind == "group" else "user_id"): int(target), "message": segs}
+
+            ok = False
+            code = "not_connected"
+            left_wire = False
+            max_attempts = 1 + (self.cfg.send_retries if not self._stop.is_set() else 0)
+            for attempt in range(max_attempts):
+                ok, code, _, left_wire = self._call_detailed(action, params)
+                if ok:
+                    break
+                # Retry ONLY when nothing touched the wire yet (`not_connected`); never retry post-wire/retcode errors.
+                if left_wire or code != "not_connected" or attempt + 1 >= max_attempts or self._stop.is_set():
+                    break
+                self._stop.wait(self.cfg.retry_backoff_s * (attempt + 1))
+
             if not ok:
+                if code == "not_connected" and self._spool is not None and spool_ids:
+                    # Leave `reply_ready` pending in spool so `_enqueue_recovered` resumes once WS reconnects.
+                    return sent_any
                 self._bump("send_failed")
                 self._log(f"send failed ({code}); dropped, not retried")
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="failed_wire")
                 return sent_any
+
             sent_any = True
+            if self._spool is not None and spool_ids:
+                self._spool.record_part_sent(spool_ids, i + 1)
+
+        if self._spool is not None and spool_ids:
+            self._spool.ack(spool_ids, state="done")
         return sent_any
+
+    def _send(self, kind: str, target: str, text: str, at: Optional[str] = None) -> bool:
+        """True if at least one part went out (a later part failing still leaves the first one delivered)."""
+        return self._send_bubbles(kind, target, self._split(text), at=at)
 
     def _call_detailed(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, str, bool]:
         with self._ws_lock:
@@ -545,6 +829,8 @@ class OneBotChannel(ChannelPlugin):
             "actor": "ONEBOT_ACTOR",
             "groups": "ONEBOT_GROUPS",
             "max_per_hour": "ONEBOT_MAX_PER_HOUR",
+            "debounce_ms": "ONEBOT_DEBOUNCE_MS",
+            "max_parts": "ONEBOT_MAX_PARTS",
         }
         for key, env_name in mapping.items():
             if key in cfg_values and cfg_values[key] not in (None, ""):
@@ -619,6 +905,26 @@ PLUGIN_DEF = PluginDefinition(
                 max_val=3600,
                 env_var="ONEBOT_MAX_PER_HOUR",
                 description="每个私聊/群会话每小时最多回复条数（1–3600）。",
+            ),
+            ConfigField(
+                key="debounce_ms",
+                label="连发防抖窗口（毫秒）",
+                field_type="int",
+                default=0,
+                min_val=0,
+                max_val=5000,
+                env_var="ONEBOT_DEBOUNCE_MS",
+                description="短时间同一会话连续多条输入合并等待窗口（0 表示不合并）。",
+            ),
+            ConfigField(
+                key="max_parts",
+                label="单次最大分条气泡数",
+                field_type="int",
+                default=3,
+                min_val=1,
+                max_val=8,
+                env_var="ONEBOT_MAX_PARTS",
+                description="长回复按自然段落/句号拆分时的最大气泡数量（1–8）。",
             ),
         ),
     ),
