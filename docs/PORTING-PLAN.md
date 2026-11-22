@@ -214,7 +214,7 @@
 
 | 项 | 入口 |
 |---|---|
-| 快进后不睡觉 | `world-kernel/worldkernel/life.py:82` 在构造时保存了时钟；`src/ai_house/daemon.py:335-339` 的 `fast_forward` 只替换了三处引用。修的时候顺带检查还有谁持有旧时钟（记忆存储未核实），以及快进后重启时钟回退的问题 |
+| 快进后不睡觉 | `world-kernel/worldkernel/life.py:82` 在构造时保存了时钟；`src/ai_house/daemon.py:335-339` 的 `fast_forward` 只替换了三处引用（已核实 `MemoryStore._clock` 在构造时同样持有了旧时钟引用）。改用动态 `Life.clock` 属性并持久化快进时钟偏移 `clock_offset.json` |
 | 采购约定不履行 | `world-kernel/worldkernel/intents_lite.py` 的 `enqueue_chat`：规则兜底只在模型没有返回任何意图时才运行。模型返回了意图但食材缺失或不在词表内时，也应该走兜底 |
 | GPT-5 系列连不上 | `src/ai_house/chat_agent.py:30-101` 写死了 `max_tokens`；错误响应体在 `chat_agent.py:388`、`daemon.py:1113` 被丢弃。阶段 0 只做最小修复，完整的模型层抽象留给 1.4 |
 | 令牌、端口、健康检查 | 见试装报告“需要 agent 绕路的问题”一节 |
@@ -236,7 +236,7 @@
 
 | 阶段 | 状态 | 备注 |
 |---|---|---|
-| 0 修基线 | 未开始 | |
+| 0 修基线 | 进行中 | 0.1 快进时钟同步与跨重启保持已完成 |
 | 1 底座 | 未开始 | |
 | 2 纯逻辑能力 | 未开始 | |
 | 3 可选服务插件 | 未开始 | |
