@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from ..chat_identity import Speaker, member_speaker, owner_speaker
+from worldkernel.outbox import NotSent
 from ..plugin_api import ChannelPlugin, ConfigField, PluginDefinition, PluginManifest
 
 
@@ -149,6 +150,8 @@ class OneBotChannel(ChannelPlugin):
         self._window: Dict[str, List[float]] = {}
         self._rate_lock = threading.Lock()
         self._threads: List[threading.Thread] = []
+        self._delivered_refs: Dict[str, str] = {}
+        self._ref_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self.stats: Dict[str, int] = {
             "connects": 0, "received": 0, "replied": 0, "ignored": 0, "rate_limited": 0,
@@ -457,31 +460,76 @@ class OneBotChannel(ChannelPlugin):
             sent_any = True
         return sent_any
 
-    def _call(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str]:
+    def _call_detailed(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, str, bool]:
         with self._ws_lock:
             ws = self._ws
         if ws is None:
-            return False, "not_connected"
+            return False, "not_connected", "", False
         with self._pending_lock:
             self._echo += 1
             echo = f"ah{self._echo}"
             fut: "concurrent.futures.Future[Dict[str, Any]]" = concurrent.futures.Future()
             self._pending[echo] = fut
+        left_wire = False
         try:
             ws.send(json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False))
+            left_wire = True
             resp = fut.result(timeout=self.cfg.send_timeout_s)
         except concurrent.futures.TimeoutError:
-            return False, "timeout"
+            return False, "timeout", "", True
         except ConnectionError:
-            return False, "disconnected"
+            return False, "disconnected", "", left_wire
         except Exception:
-            return False, "send_error"
+            return False, "send_error", "", left_wire
         finally:
             with self._pending_lock:
                 self._pending.pop(echo, None)
         if resp.get("status") == "ok" or resp.get("retcode") == 0:
-            return True, "ok"
-        return False, f"retcode_{resp.get('retcode')}"
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            msg_id = str(data.get("message_id") or "")
+            return True, "ok", (msg_id or f"ob-{echo}"), True
+        return False, f"retcode_{resp.get('retcode')}", "", False
+
+    def _call(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str]:
+        ok, code, _, _ = self._call_detailed(action, params)
+        return ok, code
+
+    def lookup_delivery(self, delivery_id: str) -> Optional[str]:
+        with self._ref_lock:
+            return self._delivered_refs.get(delivery_id)
+
+    def deliver(self, delivery_id: str, payload: Dict[str, Any]) -> Optional[str]:
+        """Deliver an outbox message via OneBot v11 WebSocket with unknown-vs-not-sent semantics."""
+        existing = self.lookup_delivery(delivery_id)
+        if existing:
+            return existing
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise ValueError("empty outbox text")
+        kind = str(payload.get("kind") or ("group" if payload.get("group_id") else "private")).strip().lower()
+        target = str(payload.get("target") or payload.get("group_id") or payload.get("user_id") or "").strip()
+        if not target or not target.isdigit():
+            raise NotSent("invalid_target")
+        at_qq = str(payload.get("at") or "").strip() or None
+        last_ref = ""
+        sent_any = False
+        for i, part in enumerate(self._split(text)):
+            segs: List[Dict[str, Any]] = [{"type": "text", "data": {"text": part}}]
+            if at_qq and i == 0 and kind == "group":
+                segs = [{"type": "at", "data": {"qq": at_qq}}, {"type": "text", "data": {"text": " " + part}}]
+            action = "send_group_msg" if kind == "group" else "send_private_msg"
+            param_key = "group_id" if kind == "group" else "user_id"
+            ok, code, ext_ref, left_wire = self._call_detailed(action, {param_key: int(target), "message": segs})
+            if not ok:
+                self._bump("send_failed")
+                if not sent_any and not left_wire:
+                    raise NotSent(code)
+                raise TimeoutError(code)
+            sent_any = True
+            last_ref = ext_ref
+        with self._ref_lock:
+            self._delivered_refs[delivery_id] = last_ref
+        return last_ref
 
     @classmethod
     def from_config(

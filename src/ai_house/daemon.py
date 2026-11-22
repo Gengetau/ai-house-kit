@@ -27,6 +27,7 @@ from worldkernel import avatar, inventory, legacy, statuscard, vocab_life1, ward
 from authority import Authority
 from worldkernel.intents_lite import IntentsLite
 from worldkernel.life_model import FakeLifeModel, LiveLifeModel
+from worldkernel.outbox import Dispatcher, enqueue_outbound as _kernel_enqueue_outbound
 from worldkernel.store import VirtualClock, WallClock
 
 from . import __version__
@@ -39,6 +40,7 @@ from .diary import DiaryService, due_diary_day
 from .identity import IdentityStore
 from .llm import ModelRouter
 from .memory import MemoryStore
+from .send_gate import SendGate
 from .onboarding import (
     ACCENT_OPTIONS,
     COOK_PRESETS,
@@ -169,6 +171,7 @@ class HouseDaemon:
         self.settings_store = SettingsStore(self.runtime_dir)
         self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
         self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
+        self.send_gate = SendGate(self)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
         self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env)
         stored_plugins = self.settings_store.get_plugins_map()
@@ -454,6 +457,10 @@ class HouseDaemon:
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
             self._run_plugin_tasks(now)
+            try:
+                self.flush_outbox()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"outbox flush error: {type(exc).__name__}: {exc}")
 
     def _run_plugin_tasks(self, now: float) -> None:
         stored_plugins = self.settings_store.get_plugins_map()
@@ -777,6 +784,119 @@ class HouseDaemon:
             )
             return {"ok": True, "removed": removed, "identities": self.identity_store.list_identities()}
         raise ValueError(f"不支持的身份操作：{op or '(空)'}")
+
+    def _deliver_webchat_outbox(self, delivery_id: str, payload: Mapping[str, Any]) -> str:
+        text = str(payload.get("text") or "").strip()
+        actor = str(payload.get("actor") or "").strip()
+        kind = str(payload.get("kind") or ("group" if not actor else "private")).strip().lower()
+        target_ch = str(
+            payload.get("target_channel")
+            or ("group" if kind == "group" or not actor else f"private:{actor}")
+        ).strip()
+        with self._lock:
+            self._require_world()
+            now = self.clock.now()
+            sender = actor if actor in self.vocab.ROSTER else self.vocab.ROSTER[0]
+            sender_name = self.vocab.NAMES.get(sender, sender)
+            with contextlib.closing(sqlite3.connect(self.world_db)) as c:
+                with c:
+                    c.execute(
+                        "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, '主动', 'outbox', ?)",
+                        (target_ch, sender, sender_name, str(payload.get("to_identity") or "owner"), text, now),
+                    )
+            if self.memory is not None and sender in self.vocab.ROSTER:
+                sc = "private" if target_ch.startswith("private:") else "group"
+                mem_ch = "" if sc == "private" else target_ch
+                self.memory.observe(sender, sc, "", channel=mem_ch, reply=text, now=now)
+        self._broadcast("chat", {"channel": "group" if target_ch == "group" else "private", "replies": 1, "delivery_id": delivery_id})
+        return f"web-{delivery_id}"
+
+    def enqueue_outbound(
+        self,
+        *,
+        channel: str,
+        payload: Mapping[str, Any],
+        event_id: int = 0,
+        delivery_id: Optional[str] = None,
+    ) -> str:
+        with self._lock:
+            self._require_world()
+            return _kernel_enqueue_outbound(
+                self.authority.store,
+                channel=str(channel or "webchat"),
+                payload=dict(payload or {}),
+                event_id=int(event_id or 0),
+                delivery_id=delivery_id,
+            )
+
+    def flush_outbox(self, *, reconcile: bool = True) -> Dict[str, Any]:
+        if self.needs_onboarding or self.authority is None:
+            return {"ok": True, "dispatched": {}, "reconciled": {}, "stats": self.send_gate.stats_view()}
+
+        class _LockedStoreProxy:
+            def __init__(self, lock: threading.RLock, store: Any) -> None:
+                self._lock = lock
+                self._store = store
+
+            @property
+            def clock(self) -> Any:
+                return self._store.clock
+
+            @property
+            def epoch(self) -> Any:
+                return self._store.epoch
+
+            @contextlib.contextmanager
+            def read(self):
+                with self._lock:
+                    with self._store.read() as db:
+                        yield db
+
+            @contextlib.contextmanager
+            def tx(self, control: bool = False):
+                with self._lock:
+                    with self._store.tx(control=control) as db:
+                        yield db
+
+        disp = Dispatcher(_LockedStoreProxy(self._lock, self.authority.store), self.send_gate.channel_map())
+        dispatched = disp.run_once()
+        reconciled = disp.reconcile() if reconcile else {}
+        return {
+            "ok": True,
+            "dispatched": dispatched,
+            "reconciled": reconciled,
+            "stats": self.send_gate.stats_view(),
+        }
+
+    def get_outbox_view(self, *, limit: int = 50) -> Dict[str, Any]:
+        clean_lim = max(1, min(int(limit or 50), 200))
+        if self.needs_onboarding or self.authority is None:
+            return {"ok": True, "items": [], "receipts": [], "stats": self.send_gate.stats_view()}
+        with self._lock, self.authority.store.read() as db:
+            rows = db.execute(
+                "SELECT delivery_id, event_id, channel, payload, state, attempts, external_ref, created_at, updated_at "
+                "FROM outbox ORDER BY created_at DESC LIMIT ?",
+                (clean_lim,),
+            ).fetchall()
+            rcps = db.execute(
+                "SELECT receipt_id, delivery_id, status, external_ref, received_at FROM receipts "
+                "ORDER BY received_at DESC LIMIT ?",
+                (clean_lim,),
+            ).fetchall()
+        items = []
+        for r in rows:
+            try:
+                p = json.loads(r["payload"] or "{}")
+            except ValueError:
+                p = {}
+            items.append({**dict(r), "payload": p})
+        return {
+            "ok": True,
+            "items": items,
+            "receipts": [dict(x) for x in rcps],
+            "stats": self.send_gate.stats_view(),
+        }
 
     def converse(
         self,
@@ -1678,6 +1798,8 @@ class HouseDaemon:
             if hasattr(self.clock, "reset"):
                 self.clock.reset()
             self._plugin_task_last_run.clear()
+            if getattr(self, "send_gate", None) is not None:
+                self.send_gate.reset()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():
@@ -1736,7 +1858,7 @@ class HouseDaemon:
                 "result": {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "ai-house-kit", "version": "0.2.0"},
+                    "serverInfo": {"name": "ai-house-kit", "version": __version__},
                 },
             }
         if method == "notifications/initialized":
@@ -1994,6 +2116,16 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 self._send_json(daemon.list_identities())
                 return
+            if parsed.path == "/api/outbox":
+                if not self._need(parsed, "owner"):
+                    return
+                qs = parse_qs(parsed.query)
+                try:
+                    lim = int((qs.get("limit") or ["50"])[0])
+                except (TypeError, ValueError):
+                    lim = 50
+                self._send_json(daemon.get_outbox_view(limit=lim))
+                return
             if parsed.path == "/api/usage":
                 if not self._need(parsed, "read"):
                     return
@@ -2175,6 +2307,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 "/api/settings/llm",
                 "/api/settings/plugins",
                 "/api/identities",
+                "/api/outbox/flush",
                 "/api/residents",
                 "/api/residents/update",
                 "/api/setup/reset",
@@ -2217,6 +2350,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 if parsed.path == "/api/identities":
                     self._send_json(daemon.mutate_identity(body if isinstance(body, dict) else {}))
+                    return
+                if parsed.path == "/api/outbox/flush":
+                    self._send_json(daemon.flush_outbox())
                     return
                 if parsed.path == "/api/residents":
                     self._send_json(daemon.add_resident(body if isinstance(body, dict) else {}))

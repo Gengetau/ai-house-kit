@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- **插件底座 1.1–1.3（清单、通用设置页、钩子与失败隔离）**：
+  - 升级 `ai_house.plugin_api`：新增 `PluginManifest`、`ConfigField`、`PluginDefinition`、`PluginLoadErrorRecord`、`ToolRegistration`（支持 `ToolContext`）、`PluginRoute`（`/api/plugins/<plugin_id>/<subpath>`）与 `PluginTask`（周期任务钩子）；统一按插件生效与失败隔离，不因单个插件配置或导入失败拖垮宿主，并新增 `ai-house plugins` 清单与报错输出。
+  - 新增 `SettingsStore`（原子写入 `plugin_settings.json`、`0o600` 密钥存储及脱敏回显）、`GET/POST /api/settings/plugins` 热重载接口，以及网页端动态 `#/settings` 插件设置页；提供独立第三方示例插件包 `examples/hello-tea-plugin`。
+- **模型路由与用量账本 1.4（`ModelRouter`）**：
+  - 新增 `src/ai_house/llm.py`：统一 OpenAI 兼容请求构造、GPT-5 / 推理模型参数自适配与能力缓存、`408/429/5xx` 重试与备用通道切换；支持按任务类型（`chat / life / memory_extract / diary / ping`）与按住客模型路由；记录 SQLite `usage.db` 并开放 `GET /api/usage`。
+- **渠道解耦身份层 1.5（`IdentityStore`）**：
+  - 新增 `src/ai_house/identity.py`：以内部身份（`owner / resident / visitor / bot`）为中心映射网页端与 OneBot 等多渠道外部账号；`seen` 表迁移 `speaker_id`；`converse`、`memory` 与 `onebot_v11` 自动跳过其他 bot 发言。
+- **出站通道桥与统一发送门 1.6（`SendGate` + `outbox`）**：
+  - 打通 `worldkernel.outbox`（新增 `enqueue_outbound` 与 `BlockedDelivery`）、`ChannelPlugin.deliver` / `lookup_delivery`、`OneBotChannel` 真发/断线 defer 与超时对账语义；新增 `SendGate` 统一执行敏感词与私聊防泄漏拦截、bot 拒发、JST 静默时段及小时/日频率上限，并开放 `GET /api/outbox` 与 `POST /api/outbox/flush`。
+
 ## 0.2.0
 
 - **暖灯像素控制台（Warm Lamp Console）与首位 AI 住客向导**：

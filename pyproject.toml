@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-house-kit"
-version = "0.2.0"
+version = "0.3.0"
 description = "Turnkey AI roommate sharehouse engine & studio with 4-axis plugin SDK and Qingkong City linkage"
 readme = "README.md"
 license = "Apache-2.0"
