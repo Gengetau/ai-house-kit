@@ -25,7 +25,6 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from worldkernel import avatar, inventory, legacy, statuscard, vocab_life1, wardrobeview
 from authority import Authority
-from worldkernel.intents_lite import IntentsLite
 from worldkernel.life_model import FakeLifeModel, LiveLifeModel
 from worldkernel.outbox import Dispatcher, enqueue_outbound as _kernel_enqueue_outbound
 from worldkernel.store import VirtualClock, WallClock
@@ -39,6 +38,7 @@ from .chat_identity import Speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
+from .intents import CommitmentStore
 from .llm import ModelRouter
 from .memory import MemoryStore
 from .proactive import ProactiveEngine
@@ -331,7 +331,7 @@ class HouseDaemon:
                                 (aid, f"life1:people/{aid}", self.vocab.bed(aid), body_json, now, now),
                             )
 
-        self.intents = IntentsLite(self.world_db, vocab=self.vocab)
+        self.intents = CommitmentStore(self.world_db, vocab=self.vocab)
         self.intents.init()
         self._rebuild_llm_and_guard()
         if getattr(self, "identity_store", None) is not None:
@@ -1169,6 +1169,9 @@ class HouseDaemon:
                         where=where,
                         intents=rep.get("tool_intents") or None,
                         now=now,
+                        speaker_role=speaker_role,
+                        proposer_id=speaker.identity_id or "user:owner",
+                        party=list(targets),
                     )
                 self.memory.observe(
                     aid,
@@ -2306,7 +2309,8 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 qs = parse_qs(parsed.query)
                 act = (qs.get("actor") or [None])[0]
                 lim = int((qs.get("limit") or ["30"])[0])
-                self._send_json({"ok": True, "intents": daemon.intents.list_intents(actor=act, limit=lim)})
+                st_filter = (qs.get("state") or [None])[0]
+                self._send_json({"ok": True, "intents": daemon.intents.list_intents(actor=act, limit=lim, state=st_filter)})
                 return
             if parsed.path == "/api/events":
                 if not self._need(parsed, "read"):
@@ -2400,9 +2404,12 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 tier = "owner"
             elif parsed.path in ("/api/step", "/api/avatar", "/api/house/avatar", "/api/stock", "/api/city/depart", "/api/city/return"):
                 tier = "write"
-            elif parsed.path == "/api/memories/forget" and isinstance(body, dict):
-                sc = str(body.get("scope") or "private")
-                tier = "private" if sc == "private" else "write"
+            elif parsed.path in ("/api/memories/forget", "/api/intents/cancel") and isinstance(body, dict):
+                if parsed.path == "/api/intents/cancel":
+                    tier = "private"
+                else:
+                    sc = str(body.get("scope") or "private")
+                    tier = "private" if sc == "private" else "write"
             elif parsed.path == "/api/chat" and isinstance(body, dict):
                 tier = tier_for_channel(str(body.get("channel") or "group"), write=True)
             elif parsed.path == "/mcp":
@@ -2450,6 +2457,18 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 if parsed.path == "/api/setup/reset":
                     self._send_json(daemon.reset_house())
+                    return
+                if parsed.path == "/api/intents/cancel":
+                    if daemon.needs_onboarding or daemon.intents is None:
+                        raise ValueError("世界尚未初始化")
+                    req_body = body if isinstance(body, dict) else {}
+                    iid = str(req_body.get("intent_id") or req_body.get("id") or "").strip()
+                    cancelled = daemon.intents.cancel(
+                        iid,
+                        reason=str(req_body.get("reason") or "owner_cancelled"),
+                        now=daemon.clock.now(),
+                    )
+                    self._send_json({"ok": True, "intent": cancelled, "intents": daemon.intents.list_intents()})
                     return
                 if parsed.path == "/api/step":
                     mins = int(body.get("minutes") or 0)
