@@ -51,6 +51,7 @@ from .onboarding import (
     write_custom_pack,
 )
 from .plugin_api import PluginRegistry
+from .settings_store import SettingsStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
 
@@ -155,10 +156,16 @@ class HouseDaemon:
         else:
             self.clock = OffsetWallClock(self.runtime_dir / "clock_offset.json")
 
+        self.settings_store = SettingsStore(self.runtime_dir)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
+        self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env)
+        stored_plugins = self.settings_store.get_plugins_map()
         self._plugin_runtime_errors: List[Dict[str, str]] = []
-        self._active_tools = self.registry.active_tools(self.env)
-        self.providers = [inst for _, inst in self.registry.active_providers(self.env)]
+        self._managed_plugin_extensions: List[Any] = []
+        self._managed_plugin_ext_map: Dict[str, Any] = {}
+        self._active_channel_ids: set[str] = set()
+        self._active_tools = self.registry.active_tools(self.env, stored_plugins=stored_plugins)
+        self.providers = [inst for _, inst in self.registry.active_providers(self.env, stored_plugins=stored_plugins)]
         self.channels = []
         self.authority: Any = None
         self.memory: Any = None
@@ -180,12 +187,13 @@ class HouseDaemon:
             else:
                 self._mount_world(None)
 
-            for ch_pid, ch_factory in self.registry.active_channels(self.env):
+            for ch_pid, ch_factory in self.registry.active_channels(self.env, stored_plugins=stored_plugins):
                 try:
                     inst = ch_factory()
                     if inst is not None:
                         inst.start(self)
                         self.channels.append(inst)
+                        self._active_channel_ids.add(ch_pid)
                 except ChannelConfigError:
                     if ch_pid == "onebot_v11":
                         raise
@@ -204,8 +212,12 @@ class HouseDaemon:
 
     def _rebuild_llm_and_guard(self) -> None:
         self.chat_agent = RoommateChatAgent(self.vocab, env=self.env, llm_fn=self._llm_fn)
+        guard_env = dict(self.env)
+        if getattr(self, "settings_store", None) is not None and getattr(self, "registry", None) is not None:
+            for idx, sec in enumerate(self.settings_store.collect_secrets(self.registry.definitions, self.env)):
+                guard_env[f"AI_HOUSE_PLUGIN_SECRET_{idx}"] = sec
         self.guard = ReplyGuard(
-            self.env,
+            guard_env,
             runtime_dir=self.runtime_dir.resolve(),
             protected_texts=[
                 *self.vocab.SELVES.values(),
@@ -314,7 +326,22 @@ class HouseDaemon:
         eff_env.setdefault("INTENTS_KERNEL_MATCH", "on")
         eff_env.setdefault("WORLD_KERNEL_DAY_NOTE", "1" if k_chat else "0")
 
-        ext_factories = self.registry.active_extension_factories(self.env)
+        stored_plugins = self.settings_store.get_plugins_map()
+        managed_exts: List[Any] = []
+        managed_map: Dict[str, Any] = {}
+
+        def _track_ext_factory(pid_key: str, factory_fn):
+            def _wrapped(life):
+                ext = factory_fn(life)
+                managed_exts.append(ext)
+                managed_map[pid_key] = ext
+                return ext
+            return _wrapped
+
+        ext_factories = [
+            _track_ext_factory(pid_k, f)
+            for pid_k, f in self.registry.active_extension_specs(self.env, stored_plugins=stored_plugins)
+        ]
         life_model = LiveLifeModel(k_chat, self.vocab.SELVES) if k_chat else FakeLifeModel(vocab=self.vocab)
         self.authority = Authority(
             self.life_db,
@@ -328,6 +355,8 @@ class HouseDaemon:
             extra_extensions=ext_factories,
             intents_mod=self.intents,
         )
+        self._managed_plugin_extensions = managed_exts
+        self._managed_plugin_ext_map = managed_map
         if self._virtual_clock:
             self.authority.store.synthetic = True
             self.authority.proj.synthetic = True
@@ -1174,6 +1203,166 @@ class HouseDaemon:
         self._broadcast("state", {"now": snap["now_jst"], "llm_mode": snap["llm_mode"]})
         return {"ok": True, "llm": llm_info, "state": snap}
 
+    def reload_plugins(self, *, strict_channels: bool = False) -> None:
+        """Re-evaluate active tools, providers, extensions, and channels from SettingsStore + env."""
+        with self._lock:
+            stored_plugins = self.settings_store.get_plugins_map()
+            self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env, env_file=None)
+            chan_specs = self.registry.active_channels(self.env, stored_plugins=stored_plugins)
+            cand_channels: List[tuple[str, Any]] = []
+            chan_errors: List[Dict[str, str]] = []
+            for ch_pid, ch_factory in chan_specs:
+                try:
+                    inst = ch_factory()
+                    if inst is not None:
+                        cand_channels.append((ch_pid, inst))
+                except ChannelConfigError:
+                    if strict_channels or ch_pid == "onebot_v11":
+                        raise
+                    chan_errors.append({
+                        "plugin_id": ch_pid,
+                        "group": "ai_house.channels",
+                        "error": "ChannelConfigError",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    chan_errors.append({
+                        "plugin_id": ch_pid,
+                        "group": "ai_house.channels",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+
+            old_channels = list(self.channels)
+            self.channels = []
+            self._active_channel_ids = set()
+
+        for old_ch in old_channels:
+            try:
+                old_ch.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+        started_channels: List[Any] = []
+        started_ids: set[str] = set()
+        for ch_pid, inst in cand_channels:
+            try:
+                inst.start(self)
+                started_channels.append(inst)
+                started_ids.add(ch_pid)
+            except ChannelConfigError:
+                if strict_channels:
+                    raise
+                chan_errors.append({
+                    "plugin_id": ch_pid,
+                    "group": "ai_house.channels",
+                    "error": "ChannelConfigError",
+                })
+            except Exception as exc:  # noqa: BLE001
+                chan_errors.append({
+                    "plugin_id": ch_pid,
+                    "group": "ai_house.channels",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+        with self._lock:
+            self.settings_store.sync_env_and_dotenv(self.registry.definitions, self.env, env_file=self.env_file)
+            self.channels = started_channels
+            self._active_channel_ids = started_ids
+            self._active_tools = self.registry.active_tools(self.env, stored_plugins=stored_plugins)
+            self.providers = [inst for _, inst in self.registry.active_providers(self.env, stored_plugins=stored_plugins)]
+            self._plugin_runtime_errors = chan_errors
+            if self.authority is not None:
+                prev_ids = {id(x) for x in self._managed_plugin_extensions}
+                kept = [e for e in self.authority.life.extensions if id(e) not in prev_ids]
+                new_managed: List[Any] = []
+                new_map: Dict[str, Any] = {}
+                for pid_k, f in self.registry.active_extension_specs(self.env, stored_plugins=stored_plugins):
+                    ext = f(self.authority.life)
+                    new_managed.append(ext)
+                    new_map[pid_k] = ext
+                self._managed_plugin_extensions = new_managed
+                self._managed_plugin_ext_map = new_map
+                self.authority.life.extensions = kept + new_managed
+            self._rebuild_llm_and_guard()
+
+    def _serialize_all_plugins(self) -> List[Dict[str, Any]]:
+        err_map: Dict[str, str] = {}
+        for rec in self.registry.load_errors:
+            err_map.setdefault(rec.plugin_id, rec.error)
+        for err in self._plugin_runtime_errors:
+            err_map.setdefault(str(err.get("plugin_id") or ""), str(err.get("error") or ""))
+        active_provider_ids = {getattr(p, "provider_id", "") for p in self.providers}
+        active_tool_plugins = {str(t.get("plugin_id") or "") for t in self._active_tools.values()}
+        stored_plugins = self.settings_store.get_plugins_map()
+        active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_plugins)}
+        out: List[Dict[str, Any]] = []
+        for pid, defn in self.registry.definitions.items():
+            kind = defn.manifest.kind
+            is_enabled_flag = pid in active_pids
+            if kind == "channel":
+                active = pid in self._active_channel_ids
+            elif kind == "provider":
+                active = pid in active_provider_ids
+            elif kind == "tool":
+                active = pid in active_tool_plugins
+            elif kind == "extension":
+                ext = self._managed_plugin_ext_map.get(pid)
+                active = is_enabled_flag and pid not in err_map and (
+                    self.authority is None or (ext is not None and not getattr(ext, "_is_stub", False))
+                )
+            else:
+                active = is_enabled_flag and (pid not in err_map)
+            out.append(
+                self.settings_store.serialize_plugin_view(
+                    defn,
+                    self.env,
+                    active=active,
+                    runtime_error=err_map.get(pid, ""),
+                )
+            )
+        return out
+
+    def get_plugins_settings_view(self) -> Dict[str, Any]:
+        with self._lock:
+            plugins = self._serialize_all_plugins()
+            load_errors = [e.to_dict() for e in self.registry.load_errors] + list(self._plugin_runtime_errors)
+            llm = self._llm_status_view()
+        return {"ok": True, "plugins": plugins, "load_errors": load_errors, "llm": llm}
+
+    def update_plugin_settings(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(spec or {})
+        pid = str(data.get("plugin_id") or "").strip()
+        if pid not in self.registry.definitions:
+            raise ValueError(f"未知插件：{pid or '(空)'}")
+        defn = self.registry.definitions[pid]
+        enabled = data["enabled"] if "enabled" in data and data["enabled"] is not None else None
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+        values = data.get("values") if isinstance(data.get("values"), dict) else {}
+        clear_secrets = data.get("clear_secrets") if isinstance(data.get("clear_secrets"), list) else ()
+
+        prev_entry = self.settings_store.get_plugins_map().get(pid)
+        prev_env = dict(self.env)
+        self.settings_store.update_plugin(
+            defn.manifest,
+            enabled=enabled,
+            values=values,
+            clear_secrets=clear_secrets,
+            env=self.env,
+        )
+        try:
+            self.reload_plugins(strict_channels=True)
+        except Exception:
+            self.env.clear()
+            self.env.update(prev_env)
+            self.settings_store.restore_plugin_entry(pid, prev_entry)
+            raise
+
+        with self._lock:
+            plugin_view = next((p for p in self._serialize_all_plugins() if p["plugin_id"] == pid), None)
+            snap = self.get_state()
+        self._broadcast("state", {"now": snap["now_jst"], "plugin_updated": pid})
+        return {"ok": True, "plugin": plugin_view, "state": snap}
+
     def test_llm_settings(self, spec: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(spec or {})
         base_url = str(
@@ -1610,6 +1799,11 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 self._send_json(daemon.get_setup_info())
                 return
+            if parsed.path == "/api/settings/plugins":
+                if not self._need(parsed, "owner"):
+                    return
+                self._send_json(daemon.get_plugins_settings_view())
+                return
             if parsed.path == "/api/state":
                 if not self._need(parsed, "read"):
                     return
@@ -1744,6 +1938,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 "/api/setup",
                 "/api/setup/test-llm",
                 "/api/settings/llm",
+                "/api/settings/plugins",
                 "/api/residents",
                 "/api/residents/update",
                 "/api/setup/reset",
@@ -1780,6 +1975,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 if parsed.path == "/api/settings/llm":
                     self._send_json(daemon.update_llm_settings(body if isinstance(body, dict) else {}))
+                    return
+                if parsed.path == "/api/settings/plugins":
+                    self._send_json(daemon.update_plugin_settings(body if isinstance(body, dict) else {}))
                     return
                 if parsed.path == "/api/residents":
                     self._send_json(daemon.add_resident(body if isinstance(body, dict) else {}))

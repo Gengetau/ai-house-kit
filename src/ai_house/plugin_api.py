@@ -614,13 +614,13 @@ class PluginRegistry:
         )
         return resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
 
-    def active_extension_factories(
+    def active_extension_specs(
         self,
         env: Optional[Mapping[str, str]] = None,
         stored_plugins: Optional[Mapping[str, Any]] = None,
-    ) -> List[Callable[[Any], Any]]:
+    ) -> List[Tuple[str, Callable[[Any], Any]]]:
         eff = os.environ if env is None else env
-        out: List[Callable[[Any], Any]] = []
+        out: List[Tuple[str, Callable[[Any], Any]]] = []
         seen: set[str] = set()
         for defn in self.definitions.values():
             if defn.extension_factory is None:
@@ -630,8 +630,11 @@ class PluginRegistry:
             seen.add(defn.plugin_id)
             plugin_env = merged_plugin_env(defn, eff, stored_plugins)
             factory = defn.extension_factory
-            out.append(self._wrap_isolated_extension_factory(
-                defn.plugin_id, factory, plugin_env, isolate_runtime=(defn.source != "builtin")
+            out.append((
+                defn.plugin_id,
+                self._wrap_isolated_extension_factory(
+                    defn.plugin_id, factory, plugin_env, isolate_runtime=(defn.source != "builtin")
+                ),
             ))
 
         raw_extra = [x.strip() for x in (eff.get("AI_HOUSE_EXTENSIONS") or "").split(",") if x.strip()]
@@ -645,8 +648,18 @@ class PluginRegistry:
                     PluginLoadErrorRecord(plugin_id=name, group="ai_house.extensions", error=f"{type(exc).__name__}: {exc}")
                 )
                 continue
-            out.append(self._wrap_isolated_extension_factory(name, factory, dict(eff), isolate_runtime=True))
+            out.append((
+                name,
+                self._wrap_isolated_extension_factory(name, factory, dict(eff), isolate_runtime=True),
+            ))
         return out
+
+    def active_extension_factories(
+        self,
+        env: Optional[Mapping[str, str]] = None,
+        stored_plugins: Optional[Mapping[str, Any]] = None,
+    ) -> List[Callable[[Any], Any]]:
+        return [f for _, f in self.active_extension_specs(env=env, stored_plugins=stored_plugins)]
 
     def _wrap_isolated_extension_factory(
         self,
