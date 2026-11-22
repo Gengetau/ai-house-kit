@@ -664,6 +664,7 @@ class PluginRegistry:
             dice_tabletop,
             group_behavior,
             onebot_ws,
+            proactive_talk,
             sticker_pack,
             svg_wardrobe_studio,
         )
@@ -676,6 +677,7 @@ class PluginRegistry:
             sticker_pack,
             dice_tabletop,
             group_behavior,
+            proactive_talk,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 
