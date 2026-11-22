@@ -30,7 +30,7 @@ from worldkernel.life_model import FakeLifeModel, LiveLifeModel
 from worldkernel.store import VirtualClock, WallClock
 
 from .auth import AuthPolicy, check_bind, host_is_loopback, mcp_tier, origin_is_loopback, tier_for_channel
-from .chat_agent import RoommateChatAgent, openai_compatible_chat
+from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_compatible_chat
 from .chat_guard import ReplyGuard
 from .chat_identity import Speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
@@ -1176,8 +1176,10 @@ class HouseDaemon:
                 timeout_s=12.0,
             )
             return {"ok": bool(ans), "model": model, "reply": ans[:80], "tokens": toks}
+        except LLMAPIError as exc:
+            return {"ok": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {"ok": False, "error": mask_secrets(f"{type(exc).__name__}: {exc}", api_key=api_key)}
 
     def complete_setup(self, body: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(body or {})
