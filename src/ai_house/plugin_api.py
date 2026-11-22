@@ -663,8 +663,10 @@ class PluginRegistry:
             city_mcp_outing,
             dice_tabletop,
             group_behavior,
+            mini_games,
             onebot_ws,
             proactive_talk,
+            reminders,
             sticker_pack,
             svg_wardrobe_studio,
         )
@@ -678,6 +680,8 @@ class PluginRegistry:
             dice_tabletop,
             group_behavior,
             proactive_talk,
+            reminders,
+            mini_games,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 
