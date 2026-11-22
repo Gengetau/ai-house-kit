@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from worldkernel import vocab_life1
 
 from .auth import BindRefused, check_bind
+from .backup import create_backup, verify_backup
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, mask_secrets, openai_compatible_chat
 from .daemon import HouseDaemon, make_http_server
@@ -407,6 +408,34 @@ def cmd_pack_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    _load_dotenv(args.env_file)
+    try:
+        if args.verify:
+            res = verify_backup(args.verify)
+        else:
+            data_dir = args.data_dir or os.environ.get("AI_HOUSE_DATA_DIR") or "./runtime"
+            res = create_backup(
+                data_dir,
+                out_dir=args.out_dir,
+                keep_count=args.keep_count,
+                keep_days=args.keep_days,
+            )
+    except Exception as exc:  # noqa: BLE001
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"[ai-house] 备份失败：{exc}", file=sys.stderr, flush=True)
+        return 2
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.verify:
+        print(f"✅ 备份校验通过：{res['archive']}（{res['verified_files']} 个文件，{len(res['dbs'])} 个 SQLite 库）")
+    else:
+        print(f"✅ 在线备份完成：{res['archive']}（{res['files']} 个文件，大小 {res['size']} 字节）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="ai-house", description="Turnkey AI roommate sharehouse engine & studio")
     sub = ap.add_subparsers(dest="cmd")
@@ -451,6 +480,16 @@ def main(argv: list[str] | None = None) -> int:
     p_pk = sub.add_parser("pack-check", help="校验自定义世界与室友内容包 (WorldPack)")
     p_pk.add_argument("pack", help="WorldPack 目录路径或内置名称（如 life1、indie-studio-3）")
     p_pk.set_defaults(func=cmd_pack_check)
+
+    p_bk = sub.add_parser("backup", help="对运行时 SQLite 与状态配置执行在线热备或 SHA-256 校验")
+    p_bk.add_argument("--env-file", default=".env", help="启动配置 .env 路径（用于读取 AI_HOUSE_DATA_DIR）")
+    p_bk.add_argument("--data-dir", default=None, help="运行时数据目录（默认读取 AI_HOUSE_DATA_DIR 或 ./runtime）")
+    p_bk.add_argument("--out-dir", default=None, help="备份输出目录（默认为 <data-dir>/backups）")
+    p_bk.add_argument("--keep-count", type=int, default=10, help="最多保留备份份数（默认 10）")
+    p_bk.add_argument("--keep-days", type=int, default=14, help="最多保留备份天数（默认 14）")
+    p_bk.add_argument("--verify", default=None, help="校验指定备份归档 (.tar.gz) 而不创建新备份")
+    p_bk.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
+    p_bk.set_defaults(func=cmd_backup)
 
     ns = ap.parse_args(argv)
     if not getattr(ns, "cmd", None):

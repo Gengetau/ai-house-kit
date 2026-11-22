@@ -11,6 +11,15 @@
   - 新增 `src/ai_house/identity.py`：以内部身份（`owner / resident / visitor / bot`）为中心映射网页端与 OneBot 等多渠道外部账号；`seen` 表迁移 `speaker_id`；`converse`、`memory` 与 `onebot_v11` 自动跳过其他 bot 发言。
 - **出站通道桥与统一发送门 1.6（`SendGate` + `outbox`）**：
   - 打通 `worldkernel.outbox`（新增 `enqueue_outbound` 与 `BlockedDelivery`）、`ChannelPlugin.deliver` / `lookup_delivery`、`OneBotChannel` 真发/断线 defer 与超时对账语义；新增 `SendGate` 统一执行敏感词与私聊防泄漏拦截、bot 拒发、JST 静默时段及小时/日频率上限，并开放 `GET /api/outbox` 与 `POST /api/outbox/flush`。
+- **阶段 2 纯逻辑能力 2.1–2.8**：
+  - **2.1 通道可靠性（`ChannelSpool` + `OneBotChannel`）**：新增 `channel_spool.db` 入站落盘、事件 ID 去重、防抖聚合、自动分段、仅写前失败退避重试与重启恢复补发。
+  - **2.2 群聊行为与睡眠静默（`GroupBehaviorController` + `group_behavior`）**：新增非房主回复概率、连续回复上限与静默期清零、房主语音/HTTP 闭麦与住客熟睡静默控制。
+  - **2.3 事件驱动主动发言（`ProactiveEngine` + `proactive_talk`）**：默认关闭按需启用；锚定游标不重放历史、无事件不冷场、调用模型前执行 JST 活跃时段窗与全屋/单人配额拦截。
+  - **2.4 记忆原话证据与防外泄（`MemoryStore`）**：新增 `claim` 与 `trust` 可信度分级、群聊成员单方面陈述降级降权、拒绝纯提问/本人猜测写入 `fact`，并加强跨范围私密过敏实体防泄漏检测。
+  - **2.5 完整约定系统（`CommitmentStore`）**：房主立约权限闸、多人共同计划共享 `plan_ref` 与 `ChatLink` 兼容、过敏忌口归 `memo` 防误消防过期、`intent_evidence` 严格收口与 `/api/intents/cancel`。
+  - **2.6 提醒与无状态小游戏插件（`reminders` + `mini_games`）**：基于 `reminders.db` 的作用域隔离定时提醒与 `urgent` Outbox 推送，以及零副作用猜拳/抽签/随机选/接龙工具。
+  - **2.7 模型用量账本页（`#/usage`）**：支持 `today / 7d / 30d / all` 多周期聚合与最近调用明细，遵循容器查询与无障碍表格规范（`role="region"`、`tabindex="0"`、吸顶表头/吸左列与窄容器卡片堆叠）。
+  - **2.8 在线热备与 32 小时回归（`ai-house backup`）**：SQLite `Connection.backup()` 热备、`PRAGMA integrity_check`、SHA-256 `manifest.json`（不打包 `.env`）、保留裁剪与恢复检验，及 32 虚拟小时契约回归（含试住问题 #2 与 #4）。
 
 ## 0.2.0
 
