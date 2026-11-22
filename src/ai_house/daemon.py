@@ -68,6 +68,49 @@ CREATE TABLE IF NOT EXISTS owner_avatar_queue (cmd_id TEXT PRIMARY KEY, body TEX
 """
 
 
+class OffsetWallClock:
+    """Wall clock with a persisted fast-forward offset so simulated advances survive restarts."""
+
+    def __init__(self, offset_file: Optional[Path] = None, base_clock: Any = None):
+        self._base = base_clock or WallClock()
+        self._offset_file = Path(offset_file) if offset_file else None
+        self.offset_s = 0.0
+        if self._offset_file and self._offset_file.is_file():
+            try:
+                doc = json.loads(self._offset_file.read_text(encoding="utf-8"))
+                self.offset_s = max(0.0, float(doc.get("offset_s") or 0.0))
+            except (OSError, ValueError, TypeError):
+                self.offset_s = 0.0
+
+    def now(self) -> float:
+        return float(self._base.now()) + self.offset_s
+
+    def advance(self, seconds: float) -> float:
+        self.offset_s += float(seconds)
+        self._save()
+        return self.now()
+
+    def ensure_at_least(self, min_ts: float) -> None:
+        cur = self.now()
+        if float(min_ts) > cur:
+            self.offset_s += float(min_ts) - cur
+            self._save()
+
+    def reset(self) -> None:
+        self.offset_s = 0.0
+        if self._offset_file:
+            self._offset_file.unlink(missing_ok=True)
+
+    def _save(self) -> None:
+        if not self._offset_file:
+            return
+        try:
+            self._offset_file.parent.mkdir(parents=True, exist_ok=True)
+            self._offset_file.write_text(json.dumps({"offset_s": self.offset_s}), encoding="utf-8")
+        except OSError:
+            pass
+
+
 class HouseDaemon:
     """Self-contained runtime wrapping Authority + Web Console API + SSE + MCP Server."""
 
@@ -80,6 +123,7 @@ class HouseDaemon:
         step_interval_s: float = 60.0,
         virtual_clock: bool = False,
         start_ts: Optional[float] = None,
+        clock: Any = None,
         env: Optional[Dict[str, str]] = None,
         llm_fn: Any = None,
         allow_onboarding: bool = False,
@@ -101,11 +145,13 @@ class HouseDaemon:
         self._stop = threading.Event()
         self._sse_clients: List[queue.Queue[str]] = []
 
-        if self._virtual_clock:
+        if clock is not None:
+            self.clock: Any = clock
+        elif self._virtual_clock:
             t0 = start_ts or dt.datetime(2026, 11, 21, 9, 0, tzinfo=JST).timestamp()
-            self.clock: Any = VirtualClock(t0)
+            self.clock = VirtualClock(t0)
         else:
-            self.clock = WallClock()
+            self.clock = OffsetWallClock(self.runtime_dir / "clock_offset.json")
 
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
         self._active_tools = self.registry.active_tools(self.env)
@@ -203,8 +249,18 @@ class HouseDaemon:
         if Path(self.life_db).exists():
             with contextlib.closing(sqlite3.connect(self.life_db)) as lc:
                 has_meta = lc.execute("SELECT 1 FROM sqlite_master WHERE name='runtime_meta'").fetchone()
+                last_step_row = (
+                    lc.execute("SELECT value FROM runtime_meta WHERE key='last_step'").fetchone()
+                    if has_meta else None
+                )
+                if last_step_row and hasattr(self.clock, "ensure_at_least"):
+                    try:
+                        self.clock.ensure_at_least(float(last_step_row[0]))
+                    except (TypeError, ValueError):
+                        pass
                 seeded = has_meta and lc.execute("SELECT value FROM runtime_meta WHERE key='seeded'").fetchone()
                 if seeded:
+                    now = self.clock.now()
                     body_json = json.dumps({
                         k: (70.0 if k == "energy" else 30.0 if k == "hunger" else 50.0)
                         for k in self.vocab.BODY_KEYS
@@ -337,6 +393,9 @@ class HouseDaemon:
                 self.clock = vc
                 self.authority.clock = vc
                 self.authority.store.clock = vc
+                self.authority.life.clock = vc
+                if self.memory is not None:
+                    self.memory._clock = vc
             for _ in range(minutes):
                 self.clock.advance(60)
                 self.authority.step()
@@ -1223,6 +1282,7 @@ class HouseDaemon:
                 self.runtime_dir / "memory.db",
                 self.runtime_dir / "memory.db-wal",
                 self.runtime_dir / "memory.db-shm",
+                self.runtime_dir / "clock_offset.json",
                 self.runtime_dir / "house_setup.json",
             ]
             wait_ev = threading.Event()
@@ -1238,6 +1298,9 @@ class HouseDaemon:
                             raise
                         gc.collect()
                         wait_ev.wait(0.05)
+
+            if hasattr(self.clock, "reset"):
+                self.clock.reset()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():

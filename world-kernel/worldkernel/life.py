@@ -79,7 +79,7 @@ class Life:
         self.roster = tuple(getattr(self.V, 'ROSTER', ROSTER))
         self.names = dict(getattr(self.V, 'NAMES', NAMES))
         self.cook_order = tuple(getattr(self.V, 'COOK_ORDER', self.roster))
-        self.s, self.clock = store, store.clock
+        self.s = store
         self.k = Kernel(store, self.roster, vocab=self.V)
         self.city_visits = self.k.city_visits
         self.preparing_city_visits = self.city_visits.recover_preparing(city_recovery)
@@ -110,6 +110,15 @@ class Life:
         # pure caches of what the store already says (restart-safe without them): outfits she chose herself,
         # invitations already asked once, invitations with no more asks
         self._kept, self._inv_asked, self._inv_settled = {}, set(), set()
+
+    @property
+    def clock(self):
+        """Follow Store.clock dynamically so runtime clock swaps stay in sync across all subsystems."""
+        return self.s.clock
+
+    @clock.setter
+    def clock(self, value):
+        self.s.clock = value
 
     # ------------------------------------------------------------------ seed
     def _genesis(self, reality):
