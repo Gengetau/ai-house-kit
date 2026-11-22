@@ -428,30 +428,22 @@ def _openai_json_extractor(
     model: str,
     timeout_s: float = 45.0,
 ) -> Dict[str, Any]:
-    url = base_url.rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url = (url + "/chat/completions") if url.endswith("/v1") else (url + "/v1/chat/completions")
-    payload = {
-        "model": model,
-        "temperature": 0.2,
-        "max_tokens": 2000,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "ai-house-kit/0.2 (+https://github.com/Gengetau/ai-house-kit)",
+    from .chat_agent import post_openai_chat_json
+
+    doc = post_openai_chat_json(
+        base_url=base_url,
+        api_key=api_key,
+        payload={
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": 2000,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
         },
-        method="POST",
+        timeout_s=timeout_s,
     )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        doc = json.loads(resp.read().decode("utf-8", errors="replace"))
     content = str((((doc.get("choices") or [{}])[0]).get("message") or {}).get("content") or "")
     if not content.strip() and not ((doc.get("usage") or {}).get("completion_tokens") or 0):
         raise MemoryRefusedError("memory extractor model returned empty refusal")

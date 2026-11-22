@@ -17,7 +17,7 @@ from worldkernel import vocab_life1
 
 from .auth import BindRefused, check_bind
 from .builtin_plugins.onebot_ws import ChannelConfigError
-from .chat_agent import openai_compatible_chat
+from .chat_agent import LLMAPIError, mask_secrets, openai_compatible_chat
 from .daemon import HouseDaemon, make_http_server
 from .plugin_api import PluginRegistry
 
@@ -284,8 +284,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 model = eff_env.get("AI_HOUSE_MODEL", "gpt-4o-mini").strip()
                 ans, toks = openai_compatible_chat("Reply OK.", "ping", api_key=api_key, base_url=base_url, model=model, timeout_s=12.0)
                 checks.append({"name": "llm_live_ping", "ok": bool(ans), "detail": f"模型 {model} 连通 ({toks} tokens)"})
+            except LLMAPIError as exc:
+                checks.append({"name": "llm_live_ping", "ok": False, "detail": f"连通失败: {exc}"})
             except Exception as exc:  # noqa: BLE001
-                checks.append({"name": "llm_live_ping", "ok": False, "detail": f"连通失败: {type(exc).__name__}: {exc}"})
+                checks.append({
+                    "name": "llm_live_ping",
+                    "ok": False,
+                    "detail": f"连通失败: {mask_secrets(f'{type(exc).__name__}: {exc}', api_key=api_key)}",
+                })
     else:
         checks.append({
             "name": "llm_mode",

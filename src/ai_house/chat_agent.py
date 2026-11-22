@@ -20,11 +20,127 @@ from .chat_identity import Speaker, one_line, owner_speaker, quote_untrusted
 JST = dt.timezone(dt.timedelta(hours=9))
 
 
+_SK_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+
+
+class LLMAPIError(RuntimeError):
+    """Structured error raised on HTTP failures from OpenAI-compatible endpoints."""
+
+    def __init__(self, status_code: int, message: str, detail: str = "") -> None:
+        self.status_code = int(status_code or 0)
+        self.detail = detail
+        super().__init__(message)
+
+
+def mask_secrets(text: str, api_key: str = "") -> str:
+    """Redact API keys and sk-* tokens before surfacing errors to logs or UI."""
+    cleaned = str(text or "")
+    key = str(api_key or "").strip()
+    if key:
+        cleaned = cleaned.replace(key, "[REDACTED]")
+    return _SK_SECRET_RE.sub("[REDACTED]", cleaned)
+
+
+def _extract_http_error_detail(exc: urllib.error.HTTPError, api_key: str = "") -> str:
+    raw = ""
+    try:
+        if exc.fp is not None:
+            raw = exc.fp.read(4096).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        raw = ""
+    if raw:
+        try:
+            doc = json.loads(raw)
+            err = doc.get("error")
+            if isinstance(err, dict):
+                parts = [str(err.get("message") or "").strip()]
+                if err.get("param"):
+                    parts.append(f"param={err['param']}")
+                if err.get("code"):
+                    parts.append(f"code={err['code']}")
+                raw = "; ".join(p for p in parts if p)
+            elif isinstance(err, str):
+                raw = err
+            elif doc.get("message"):
+                raw = str(doc.get("message"))
+        except ValueError:
+            pass
+    detail = " ".join(str(raw or exc.reason or f"HTTP {exc.code}").split())
+    return mask_secrets(detail, api_key=api_key)[:280]
+
+
+def _compat_retry_payload(payload: Mapping[str, Any], detail: str) -> Optional[Dict[str, Any]]:
+    low = detail.lower()
+    if not any(tok in low for tok in ("max_tokens", "max_completion_tokens", "temperature")):
+        return None
+    adapted = dict(payload)
+    changed = False
+    if "max_tokens" in adapted:
+        old_max = adapted.pop("max_tokens")
+        try:
+            n = int(old_max or 0)
+        except (TypeError, ValueError):
+            n = 0
+        adapted["max_completion_tokens"] = max(n, 1024)
+        changed = True
+    elif "max_completion_tokens" in adapted:
+        try:
+            n = int(adapted["max_completion_tokens"] or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n < 1024:
+            adapted["max_completion_tokens"] = 1024
+            changed = True
+    if "temperature" in adapted:
+        adapted.pop("temperature", None)
+        changed = True
+    return adapted if changed else None
+
+
 def _chat_completions_url(base_url: str) -> str:
     url = (base_url or "https://api.openai.com").strip().rstrip("/")
     if not url.endswith("/chat/completions"):
         url = (url + "/chat/completions") if url.endswith("/v1") else (url + "/v1/chat/completions")
     return url
+
+
+def _send_chat_request(url: str, api_key: str, payload: Mapping[str, Any], timeout_s: float) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(dict(payload), ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "ai-house-kit/0.2 (+https://github.com/Gengetau/ai-house-kit)",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def post_openai_chat_json(
+    *,
+    base_url: str,
+    api_key: str,
+    payload: Mapping[str, Any],
+    timeout_s: float = 25.0,
+) -> Dict[str, Any]:
+    """POST to `/v1/chat/completions`, auto-adapting GPT-5/o-series parameter limits on HTTP 400."""
+    url = _chat_completions_url(base_url)
+    try:
+        return _send_chat_request(url, api_key, payload, timeout_s)
+    except urllib.error.HTTPError as exc:
+        detail = _extract_http_error_detail(exc, api_key=api_key)
+        if exc.code == 400:
+            retry_payload = _compat_retry_payload(payload, detail)
+            if retry_payload is not None:
+                try:
+                    return _send_chat_request(url, api_key, retry_payload, timeout_s)
+                except urllib.error.HTTPError as retry_exc:
+                    retry_detail = _extract_http_error_detail(retry_exc, api_key=api_key)
+                    raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {retry_detail}", detail=retry_detail) from retry_exc
+        raise LLMAPIError(exc.code, f"HTTP {exc.code}: {detail}", detail=detail) from exc
 
 
 def openai_compatible_chat(
@@ -37,28 +153,20 @@ def openai_compatible_chat(
     timeout_s: float = 25.0,
 ) -> Tuple[str, int]:
     """Call any OpenAI-compatible `/v1/chat/completions` endpoint using Python stdlib."""
-    url = _chat_completions_url(base_url)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 350,
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "ai-house-kit/0.2 (+https://github.com/Gengetau/ai-house-kit)",
+    doc = post_openai_chat_json(
+        base_url=base_url,
+        api_key=api_key,
+        payload={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 350,
         },
-        method="POST",
+        timeout_s=timeout_s,
     )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        doc = json.loads(resp.read().decode("utf-8", errors="replace"))
     msg = (((doc.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
     tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
     return str(msg).strip(), tokens
@@ -73,7 +181,6 @@ def _openai_messages_call(
     tools: Optional[Sequence[Dict[str, Any]]] = None,
     timeout_s: float = 25.0,
 ) -> Tuple[Dict[str, Any], int]:
-    url = _chat_completions_url(base_url)
     payload: Dict[str, Any] = {
         "model": model,
         "messages": list(messages),
@@ -83,18 +190,7 @@ def _openai_messages_call(
     if tools:
         payload["tools"] = [{"type": "function", "function": t} for t in tools]
         payload["tool_choice"] = "auto"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "ai-house-kit/0.2 (+https://github.com/Gengetau/ai-house-kit)",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        doc = json.loads(resp.read().decode("utf-8", errors="replace"))
+    doc = post_openai_chat_json(base_url=base_url, api_key=api_key, payload=payload, timeout_s=timeout_s)
     choice = (doc.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
@@ -248,8 +344,9 @@ class RoommateChatAgent:
                         messages, api_key=key, base_url=url, model=mdl, tools=tool_specs if self.tools_enabled else None
                     )
                     break
-                except urllib.error.HTTPError as exc:
-                    if exc.code == 400 and self.tools_enabled:
+                except (urllib.error.HTTPError, LLMAPIError) as exc:
+                    status = getattr(exc, "status_code", getattr(exc, "code", 0))
+                    if status == 400 and self.tools_enabled:
                         try:
                             msg, toks = _openai_messages_call(
                                 messages, api_key=key, base_url=url, model=mdl, tools=None
@@ -401,8 +498,12 @@ class RoommateChatAgent:
                         "mode": "live_api",
                         "tool_intents": recorded_intents,
                     }
-            except Exception as exc:
-                fallback_note = f"（接口暂不可用 {type(exc).__name__}，已自动切换本地演示回复）"
+            except Exception as exc:  # noqa: BLE001
+                err_msg = mask_secrets(str(exc), api_key=self.api_key)
+                if len(err_msg) > 140:
+                    err_msg = err_msg[:137] + "..."
+                detail_str = err_msg if isinstance(exc, LLMAPIError) else f"{type(exc).__name__}: {err_msg}"
+                fallback_note = f"（接口暂不可用 {detail_str}，已自动切换本地演示回复）"
             else:
                 fallback_note = ""
         else:
