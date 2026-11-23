@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -124,6 +125,15 @@ def _extract_image_from_payload(doc: Any, *, allow_loopback: bool) -> Tuple[str,
     raise ValueError("响应中缺少 image_base64 / b64_json / image_url")
 
 
+def _quota_fns(daemon: Any):
+    if daemon is None:
+        return None, None
+    router = getattr(daemon, "model_router", None)
+    chk = getattr(router, "check_plugin_quota", None) or getattr(daemon, "check_plugin_quota", None)
+    rec = getattr(router, "record_plugin_call", None) or getattr(daemon, "record_plugin_call", None)
+    return (chk if callable(chk) else None), (rec if callable(rec) else None)
+
+
 def generate_image_asset(
     prompt: str,
     *,
@@ -134,6 +144,8 @@ def generate_image_asset(
     actor: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
     daemon: Any = None,
+    speaker_id: str = "",
+    is_owner: bool = True,
 ) -> Dict[str, Any]:
     """Generate an image via OpenAI `/v1/images/generations`, BYO HTTP JSON contract, or Python hook."""
     clean_prompt = str(prompt or "").strip()[:500]
@@ -161,6 +173,7 @@ def generate_image_asset(
     eff_size = str(size or conf.get("size") or "1024x1024").strip() or "1024x1024"
     timeout_s = max(2.0, min(float(conf.get("timeout_s") or 30.0), 120.0))
     allow_loopback = bool(conf.get("allow_loopback_media", False))
+    daily_limit = max(1, min(int(conf.get("daily_limit") or 60), 5000))
 
     req_spec: Dict[str, Any] = {
         "prompt": clean_prompt,
@@ -172,6 +185,8 @@ def generate_image_asset(
     if seed is not None:
         req_spec["seed"] = int(seed)
 
+    chk_quota, rec_call = _quota_fns(daemon)
+
     if engine == "custom_python":
         with _ENGINE_LOCK:
             fn = _CUSTOM_ENGINES.get(model) or _CUSTOM_ENGINES.get("default")
@@ -182,10 +197,27 @@ def generate_image_asset(
                 "status": "unconfigured",
                 "error": f"未注册 Python 自带出图引擎 ({model})",
             }
+        if chk_quota is not None:
+            q_err = chk_quota(PLUGIN_ID, speaker_id=speaker_id, is_owner=is_owner, daily_limit=daily_limit)
+            if q_err:
+                return {"ok": False, "degraded": True, "status": "quota_exceeded", "error": q_err}
+        t0 = time.monotonic()
         try:
             raw_out = fn(dict(req_spec))
             mime, img_bytes = _extract_image_from_payload(raw_out, allow_loopback=allow_loopback)
         except Exception as exc:  # noqa: BLE001
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=model,
+                    base_url="custom_python://local",
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code=type(exc).__name__,
+                )
             return {
                 "ok": False,
                 "degraded": True,
@@ -202,6 +234,10 @@ def generate_image_asset(
                 "status": "misconfigured",
                 "error": "自带引擎 URL 必须以 http:// 或 https:// 开头",
             }
+        if chk_quota is not None:
+            q_err = chk_quota(PLUGIN_ID, speaker_id=speaker_id, is_owner=is_owner, daily_limit=daily_limit)
+            if q_err:
+                return {"ok": False, "degraded": True, "status": "quota_exceeded", "error": q_err}
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "ai-house-kit/0.3 (+https://github.com/Gengetau/ai-house-kit)",
@@ -214,6 +250,7 @@ def generate_image_asset(
             headers=headers,
             method="POST",
         )
+        t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 body_bytes = resp.read(DEFAULT_MAX_MEDIA_BYTES * 2)
@@ -224,9 +261,33 @@ def generate_image_asset(
                 doc = json.loads(body_bytes.decode("utf-8", errors="replace"))
                 mime, img_bytes = _extract_image_from_payload(doc, allow_loopback=allow_loopback)
         except urllib.error.HTTPError as exc:
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=model,
+                    base_url=base_url,
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code=f"HTTP_{exc.code}",
+                )
             detail = _extract_http_error_detail(exc, api_key=api_key)
             return {"ok": False, "degraded": True, "status": "upstream_error", "error": f"HTTP {exc.code}: {detail}"}
         except Exception as exc:  # noqa: BLE001
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=model,
+                    base_url=base_url,
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code=type(exc).__name__,
+                )
             return {
                 "ok": False,
                 "degraded": True,
@@ -243,6 +304,10 @@ def generate_image_asset(
                 "status": "misconfigured",
                 "error": "文生图 Base URL 必须以 http:// 或 https:// 开头",
             }
+        if chk_quota is not None:
+            q_err = chk_quota(PLUGIN_ID, speaker_id=speaker_id, is_owner=is_owner, daily_limit=daily_limit)
+            if q_err:
+                return {"ok": False, "degraded": True, "status": "quota_exceeded", "error": q_err}
         oai_payload = {"model": model, "prompt": clean_prompt, "size": eff_size, "n": 1}
         req = urllib.request.Request(
             _openai_images_url(base_url),
@@ -254,20 +319,57 @@ def generate_image_asset(
             },
             method="POST",
         )
+        t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 doc = json.loads(resp.read().decode("utf-8", errors="replace"))
             mime, img_bytes = _extract_image_from_payload(doc, allow_loopback=allow_loopback)
         except urllib.error.HTTPError as exc:
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=model,
+                    base_url=base_url,
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code=f"HTTP_{exc.code}",
+                )
             detail = _extract_http_error_detail(exc, api_key=api_key)
             return {"ok": False, "degraded": True, "status": "upstream_error", "error": f"HTTP {exc.code}: {detail}"}
         except Exception as exc:  # noqa: BLE001
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=model,
+                    base_url=base_url,
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code=type(exc).__name__,
+                )
             return {
                 "ok": False,
                 "degraded": True,
                 "status": "upstream_error",
                 "error": mask_secrets(f"{type(exc).__name__}: {exc}", api_key=api_key),
             }
+
+    if rec_call is not None:
+        rec_call(
+            PLUGIN_ID,
+            actor=actor,
+            model=model,
+            base_url=base_url or f"{engine}://local",
+            speaker_id=speaker_id,
+            is_owner=is_owner,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            ok=True,
+        )
 
     ext = media_ext_for_mime(mime, default="png")
     media_rel = ""
@@ -305,7 +407,19 @@ def _tool_generate_image(
     daemon = ctx.daemon if ctx is not None else None
     scope = ctx.scope if ctx is not None else "group"
     actor = ctx.actor if ctx is not None else ""
-    res = generate_image_asset(prompt, size=size, scope=scope, actor=actor, cfg=cfg, daemon=daemon)
+    sp = ctx.speaker if ctx is not None else None
+    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
+    res = generate_image_asset(
+        prompt,
+        size=size,
+        scope=scope,
+        actor=actor,
+        cfg=cfg,
+        daemon=daemon,
+        speaker_id=sp_id,
+        is_owner=is_owner,
+    )
     if res.get("ok"):
         if ctx is not None and isinstance(ctx.pending_media, list):
             ctx.pending_media.append({
@@ -418,6 +532,16 @@ PLUGIN_DEF = PluginDefinition(
                 default=False,
                 env_var="AI_HOUSE_IMAGE_ALLOW_LOOPBACK",
                 description="引擎返回 127.0.0.1 URL 而非 base64 时开启。",
+            ),
+            ConfigField(
+                key="daily_limit",
+                label="每日调用上限",
+                field_type="int",
+                default=60,
+                min_val=1,
+                max_val=5000,
+                env_var="AI_HOUSE_IMAGE_DAILY_LIMIT",
+                description="每天允许调用文生图引擎的最大次数。",
             ),
         ),
     ),

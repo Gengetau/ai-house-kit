@@ -5,6 +5,7 @@ import base64
 import hashlib
 import io
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -24,6 +25,8 @@ from ..media_safety import (
     to_data_uri,
 )
 from ..plugin_api import (
+    AttachmentContext,
+    AttachmentProcessor,
     ConfigField,
     PluginDefinition,
     PluginManifest,
@@ -130,6 +133,15 @@ def _encode_multipart(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
+def _quota_fns(daemon: Any):
+    if daemon is None:
+        return None, None
+    router = getattr(daemon, "model_router", None)
+    chk = getattr(router, "check_plugin_quota", None) or getattr(daemon, "check_plugin_quota", None)
+    rec = getattr(router, "record_plugin_call", None) or getattr(daemon, "record_plugin_call", None)
+    return (chk if callable(chk) else None), (rec if callable(rec) else None)
+
+
 def transcribe_audio_source(
     source: str,
     *,
@@ -139,12 +151,15 @@ def transcribe_audio_source(
     scope: str = "private",
     actor: str = "",
     channel: str = "",
+    speaker_id: str = "",
+    is_owner: bool = True,
 ) -> Dict[str, Any]:
     """Transcribe an audio source via OpenAI-compatible `/v1/audio/transcriptions`, degrading cleanly on fault."""
     conf = dict(cfg or {})
     api_key = str(conf.get("api_key") or "").strip()
     base_url = str(conf.get("base_url") or "").strip().rstrip("/")
     stt_model = str(conf.get("stt_model") or "whisper-1").strip() or "whisper-1"
+    daily_limit = max(1, min(int(conf.get("daily_limit") or 60), 5000))
     if not api_key:
         return {"ok": False, "degraded": True, "status": "unconfigured", "error": "未配置语音识别 API Key", "text": ""}
     if not base_url or not base_url.startswith(("http://", "https://")):
@@ -155,6 +170,12 @@ def transcribe_audio_source(
             "error": "语音接口 Base URL 必须以 http:// 或 https:// 开头",
             "text": "",
         }
+
+    chk_quota, rec_call = _quota_fns(daemon)
+    if chk_quota is not None:
+        q_err = chk_quota(PLUGIN_ID, speaker_id=speaker_id, is_owner=is_owner, daily_limit=daily_limit)
+        if q_err:
+            return {"ok": False, "degraded": True, "status": "quota_exceeded", "error": q_err, "text": ""}
 
     allow_loopback = bool(conf.get("allow_loopback_media", False))
     try:
@@ -192,6 +213,7 @@ def transcribe_audio_source(
         },
         method="POST",
     )
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=20.0) as resp:
             raw_resp = resp.read().decode("utf-8", errors="replace")
@@ -202,16 +224,63 @@ def transcribe_audio_source(
             text = raw_resp.strip()
         cleaned = quote_untrusted(text)[:500]
         if not cleaned:
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=stt_model,
+                    base_url=base_url,
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code="empty_response",
+                )
             return {"ok": False, "degraded": True, "status": "empty_response", "error": "未识别出语音内容", "text": ""}
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=stt_model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=True,
+            )
         res: Dict[str, Any] = {"ok": True, "degraded": False, "status": "ok", "model": stt_model, "text": cleaned}
         winfo = _wav_info(raw)
         if winfo:
             res["audio_info"] = winfo
         return res
     except urllib.error.HTTPError as exc:
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=stt_model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                error_code=f"HTTP_{exc.code}",
+            )
         detail = _extract_http_error_detail(exc, api_key=api_key)
         return {"ok": False, "degraded": True, "status": "upstream_error", "error": f"HTTP {exc.code}: {detail}", "text": ""}
     except Exception as exc:  # noqa: BLE001
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=stt_model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                error_code=type(exc).__name__,
+            )
         return {
             "ok": False,
             "degraded": True,
@@ -229,6 +298,8 @@ def synthesize_speech(
     voice: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
     daemon: Any = None,
+    speaker_id: str = "",
+    is_owner: bool = True,
 ) -> Dict[str, Any]:
     """Synthesize speech via OpenAI-compatible `/v1/audio/speech` after leak & guard checks."""
     clean_text = str(text or "").strip()[:400]
@@ -254,6 +325,7 @@ def synthesize_speech(
     tts_model = str(conf.get("tts_model") or "tts-1").strip() or "tts-1"
     eff_voice = str(voice or conf.get("tts_voice") or "alloy").strip() or "alloy"
     fmt = str(conf.get("response_format") or "wav").strip().lower()
+    daily_limit = max(1, min(int(conf.get("daily_limit") or 60), 5000))
     if fmt not in ("wav", "mp3", "opus"):
         fmt = "wav"
     if not api_key:
@@ -265,6 +337,12 @@ def synthesize_speech(
             "status": "misconfigured",
             "error": "语音接口 Base URL 必须以 http:// 或 https:// 开头",
         }
+
+    chk_quota, rec_call = _quota_fns(daemon)
+    if chk_quota is not None:
+        q_err = chk_quota(PLUGIN_ID, speaker_id=speaker_id, is_owner=is_owner, daily_limit=daily_limit)
+        if q_err:
+            return {"ok": False, "degraded": True, "status": "quota_exceeded", "error": q_err}
 
     url = _audio_url(base_url, "/audio/speech")
     payload = {
@@ -283,6 +361,7 @@ def synthesize_speech(
         },
         method="POST",
     )
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=20.0) as resp:
             raw_audio = resp.read(DEFAULT_MAX_MEDIA_BYTES + 1)
@@ -291,15 +370,51 @@ def synthesize_speech(
             if not raw_audio:
                 raise LLMAPIError(502, "empty audio response")
     except urllib.error.HTTPError as exc:
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=tts_model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                error_code=f"HTTP_{exc.code}",
+            )
         detail = _extract_http_error_detail(exc, api_key=api_key)
         return {"ok": False, "degraded": True, "status": "upstream_error", "error": f"HTTP {exc.code}: {detail}"}
     except Exception as exc:  # noqa: BLE001
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=tts_model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                error_code=type(exc).__name__,
+            )
         return {
             "ok": False,
             "degraded": True,
             "status": "upstream_error",
             "error": mask_secrets(f"{type(exc).__name__}: {exc}", api_key=api_key),
         }
+
+    if rec_call is not None:
+        rec_call(
+            PLUGIN_ID,
+            actor=actor,
+            model=tts_model,
+            base_url=base_url,
+            speaker_id=speaker_id,
+            is_owner=is_owner,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            ok=True,
+        )
 
     mime = {"wav": "audio/wav", "mp3": "audio/mpeg", "opus": "audio/opus"}[fmt]
     media_rel = ""
@@ -341,6 +456,8 @@ def enrich_chat_records(
     actor: str = "",
     channel: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
+    speaker_id: str = "",
+    is_owner: bool = True,
 ) -> List[str]:
     """Transcribe up to 2 inbound voice refs cleanly; faults degrade to empty annotations."""
     notes: List[str] = []
@@ -352,10 +469,31 @@ def enrich_chat_records(
             scope=scope,
             actor=actor,
             channel=channel,
+            speaker_id=speaker_id,
+            is_owner=is_owner,
         )
         if res.get("ok") and res.get("text"):
             notes.append(f"[语音转写：{res['text']}]")
     return notes
+
+
+def _process_attachments(actx: AttachmentContext) -> List[str]:
+    recs = actx.attachments.get("records") if isinstance(actx.attachments, Mapping) else None
+    if not recs:
+        return []
+    sp = actx.speaker
+    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
+    return enrich_chat_records(
+        list(recs),
+        daemon=actx.daemon,
+        scope=actx.scope,
+        actor=actx.actor,
+        channel=actx.channel,
+        cfg=actx.plugin_config,
+        speaker_id=sp_id,
+        is_owner=is_owner,
+    )
 
 
 def _tool_transcribe_audio(
@@ -369,6 +507,9 @@ def _tool_transcribe_audio(
     scope = ctx.scope if ctx is not None else "group"
     actor = ctx.actor if ctx is not None else ""
     channel = ctx.channel if ctx is not None else ""
+    sp = ctx.speaker if ctx is not None else None
+    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     return transcribe_audio_source(
         source,
         language=language,
@@ -377,6 +518,8 @@ def _tool_transcribe_audio(
         scope=scope,
         actor=actor,
         channel=channel,
+        speaker_id=sp_id,
+        is_owner=is_owner,
     )
 
 
@@ -390,7 +533,19 @@ def _tool_synthesize_voice(
     daemon = ctx.daemon if ctx is not None else None
     scope = ctx.scope if ctx is not None else "group"
     actor = ctx.actor if ctx is not None else ""
-    res = synthesize_speech(text, scope=scope, actor=actor, voice=voice, cfg=cfg, daemon=daemon)
+    sp = ctx.speaker if ctx is not None else None
+    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
+    res = synthesize_speech(
+        text,
+        scope=scope,
+        actor=actor,
+        voice=voice,
+        cfg=cfg,
+        daemon=daemon,
+        speaker_id=sp_id,
+        is_owner=is_owner,
+    )
     # Keep tool output compact for LLM tool loop while staging rich audio attachment for channel delivery
     if res.get("ok"):
         if ctx is not None and isinstance(ctx.pending_media, list):
@@ -495,6 +650,16 @@ PLUGIN_DEF = PluginDefinition(
                 env_var="AI_HOUSE_VOICE_ALLOW_LOOPBACK",
                 description="本地 OneBot / 测试服务提供 127.0.0.1 语音 URL 时开启。",
             ),
+            ConfigField(
+                key="daily_limit",
+                label="每日调用上限",
+                field_type="int",
+                default=60,
+                min_val=1,
+                max_val=5000,
+                env_var="AI_HOUSE_VOICE_DAILY_LIMIT",
+                description="每天允许调用语音识别或合成接口的最大次数。",
+            ),
         ),
     ),
     tools=(
@@ -536,5 +701,8 @@ PLUGIN_DEF = PluginDefinition(
     routes=(
         PluginRoute(method="POST", subpath="/transcribe", handler=_route_transcribe, tier="write"),
         PluginRoute(method="POST", subpath="/speak", handler=_route_speak, tier="write"),
+    ),
+    attachment_processors=(
+        AttachmentProcessor(processor_id="voice_records", handler=_process_attachments, priority=30),
     ),
 )

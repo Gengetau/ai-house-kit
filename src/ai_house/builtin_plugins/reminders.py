@@ -60,6 +60,8 @@ def _parse_due_at(now: float, *, in_minutes: Optional[float] = None, at_jst: str
     if m_dt:
         yy, mo, dd, hh, mm = (int(x) for x in m_dt.groups())
         due_dt = dt.datetime(yy, mo, dd, hh, mm, tzinfo=JST)
+        if due_dt.timestamp() <= ts:
+            raise ValueError("提醒时间必须晚于当前时间")
         return due_dt.timestamp()
     m_hm = _TIME_HM_RE.match(spec)
     if m_hm:
@@ -117,6 +119,7 @@ class ReminderStore:
         due_at: float,
         now: float,
         max_active_per_user: int = 20,
+        max_active_per_channel: int = 30,
     ) -> Dict[str, Any]:
         clean_msg = str(message or "").strip()[:240]
         if not clean_msg:
@@ -139,6 +142,14 @@ class ReminderStore:
                 )
                 if cnt >= max(1, int(max_active_per_user or 20)):
                     raise ValueError(f"待触发提醒已达上限 ({max_active_per_user})")
+                ch_cnt = int(
+                    c.execute(
+                        "SELECT COUNT(*) FROM reminders WHERE channel=? AND state='pending'",
+                        (ch,),
+                    ).fetchone()[0]
+                )
+                if ch_cnt >= max(1, int(max_active_per_channel or 30)):
+                    raise ValueError(f"当前频道待触发提醒已达上限 ({max_active_per_channel})")
                 cur = c.execute(
                     "INSERT INTO reminders("
                     "actor, scope, channel, target_channel, creator_id, creator_role, creator_name, "
@@ -239,23 +250,14 @@ class ReminderStore:
             return []
         self.init()
         ts = float(now)
-        claimed: List[sqlite3.Row] = []
         with contextlib.closing(self._connect()) as c:
-            with c:
-                due_rows = c.execute(
-                    "SELECT * FROM reminders WHERE state='pending' AND due_at<=? ORDER BY due_at ASC LIMIT 20",
-                    (ts,),
-                ).fetchall()
-                for r in due_rows:
-                    cur = c.execute(
-                        "UPDATE reminders SET state='fired', fired_at=? WHERE reminder_id=? AND state='pending'",
-                        (ts, r["reminder_id"]),
-                    )
-                    if cur.rowcount == 1:
-                        claimed.append(r)
+            due_rows = c.execute(
+                "SELECT * FROM reminders WHERE state='pending' AND due_at<=? ORDER BY due_at ASC LIMIT 20",
+                (ts,),
+            ).fetchall()
 
         dispatched: List[Dict[str, Any]] = []
-        for r in claimed:
+        for r in due_rows:
             text = f"⏰ 到点提醒：{r['message']}"
             if r["scope"] == "group" and r["creator_name"]:
                 text = f"⏰ {r['creator_name']}，到点提醒：{r['message']}"
@@ -278,11 +280,19 @@ class ReminderStore:
                     payload["to_identity"] = r["creator_id"]
             if r["scope"] == "private":
                 payload["to_identity"] = r["creator_id"] or "owner"
+            det_id = f"rem-{int(r['reminder_id'])}-{int(r['due_at'])}"
             did = daemon.enqueue_outbound(
                 channel=r["target_channel"],
                 payload=payload,
                 event_id=int(r["reminder_id"]),
+                delivery_id=det_id,
             )
+            with contextlib.closing(self._connect()) as c:
+                with c:
+                    c.execute(
+                        "UPDATE reminders SET state='fired', fired_at=? WHERE reminder_id=? AND state='pending'",
+                        (ts, r["reminder_id"]),
+                    )
             dispatched.append({"reminder_id": int(r["reminder_id"]), "delivery_id": did, "text": text})
         if dispatched:
             daemon.flush_outbox(reconcile=False)
