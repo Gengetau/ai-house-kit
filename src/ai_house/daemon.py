@@ -761,7 +761,15 @@ class HouseDaemon:
             now=self.clock.now(),
         )
 
-    def send_chat(self, channel: str, text: str, sender_name: str = "房主", *, external_id: str = "") -> Dict[str, Any]:
+    def send_chat(
+        self,
+        channel: str,
+        text: str,
+        sender_name: str = "房主",
+        *,
+        external_id: str = "",
+        attachments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Web studio / MCP entry. The caller already passed the token tier check, so default speaker is the owner."""
         self._require_world()
         channel = str(channel or "group")
@@ -779,7 +787,7 @@ class HouseDaemon:
             spk = self.identity_store.resolve_speaker("web", "owner", fallback_name=sender_name, default_owner=True)
         else:
             spk = owner_speaker(sender_name)
-        return self.converse(channel, text, spk)
+        return self.converse(channel, text, spk, attachments=attachments)
 
     def list_identities(self) -> Dict[str, Any]:
         return {"ok": True, "identities": self.identity_store.list_identities()}
@@ -988,6 +996,7 @@ class HouseDaemon:
         speaker: Speaker,
         *,
         actor: Optional[str] = None,
+        attachments: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """The one conversation entry shared by the web studio and chat plugins (OneBot).
 
@@ -1085,12 +1094,33 @@ class HouseDaemon:
                         }
                     }
             nook = self._book_nook()
+            vision_enabled = "vision_understand" in active_pids
+            vision_cfg = (
+                self.registry.resolve_config("vision_understand", env=self.env, stored_plugins=stored_plugins)
+                if vision_enabled
+                else {}
+            )
 
-        # Release `self._lock` before memory recall and model HTTP calls so `/api/state` and background ticks stay responsive.
+        # Release `self._lock` before attachment analysis, memory recall, and model HTTP calls.
         scope = "private" if is_private else "group"
         mem_ch = "" if is_private else channel
         speaker_role = "owner" if speaker.is_owner else "member"
         extra_tools = [t["spec"] for t in self._active_tools.values()]
+        model_user_text = text
+        if isinstance(attachments, Mapping) and attachments.get("images") and vision_enabled:
+            try:
+                from .builtin_plugins.vision_understand import enrich_chat_images
+
+                img_notes = enrich_chat_images(
+                    list(attachments.get("images") or ()),
+                    daemon=self,
+                    actor=targets[0] if targets else "",
+                    cfg=vision_cfg,
+                )
+                if img_notes:
+                    model_user_text = f"{text}\n" + "\n".join(img_notes)
+            except Exception:  # noqa: BLE001
+                pass
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
@@ -1178,7 +1208,7 @@ class HouseDaemon:
 
             rep = self.chat_agent.reply_as(
                 aid,
-                text,
+                model_user_text,
                 residents[aid],
                 snaps_by_target[aid],
                 recent,
@@ -2553,11 +2583,13 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json({"ok": True, "state": res})
                     return
                 if parsed.path == "/api/chat":
+                    raw_att = body.get("attachments") if isinstance(body, dict) and isinstance(body.get("attachments"), Mapping) else None
                     res = daemon.send_chat(
                         channel=str(body.get("channel") or "group"),
                         text=str(body.get("text") or ""),
                         sender_name=str(body.get("sender_name") or "房主"),
                         external_id=str(body.get("external_id") or ""),
+                        attachments=raw_att,
                     )
                     self._send_json(res)
                     return

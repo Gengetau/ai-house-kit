@@ -23,6 +23,7 @@ sends). `start()` returns immediately.
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import json
 import queue
 import re
@@ -132,6 +133,27 @@ def parse_message(message: Any, self_id: str) -> Tuple[str, bool]:
         elif kind:
             out.append(f"[{kind}]")
     return "".join(out).strip(), mentioned
+
+
+def extract_media_segments(message: Any) -> Dict[str, List[str]]:
+    """Extract image and audio refs (`url` / `file` / `data:`) from OneBot segment arrays."""
+    images: List[str] = []
+    records: List[str] = []
+    if not isinstance(message, list):
+        return {"images": images, "records": records}
+    for seg in message:
+        if not isinstance(seg, dict):
+            continue
+        kind = re.sub(r"[^a-z_]", "", str(seg.get("type") or "").lower())[:16]
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        ref = str(data.get("url") or data.get("file") or "").strip()
+        if not ref:
+            continue
+        if kind in ("image", "mface") and len(images) < 4:
+            images.append(ref)
+        elif kind == "record" and len(records) < 2:
+            records.append(ref)
+    return {"images": images, "records": records}
 
 
 class OneBotChannel(ChannelPlugin):
@@ -496,6 +518,8 @@ class OneBotChannel(ChannelPlugin):
             return self.handle_event(batch[0])
         texts: List[str] = []
         spool_ids: List[int] = []
+        merged_images: List[str] = []
+        merged_records: List[str] = []
         last_ev = dict(batch[-1])
         for item in batch:
             if item.get("_spool_id"):
@@ -503,8 +527,13 @@ class OneBotChannel(ChannelPlugin):
             why, info = self._classify(item)
             if not why and info.get("text"):
                 texts.append(str(info["text"]))
+            media = extract_media_segments(item.get("message", item.get("raw_message", "")))
+            merged_images.extend(x for x in media["images"] if x not in merged_images)
+            merged_records.extend(x for x in media["records"] if x not in merged_records)
         merged = dict(last_ev)
         merged["_spool_ids"] = spool_ids
+        if merged_images or merged_records:
+            merged["_merged_attachments"] = {"images": merged_images[:4], "records": merged_records[:2]}
         if texts:
             merged["message"] = [{"type": "text", "data": {"text": "\n".join(texts)}}]
             if merged.get("message_type") == "group":
@@ -643,7 +672,21 @@ class OneBotChannel(ChannelPlugin):
                 return f"ignored:{why}"
             if self._spool is not None and spool_ids:
                 self._spool.mark_processing(spool_ids)
-            res = self._host.converse(channel, text, speaker, actor=actor)
+            attachments = ev.get("_merged_attachments")
+            if not isinstance(attachments, dict):
+                attachments = extract_media_segments(ev.get("message", ev.get("raw_message", "")))
+            has_media = bool(attachments.get("images") or attachments.get("records"))
+            converse_kw: Dict[str, Any] = {"actor": actor}
+            if has_media:
+                try:
+                    sig = inspect.signature(self._host.converse)
+                    if "attachments" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    ):
+                        converse_kw["attachments"] = attachments
+                except (TypeError, ValueError):
+                    pass
+            res = self._host.converse(channel, text, speaker, **converse_kw)
             sent = 0
             send_groups: List[List[str]] = []
             for rep in res.get("replies") or ():
