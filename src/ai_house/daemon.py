@@ -867,7 +867,7 @@ class HouseDaemon:
         attachments: Optional[Mapping[str, Any]] = None,
         is_owner_token: bool = True,
     ) -> Dict[str, Any]:
-        """Web studio / MCP entry. Only an `owner`-tier token can default to the owner identity."""
+        """Web studio / MCP entry. Only `owner`/`private`-tier tokens may use owner identity; `write`-tier stays visitor."""
         self._require_world()
         raw_ch = str(channel or "group").strip()
         if raw_ch.lower() == "group":
@@ -2887,7 +2887,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                         sender_name=str(body.get("sender_name") or "房主"),
                         external_id=str(body.get("external_id") or ""),
                         attachments=raw_att,
-                        is_owner_token=policy.is_owner(self._token(parsed)),
+                        is_owner_token=policy.allows(self._token(parsed), "private"),
                     )
                     self._send_json(res)
                     return
@@ -2925,7 +2925,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json(res)
                     return
                 if parsed.path == "/mcp":
-                    self._send_json(daemon.handle_mcp_rpc(body, is_owner_token=policy.is_owner(self._token(parsed))))
+                    self._send_json(daemon.handle_mcp_rpc(body, is_owner_token=policy.allows(self._token(parsed), "private")))
                     return
                 if parsed.path == "/api/city/return":
                     res = daemon.return_city_outing(

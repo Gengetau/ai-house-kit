@@ -81,7 +81,7 @@ class _StatefulStage2MockServer:
                     }, ensure_ascii=False)
                 elif "输出必须是 JSON" in sys_txt or "action" in sys_txt.lower():
                     parent.calls.append("life")
-                    content = json.dumps({"steps": [{"type": "move", "to": "living"}, {"type": "begin_activity", "activity": "reading"}]}, ensure_ascii=False)
+                    content = json.dumps({"steps": []}, ensure_ascii=False)
                 else:
                     parent.calls.append("chat")
                     if parent.leak_mode:
@@ -294,28 +294,10 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         self.assertAlmostEqual(d.clock.now() - t0, 32 * 3600, delta=120.0)
         self.assertTrue(saw_sleep)
 
-        # Ensure genuine supermarket/purchased evidence completes onion errand; allergy memo NEVER closes or expires!
+        # Genuine autonomous supermarket execution MUST complete the onion errand without manual evidence injection
         onion_after_32h = [r for r in d.intents.list_intents(actor="sora") if r["item"] == "onion"][0]
-        if onion_after_32h["state"] != "completed":
-            # Feed authentic purchase receipt evidence when virtual life chose non-shopping actions
-            ev_at = d.clock.now() - 60
-            with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
-                with wc:
-                    wc.execute(
-                        "UPDATE house_intents SET state='open', expires_at=? WHERE intent_id=?",
-                        (d.clock.now() + 3600, onion_after_32h["intent_id"]),
-                    )
-                    wc.execute(
-                        "INSERT OR REPLACE INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 99, ?, ?)",
-                        (
-                            "purchased:32h:onion",
-                            ev_at,
-                            json.dumps({"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2, "at": ev_at}),
-                        ),
-                    )
-            d.intents.sweep(d.clock.now())
-            onion_after_32h = [r for r in d.intents.list_intents(actor="sora") if r["item"] == "onion"][0]
         self.assertEqual(onion_after_32h["state"], "completed")
+        self.assertTrue(str(onion_after_32h.get("evidence_key") or "").startswith("ai-house/"))
 
         allergy_memo = [r for r in d.intents.list_intents(actor="sora") if "虾仁过敏" in r["summary"]][0]
         self.assertEqual(allergy_memo["kind"], "memo")
@@ -346,7 +328,7 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT / "tools"))
         from run_stage2_32h_live import verify_stage2_32h_invariants  # noqa: E402
 
-        self.assertEqual(verify_stage2_32h_invariants(d), [])
+        self.assertEqual(verify_stage2_32h_invariants(d, saw_sleep=saw_sleep), [])
         # Injecting a leaked group message triggers non-empty failure list (non-zero exit in live runner)
         with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
             with wc:
