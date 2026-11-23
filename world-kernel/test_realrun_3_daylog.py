@@ -199,7 +199,7 @@ class DiaryTokenBudget(unittest.TestCase):
     def test_diary_max_tokens_fits_300_chinese_characters(self) -> None:
         temperature, max_tokens, timeout, retries = llm_mod.DEFAULT_TASK_PROFILES["diary"]
         self.assertEqual(max_tokens, 800)
-        self.assertEqual((temperature, timeout, retries), (0.7, 25.0, 1))  # nothing else moved
+        self.assertEqual((temperature, timeout, retries), (0.7, 60.0, 1))  # nothing else moved (timeout 25 -> 60, test_realrun_6_diary_retry)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ DEFAULT_TASK_PROFILES: Dict[str, Tuple[float, int, float, int]] = {
     "chat": (0.7, 400, 25.0, 1),
     "life": (0.7, 400, 25.0, 1),
     "memory_extract": (0.2, 2000, 45.0, 1),
-    "diary": (0.7, 800, 25.0, 1),
+    "diary": (0.7, 800, 60.0, 1),
     "ping": (0.7, 350, 12.0, 0),
 }
 
@@ -40,7 +40,7 @@ DEFAULT_TASK_PROFILES: Dict[str, Tuple[float, int, float, int]] = {
 DEFAULT_TOTAL_BUDGET_S: Dict[str, float] = {
     "chat": 45.0,
     "life": 45.0,
-    "diary": 45.0,
+    "diary": 90.0,  # one 60s request plus a retry; at 45 the total budget cut the 60s request timeout back to 45s
     "memory_extract": 90.0,
     "ping": 15.0,
 }
@@ -1552,6 +1552,10 @@ class ModelRouter:
         budget = self.resolve_total_budget(purpose) if total_budget_s is None else max(_MIN_BUDGET_S, float(total_budget_s))
         deadline = _effective_deadline(started + budget) or (started + budget)
         use_breaker = purpose != "ping"  # connectivity tests neither feed nor consult the traffic breaker
+        # The nightly diary is a background batch (one call per resident, back to back, each with a retry): a few of its
+        # failures would open the breaker it shares with chat for that model and refuse the rest of the diaries and the
+        # chat. It consults the breaker (and a success closes it) but its failures are not counted into it.
+        feed_breaker = use_breaker and purpose != "diary"
 
         def out_of_budget() -> bool:
             return deadline - time.monotonic() <= _DEADLINE_EPSILON_S
@@ -1636,12 +1640,12 @@ class ModelRouter:
                             # An empty 200 means the endpoint answered (it is up) but this prompt got nothing: the call
                             # still fails and falls back, but it must not open the breaker for the whole model (it
                             # would also block this model's chat traffic).
-                            opened = use_breaker and exc.detail != "empty_reply" and self._record_breaker_failure(cap_key)
+                            opened = feed_breaker and exc.detail != "empty_reply" and self._record_breaker_failure(cap_key)
                             retryable = (not opened) and exc.detail not in ("empty_reasoning_length", "empty_reply")
                     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                         last_exc = exc
                         err_code = type(exc).__name__
-                        opened = use_breaker and self._record_breaker_failure(cap_key)
+                        opened = feed_breaker and self._record_breaker_failure(cap_key)
                         retryable = not opened
                     except Exception as exc:  # noqa: BLE001
                         last_exc = exc

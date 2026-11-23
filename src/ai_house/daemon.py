@@ -665,16 +665,19 @@ class HouseDaemon:
                         if (self._llm_fn is None and self.model_router.has_live_endpoint(purpose="diary"))
                         else self.chat_agent.kernel_chat_fn()
                     )
-                    for job in self.diary.collect_due_jobs(now):
-                        text, mode = self.diary.generate_text(job, llm_fn=diary_fn)
-                        saved = self.diary.save_generated(job, text, mode, now)
-                        if saved and album_enabled:
-                            try:
-                                from .builtin_plugins.album_diary_art import maybe_illustrate_diary
+                    def _illustrate(saved: Dict[str, Any], job: Mapping[str, Any]) -> None:
+                        if not album_enabled:
+                            return
+                        try:
+                            from .builtin_plugins.album_diary_art import maybe_illustrate_diary
 
-                                maybe_illustrate_diary(self, saved, job, now, cfg=album_cfg)
-                            except Exception as art_exc:  # noqa: BLE001
-                                self.log(f"diary art skipped: {type(art_exc).__name__}: {art_exc}")
+                            maybe_illustrate_diary(self, saved, job, now, cfg=album_cfg)
+                        except Exception as art_exc:  # noqa: BLE001
+                            self.log(f"diary art skipped: {type(art_exc).__name__}: {art_exc}")
+
+                    # A failed model call keeps the diary for a later tick (see DiaryService.run_due); the template
+                    # is only written once the tries or the night run out, or when no model is configured.
+                    self.diary.run_due(now, diary_fn, log=self.log, on_saved=_illustrate)
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
             self._run_plugin_tasks(now)
