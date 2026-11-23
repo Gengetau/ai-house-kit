@@ -4,8 +4,15 @@
 第一次试用不需要读这份文档，`ai-house up` 加网页聊天就够了（见 [README](../README.md)）。接 QQ 的行为、限速和风险见
 [CHAT-AND-QQ.md](CHAT-AND-QQ.md)，请先读那一份。
 
-> **现状**：下面的模板做过语法校验（`systemd-analyze verify`、`docker compose config`），`doctor --onebot-ping` 和
-> 停止信号的处理有自动化测试。但整套流程还没有在真实的 QQ 账号和真实的协议端上跑过。第一次接请用测试群和小号。
+> **现状**（2026-11-23）：
+>
+> - 在真实环境里跑过一次的：Docker 镜像构建与启动（x86_64 和 arm64 各一次）、`docker compose stop` 时保存状态退出、
+>   `doctor --onebot-ping` 对一个真实协议端（SnowLuma 1.14.16，已登录的真实 QQ 号）的连通检查，以及一次完整的收发：
+>   房主从 QQ 发来一条私聊，小屋经协议端回了一条文字，协议端确认发出。这次用的是宿主网络那种摆法（2.2 节第四行）。
+> - 只做过语法校验或本地模拟的：systemd 单元（`systemd-analyze verify`）、两个容器共用外部网络的摆法（`docker compose config`）。
+> - 还没在真实 QQ 上试过的：群聊、图片和语音、协议端掉线后的重连与补发、长时间挂机、风控下的表现。
+>
+> 第一次接请用测试群和小号。
 
 ## 1. 后台常驻
 
@@ -133,16 +140,33 @@ journalctl -u ai-house -f
 - 有的实现默认只监听 `127.0.0.1`；小屋在 Docker 里时要让它监听在容器够得着的地址上。
 - 示例里的端口 `3001` 只是常见的默认值，以你的协议端实际监听的端口为准。
 
-### 2.2 三种摆法
+### 2.2 四种摆法
 
 | 小屋 | 协议端 | `ONEBOT_WS_URL` |
 |---|---|---|
 | 直接运行 / systemd | 同一台机器上直接运行 | `ws://127.0.0.1:3001` |
-| Docker | 宿主机上直接运行 | `ws://host.docker.internal:3001` |
+| Docker | 宿主机上直接运行（或以宿主网络运行的容器） | `ws://host.docker.internal:3001` |
 | Docker | Docker | `ws://<协议端的服务名>:3001`（见下） |
+| Docker，宿主网络（仅 Linux） | 同一台宿主机 | `ws://127.0.0.1:3001`（见下） |
 
 **小屋在 Docker、协议端在宿主机**：`compose.yaml` 已经配好了 `host.docker.internal`。协议端的 WebSocket 服务端要监听在
 Docker 网桥够得着的地址上（只监听 `127.0.0.1` 的话容器连不进来），同时用防火墙保证这个端口不对外网开放，并且一定要设令牌。
+
+这种摆法在不少服务器上会卡在防火墙：宿主机的入站规则默认丢弃从 Docker 网桥发往宿主机端口的包，表现是
+`doctor --onebot-ping` 等上几秒后报「连不上 host.docker.internal:…（TimeoutError）」（我们实测的那台机器就是这样）。两条路选一条：
+
+- 在宿主机防火墙里放行 Docker 网桥网段访问那个端口（只放行网桥网段，不要对外网放开）；
+- 或者改用下面的宿主网络摆法，协议端只监听 `127.0.0.1` 就行，不用动防火墙。
+
+**小屋用宿主网络（仅 Linux）**：叠加 [`deploy/onebot/compose.host-network.yaml`](../deploy/onebot/compose.host-network.yaml)，
+小屋直接用宿主机的网络，地址写 `ws://127.0.0.1:端口`：
+
+```sh
+docker compose -f compose.yaml -f deploy/onebot/compose.host-network.yaml up -d
+```
+
+宿主网络下没有端口映射这一层，这个文件把小屋固定监听在 `127.0.0.1:8780`（宿主机的 8780 要空着）；不要把它改成 `0.0.0.0`。
+它不能和 `--profile city`、`compose.onebot.yaml` 一起用。Docker Desktop（macOS / Windows）请用上一种摆法。
 
 **两边都在 Docker**：用 [`deploy/onebot/compose.onebot.yaml`](../deploy/onebot/compose.onebot.yaml) 让两个容器进同一个网络，
 协议端的 WebSocket 端口就不必发布到宿主机。文件开头有逐步说明，简单说是三步：
@@ -191,12 +215,20 @@ docker compose exec ai-house ai-house doctor --onebot-ping
 | 提示 | 原因和处理 |
 |---|---|
 | 已连上 …，协议端已登录 QQ | 正常 |
-| 连不上 … | 协议端没启动、端口不对或被防火墙挡住；小屋在 Docker 里时地址不能写 `127.0.0.1` |
-| 拒绝了连接（HTTP 401/403） | `ONEBOT_ACCESS_TOKEN` 和协议端里设的不一致，或者一边设了一边没设 |
-| 不是 OneBot 的正向 WebSocket 端口 | 连到了 HTTP 端口或 WebUI 端口；确认开的是正向 WebSocket 服务端并且已启用 |
+| 连不上 127.0.0.1:…（ConnectionRefusedError） | 协议端没启动或端口不对；小屋在 Docker（非宿主网络）里时地址不能写 `127.0.0.1` |
+| 连不上 host.docker.internal:…（TimeoutError），提示防火墙 | 宿主机防火墙丢了 Docker 网桥来的包；放行网段，或改用宿主网络摆法（见 2.2） |
+| 连不上 host.docker.internal:…（ConnectionRefusedError） | 协议端没在宿主机上监听这个端口，或只监听了 `127.0.0.1` |
+| 拒绝了连接（HTTP 401/403） | `ONEBOT_ACCESS_TOKEN` 和协议端里设的不一致，或者一边设了一边没设；地址指到协议端的 HTTP 接口端口（它的令牌另算）时也会这样 |
+| 不是 OneBot 的正向 WebSocket 端口 / 握手失败 | 连到了别的服务的端口（网页、WebUI 等）；确认开的是正向 WebSocket 服务端并且已启用 |
 | 已连上，但协议端还没有登录 QQ | 先在协议端完成登录 |
 | 没有收到应答 | 这个端口不是 OneBot v11 接口 |
 | `ONEBOT_OWNER_QQ` 里填的是室友自己登录的这个号 | 那里要填你本人的号 |
 
 连通之后启动小屋，用你本人的号给室友的小号发一条私聊。没有回复时先看小屋日志里 `[onebot_v11]` 开头的行，再对照
 [CHAT-AND-QQ.md](CHAT-AND-QQ.md) 的「它怎么表现」一表（没配模型、室友在睡觉、超过限速时都会保持安静）。
+
+小屋里还没有住客时（全新安装、还没走网页向导，或刚重置过世界），QQ 消息不会被回复，日志里会有一行
+「房子里还没有住客…请先在网页里创建第一位住客」；在网页里建好之后不用重启，下一条消息就会由第一位住客来回。
+
+一个协议端的正向 WebSocket 服务通常允许多个客户端同时连接，事件会发给每一个。如果同一个 QQ 号上已经接着别的机器人程序，
+小屋接上去之后两边都会收到同一条消息、各回各的。正式使用时，一个号只接一个会回话的程序。

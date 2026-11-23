@@ -24,26 +24,31 @@
 ```sh
 git clone https://github.com/Gengetau/ai-house-kit.git
 cd ai-house-kit
-python3 -m pip install -e ".[dev]"   # Windows: py -3.13 -m pip install -e ".[dev]"
+python3 -m venv .venv && . .venv/bin/activate   # Windows: py -3 -m venv .venv 然后 .venv\Scripts\activate
+python3 -m pip install -e .
 ai-house init && ai-house doctor     # 自动生成强随机令牌的 .env，并检查环境/SQLite/WorldPack
 ai-house up
 ```
+
+- 建议装在虚拟环境里（上面第三行）：不少系统的 Python 不允许直接往系统目录里装包。以后每次开新终端先执行一次 `. .venv/bin/activate`，`ai-house` 命令才找得到。
+- 核心没有第三方依赖。要接 QQ 再装 `python3 -m pip install -e ".[onebot]"`；要跑测试装 `".[dev]"`。
 
 - 可选直接绑定内置 3 人工作室包：`ai-house init --pack indie-studio-3 --force && ai-house up`
 - 也可在 `.env` 预填 `AI_HOUSE_API_KEY`、`AI_HOUSE_BASE_URL`、`AI_HOUSE_MODEL`，并用 `ai-house doctor --live-ping` 测通后再启动（或启动后直接在网页向导里填写并测试）。
 
 浏览器打开 **`http://127.0.0.1:8780`**（若 `ai-house init` 生成了房主令牌 `AI_HOUSE_OWNER_TOKEN`，在玄关页填入即可进入）：
 - **首位 AI 住客向导（`#/setup`）**：空屋首次启动不再硬塞 6 个演示角色，直接进入 **「迎接你的第一位 AI 住客」** 向导——自定义第 1 位住客的昵称、像素立绘、主题色、作息与厨艺，选择并测试 OpenAI 兼容大模型 API（或先以零配置演示模式体验），也支持一键载入 3 人 `indie-studio-3` 或 6 人 `life1` 示例世界包；入住后可在首页或管家页随时 **「+ 邀请新住客」**、编辑档案或重置小屋；
-- **暖灯像素控制台与等轴互动**：浏览两层全屋像素剖面与 11 间等轴测房间，点房间让房主化身走进去当面说话、递零食，或点 **「⏩ 快进 +15 分钟」** 推进三餐、日记与晴空都行程流转；
+- **暖灯像素控制台与等轴互动**：浏览两层全屋像素剖面与 11 间等轴测房间，点房间让房主化身走进去当面说话、递零食，小屋的时间由内核按真实时钟推进；想在几分钟里看完三餐、日记与晴空都行程，另起一栋演示小屋 `ai-house up --virtual-clock`，在“小屋管家”页手动推进时间；
 - **多板块生活与记忆管理**：覆盖 **「住客」**（此刻状态 / 衣柜换装 / 档案编辑 / 私聊与群聊）、**「日子」**（时间线 / 约定履行 / 厨房货架补货 / 晴空都行程）、**「珍藏」**（精装翻页日记 / 作用域记忆检索与遗忘 / 书架便签）与 **「管家」**（模拟步进 / 住客管理 / 大模型热更新 / MCP 接入配置），另有独立聊天页 `http://127.0.0.1:8780/chat`；
-- **想在 QQ 上聊**：支持通用 OneBot v11 正向 WebSocket（协议端需自备，本项目不提供也不绑定某一家，接口要求见 [docs/DEPLOY.md](docs/DEPLOY.md)），**目前仅在模拟 OneBot 服务器测试通过，未在真实 QQ 账号测试**；接入风险自担，先读 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)；后台常驻（systemd / compose）和与协议端并排部署见 [docs/DEPLOY.md](docs/DEPLOY.md)，`ai-house doctor --onebot-ping` 可检查连通。
+- **想在 QQ 上聊**：支持通用 OneBot v11 正向 WebSocket（协议端需自备，本项目不提供也不绑定某一家，接口要求见 [docs/DEPLOY.md](docs/DEPLOY.md)），**自动化测试用的是模拟 OneBot 服务器；真实 QQ 上只验证过房主私聊的文字收发，群聊、图片语音和长时间运行还没在真号上试过**；接入风险自担，先读 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)；后台常驻（systemd / compose）和与协议端并排部署见 [docs/DEPLOY.md](docs/DEPLOY.md)，`ai-house doctor --onebot-ping` 可检查连通。
 
 > **默认只在本机可访问**：`ai-house up` 缺省只监听 `127.0.0.1`。要让局域网里别的设备访问，必须同时设置至少 16 位的 `AI_HOUSE_OWNER_TOKEN`（环境变量或 `.env`）再用 `--host 0.0.0.0`，不设会直接拒绝启动。`owner` 房主令牌开启全部控制与向导/管理接口；另可按需配置 `AI_HOUSE_READ_TOKEN`、`AI_HOUSE_WRITE_TOKEN`、`AI_HOUSE_PRIVATE_TOKEN`（读 / 写 / 私聊三档），脚本与 MCP 客户端统一通过 `Authorization: Bearer <令牌>` 传参。
 
 ### 方式二：Docker Compose（含可选晴空都本地双容器）
 
 ```sh
-python3 -m pip install -e .
+docker info                              # 先确认 Docker 已启动；报 "failed to connect" 就先把 Docker 开起来
+python3 -m pip install -e .              # 只是为了用 ai-house init 生成 .env；建议在方式一的虚拟环境里执行
 ai-house init                            # 生成强随机 AI_HOUSE_OWNER_TOKEN 与 CITY_BRIDGE_KEY
 docker compose up -d --build             # 单容器启动，只发布 127.0.0.1:8780
 ```

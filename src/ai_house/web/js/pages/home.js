@@ -69,7 +69,7 @@ export async function render(view, _route, ctx){
       temp ? el('span', {class: 'chip'}, `${temp}${rain}`) : null,
       el('span', {class: 'chip acc'}, state.pack_profile || 'life1'),
       el('span', {class: 'chip ' + (state.llm_mode === 'live_api' ? 'ok' : '')}, state.llm_mode === 'live_api' ? 'Live LLM' : '演示引擎'),
-      hasTier('write') ? el('button', {type: 'button', class: 'btn sm primary', onclick: () => stepWorld(0)}, icon('play'), '+1 步') : null);
+      state.manual_time_control && hasTier('owner') ? el('button', {type: 'button', class: 'btn sm primary', onclick: () => stepWorld(0)}, icon('play'), '+1 步') : null);
   }
 
   function drawHero(resList){
@@ -152,7 +152,7 @@ export async function render(view, _route, ctx){
             m.badge ? el('span', {class: 'tag'}, m.badge) : null,
             el('span', {class: 'tiny muted'}, fmtTime(m.created_at))),
           el('div', {class: 'txt'}, m.text),
-          chatMediaNodes(m.media)))) : empty(chatErr || '群里还没有对话，发一句和大家打个招呼吧。'));
+          chatMediaNodes(m.media))) : empty(chatErr || '群里还没有对话，发一句和大家打个招呼吧。'));
       listEl.scrollTop = listEl.scrollHeight;
     };
     drawMsgs();

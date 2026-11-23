@@ -172,6 +172,106 @@ class ProbeTests(unittest.TestCase):
     def test_bad_scheme(self) -> None:
         self.assertEqual(probe_onebot("http://127.0.0.1:3001")["code"], "bad_url")
 
+    # ---- hints found on a real deployment ------------------------------------------------------------------------
+    def test_timeout_on_host_docker_internal_blames_the_firewall_not_the_address(self) -> None:
+        with mock.patch("websockets.sync.client.connect", side_effect=TimeoutError("timed out")):
+            res = probe_onebot("ws://host.docker.internal:3001", WS_TOKEN, timeout_s=2.0)
+        self.assertEqual((res["ok"], res["code"]), (False, "unreachable"), res)
+        self.assertIn("防火墙", res["detail"])
+        self.assertIn("网桥", res["detail"])
+        self.assertIn("host 网络", res["detail"])
+        self.assertIn("ws://127.0.0.1", res["detail"])
+        self.assertNotIn("不能写 127.0.0.1", res["detail"])  # the generic "use host.docker.internal" advice is wrong here
+        self.assertNotIn(WS_TOKEN, res["detail"])
+
+    def test_timeout_on_another_machine_does_not_talk_about_docker(self) -> None:
+        with mock.patch("websockets.sync.client.connect", side_effect=TimeoutError("timed out")):
+            res = probe_onebot("ws://onebot.example.internal:3001", WS_TOKEN, timeout_s=2.0)
+        self.assertEqual((res["ok"], res["code"]), (False, "unreachable"), res)
+        self.assertIn("超时", res["detail"])
+        self.assertIn("防火墙", res["detail"])
+        self.assertNotIn("Docker", res["detail"])
+        self.assertNotIn("网桥", res["detail"])
+
+    def test_refused_on_host_docker_internal_does_not_tell_them_to_use_it_again(self) -> None:
+        with mock.patch("websockets.sync.client.connect", side_effect=ConnectionRefusedError(111, "refused")):
+            res = probe_onebot("ws://host.docker.internal:3001", WS_TOKEN, timeout_s=2.0)
+        self.assertEqual((res["ok"], res["code"]), (False, "unreachable"), res)
+        self.assertIn("0.0.0.0", res["detail"])
+        self.assertNotIn("不能写 127.0.0.1", res["detail"])
+
+    def test_unresolvable_host_docker_internal_says_so(self) -> None:
+        with mock.patch("websockets.sync.client.connect", side_effect=socket.gaierror(-2, "Name or service not known")):
+            res = probe_onebot("ws://host.docker.internal:3001", WS_TOKEN, timeout_s=2.0)
+        self.assertEqual((res["ok"], res["code"]), (False, "unreachable"), res)
+        self.assertIn("解析不了", res["detail"])
+        self.assertNotIn("防火墙", res["detail"])
+
+    def test_refused_on_loopback_keeps_the_docker_hint(self) -> None:
+        for host in ("127.0.0.1", "localhost"):
+            with mock.patch("websockets.sync.client.connect", side_effect=ConnectionRefusedError(111, "refused")):
+                res = probe_onebot(f"ws://{host}:3001", WS_TOKEN, timeout_s=2.0)
+            self.assertEqual((res["ok"], res["code"]), (False, "unreachable"), res)
+            self.assertIn("ws://host.docker.internal:端口，不能写 127.0.0.1", res["detail"])
+
+    def test_unauthorized_hint_mentions_the_http_port_mixup(self) -> None:
+        srv = self.fake()
+        for token in (WS_TOKEN + "-typo", ""):
+            res = probe_onebot(srv.url, token, timeout_s=5)
+            self.assertEqual(res["code"], "unauthorized", res)
+            self.assertIn("HTTP 接口端口", res["detail"])
+            self.assertIn("正向 WebSocket 端口", res["detail"])
+        self.assertNotIn("typo", res["detail"])
+
+    def _raw_tcp_server(self, reply: bytes) -> int:
+        """Accepts connections, reads the request, answers `reply` verbatim (not a WebSocket handshake) and hangs up."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                with contextlib.closing(conn):
+                    conn.settimeout(2.0)
+                    try:
+                        conn.recv(4096)
+                        if reply:
+                            conn.sendall(reply)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(srv.close)
+        self.addCleanup(stop.set)
+        return srv.getsockname()[1]
+
+    def test_garbage_or_hangup_during_the_handshake_is_a_bad_handshake(self) -> None:
+        for reply in (b"\x00\x01 not http at all \r\n\r\n", b"HELLO WORLD no line ending", b""):
+            port = self._raw_tcp_server(reply)
+            res = probe_onebot(f"ws://127.0.0.1:{port}", WS_TOKEN, timeout_s=3.0)
+            self.assertEqual((res["ok"], res["code"]), (False, "bad_handshake"), (reply, res))
+            self.assertIn("不是 OneBot 的正向 WebSocket 端口", res["detail"])
+            self.assertNotIn(WS_TOKEN, res["detail"])
+
+    def test_timeout_after_the_port_opened_is_not_blamed_on_the_firewall(self) -> None:
+        with mock.patch("websockets.sync.client.connect", side_effect=TimeoutError("timed out during opening handshake")):
+            res = probe_onebot("ws://host.docker.internal:3001", WS_TOKEN, timeout_s=2.0)
+        self.assertEqual((res["ok"], res["code"]), (False, "unreachable"), res)
+        self.assertNotIn("防火墙", res["detail"])
+        self.assertIn("握手", res["detail"])
+
+    def test_invalid_message_is_classified_as_bad_handshake_even_if_raised_directly(self) -> None:
+        from websockets.exceptions import InvalidMessage
+
+        with mock.patch("websockets.sync.client.connect", side_effect=InvalidMessage("did not receive a valid HTTP response")):
+            res = probe_onebot("ws://127.0.0.1:3001", "", timeout_s=2.0)
+        self.assertEqual((res["ok"], res["code"]), (False, "bad_handshake"), res)
+
 
 class DoctorCliTests(unittest.TestCase):
     def run_doctor(self, env: Dict[str, str], *flags: str) -> Dict[str, Any]:

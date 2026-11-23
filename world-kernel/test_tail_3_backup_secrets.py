@@ -156,6 +156,16 @@ class RestoreKeepsSecretsTests(_Base):
             cli_main(["restore", arc, "--data-dir", str(self.rt), "--overwrite", "--json"])
         self.assertTrue(json.loads(out2.getvalue())["secrets_missing"])
 
+    def test_cli_restore_onto_existing_data_names_the_real_flag(self) -> None:
+        arc = self._seed()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli_main(["restore", arc, "--data-dir", str(self.rt)])
+        self.assertNotEqual(rc, 0)
+        text = out.getvalue() + err.getvalue()
+        self.assertIn("--overwrite", text)
+        self.assertNotIn("overwrite=True", text)
+
 
 class ArchivePathTests(_Base):
     def _restore_fails(self, arc: Path) -> None:

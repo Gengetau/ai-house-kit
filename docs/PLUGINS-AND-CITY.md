@@ -53,8 +53,10 @@ self.host.record_sent(did, key)          # 发送成功后记账；发送失败�
 宿主默认只监听 `127.0.0.1`。监听其他地址必须设置至少 16 位的 `AI_HOUSE_OWNER_TOKEN`，否则拒绝启动。网页、REST 与 `/mcp` 都验令牌，分三档：
 
 - **读**：状态、食材、群聊历史、事件流；
-- **写**：房主化身、补货、快进、出门、向群聊发言；
+- **写**：房主化身、补货、出门、向群聊发言；
 - **私聊**：读取或发送与某位室友的私聊（单独一档）。
+
+小屋的时间归内核管：按真实时钟运行时，任何令牌都不能补步或快进（`POST /api/step` 返回 409）。只有用 `--virtual-clock` 启动的演示小屋接受手动推进，而且只认房主令牌。
 
 房主令牌开全部三档；`AI_HOUSE_READ_TOKEN` / `AI_HOUSE_WRITE_TOKEN` / `AI_HOUSE_PRIVATE_TOKEN` 各开一档。没有令牌时只能从本机访问，并拒绝非回环的 Host 头和跨站 POST。令牌用 `Authorization: Bearer <令牌>`（或 `X-AI-House-Token`）传递，任何接口都不接受放在 URL 里的 `?token=`（代理和访问日志会留存 URL）；网页的事件流用带请求头的 fetch 流订阅。
 

@@ -21,7 +21,8 @@
 ```sh
 git clone https://github.com/Gengetau/ai-house-kit.git
 cd ai-house-kit
-python3 -m pip install -e ".[dev]"   # Windows: py -3.13 -m pip install -e ".[dev]"
+python3 -m venv .venv && . .venv/bin/activate   # Windows: py -3 -m venv .venv, then .venv\Scripts\activate
+python3 -m pip install -e .          # add ".[onebot]" for QQ, ".[dev]" to run the tests
 ai-house init && ai-house doctor
 ai-house up
 ```
@@ -35,7 +36,8 @@ Open **`http://127.0.0.1:8780`** (using your `AI_HOUSE_OWNER_TOKEN` from `.env`,
 ## Docker Compose (Single & City Profiles)
 
 ```sh
-python3 -m pip install -e .
+docker info                          # make sure the Docker daemon is running first
+python3 -m pip install -e .          # only needed for `ai-house init`; use the virtual environment from above
 ai-house init
 docker compose up -d --build
 # Or include the local Qingkong City container (set WORLD_KERNEL_CITY_BRIDGE=1 in .env):

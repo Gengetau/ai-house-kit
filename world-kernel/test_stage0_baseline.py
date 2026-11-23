@@ -399,8 +399,8 @@ class Stage0ModelCompatTests(unittest.TestCase):
         replies = res.get("replies") or []
         self.assertTrue(replies)
         self.assertEqual(replies[0]["mode"], "demo")
-        self.assertIn("HTTP 400", replies[0]["text"])
-        self.assertIn("[REDACTED]", replies[0]["text"])
+        self.assertIn("模型拒绝了请求里的某个参数", replies[0]["text"])  # chat bubble: short Chinese reason only
+        self.assertNotIn("HTTP 400", replies[0]["text"])
         self.assertNotIn(secret_key, replies[0]["text"])
         self.assertNotIn("sk-mockLeak99887766", replies[0]["text"])
 
