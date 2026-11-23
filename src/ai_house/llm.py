@@ -236,6 +236,10 @@ def _llm_error_kind(err: Any, raw: str) -> str:
         return "auth"
     if code == 404 or "model_not_found" in low:
         return "model"
+    if code == 400 and "model" in low and any(
+        t in low for t in ("unexpected model name", "model name format", "invalid model", "unknown model", "not found", "does not exist")
+    ):
+        return "model"
     if code == 429:
         return "rate"
     if 500 <= code <= 599:
@@ -277,18 +281,23 @@ def _extract_http_error_detail(exc: urllib.error.HTTPError, api_key: str = "") -
     if raw:
         try:
             doc = json.loads(raw)
-            err = doc.get("error")
-            if isinstance(err, dict):
-                parts = [str(err.get("message") or "").strip()]
-                if err.get("param"):
-                    parts.append(f"param={err['param']}")
-                if err.get("code"):
-                    parts.append(f"code={err['code']}")
-                raw = "; ".join(p for p in parts if p)
-            elif isinstance(err, str):
-                raw = err
-            elif doc.get("message"):
-                raw = str(doc.get("message"))
+            if isinstance(doc, list):  # some providers (Gemini's OpenAI-compatible endpoint) wrap the body in a list
+                doc = next((d for d in doc if isinstance(d, dict)), None)
+            if isinstance(doc, dict):
+                err = doc.get("error")
+                if isinstance(err, dict):
+                    parts = [str(err.get("message") or "").strip()]
+                    if err.get("param"):
+                        parts.append(f"param={err['param']}")
+                    if err.get("code"):
+                        parts.append(f"code={err['code']}")
+                    if err.get("status"):
+                        parts.append(f"status={err['status']}")
+                    raw = "; ".join(p for p in parts if p)
+                elif isinstance(err, str):
+                    raw = err
+                elif doc.get("message"):
+                    raw = str(doc.get("message"))
         except ValueError:
             pass
     detail = " ".join(str(raw or exc.reason or f"HTTP {exc.code}").split())
