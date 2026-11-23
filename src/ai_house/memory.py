@@ -454,7 +454,7 @@ _PROBE_SUBJECT_RE = re.compile(r"我|房主|咱")
 _PROBE_QUESTION_RE = re.compile(r"[?？吗呢吧]|什么|哪|谁|几|多少|是不是|有没有")
 NO_MEMORY_NOTE = (
     "（你的记忆里没有找到和这个问题相关的内容。照实说你不记得、不知道，不要编、不要猜，"
-    "也不要替别人回答；除非这件事就写在下面“最近几句对话”里。）"
+    "也不要替别人回答；除非这件事就出现在你们这次对话的前文里。）"
 )
 FALLBACK_RECENT_PRIVATE = 3  # 「我之前告诉你的那件事」: no content word to match on, so the latest private notes
 
