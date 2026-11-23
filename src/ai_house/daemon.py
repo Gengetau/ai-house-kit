@@ -41,7 +41,7 @@ from .chat_identity import Speaker, member_speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
-from .intents import CommitmentStore, diet_memo_blocked
+from .intents import CommitmentStore, diet_memo_blocked, reply_declines
 from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
@@ -698,7 +698,10 @@ class HouseDaemon:
                 continue
             if r["kind"] == "errand" and (r.get("item") or r.get("raw_item")):
                 label = str((ingredients.get(r.get("item")) or {}).get("label") or r.get("raw_item") or r.get("item"))
-                text = f"之前答应你买的{label.split('（', 1)[0]}，一直没买成，已经过期了。还要的话再跟我说一声。"
+                if r.get("item"):
+                    text = f"之前答应你买的{label.split('（', 1)[0]}，一直没买成，已经过期了。还要的话再跟我说一声。"
+                else:
+                    text = f"之前帮你记的「{label}」提醒已经过期了。这个我买不了，还是得你自己想办法哦。"
             else:
                 text = f"之前答应你的「{str(r['summary'])[:30]}」没能办成，已经过期了。还要的话再跟我说一声。"
             self.enqueue_outbound(
@@ -1493,6 +1496,12 @@ class HouseDaemon:
             if not self._turn_world_ok(turn_epoch):
                 break
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
+            hint_store = self.intents
+            if speaker.is_owner and hint_store is not None:
+                # what she must know about her own errands (unbuyable item, expired promise) before she answers
+                promise_hints = hint_store.reply_hints(aid, text, now)
+                if promise_hints:
+                    mem_ctx = "\n".join(filter(None, [mem_ctx, "关于你和房主的约定（据实回答）：", *promise_hints]))
             turn_media: List[Dict[str, Any]] = []
 
             def _run_tool(
@@ -1637,7 +1646,7 @@ class HouseDaemon:
                     rep = {**rep, "media": list(turn_media)}
                 if rep["mode"] != "blocked" and speaker.is_owner:
                     cant_buy = self._unbuyable_item(text, rep)
-                    if cant_buy:
+                    if cant_buy and not reply_declines(str(rep.get("text") or "")):
                         rep = {**rep, "text": f"{rep['text']} 不过「{cant_buy}」我这边买不了，没法替你带回来，只先记个提醒。"}
             raw_replies.append((aid, rep))
 
