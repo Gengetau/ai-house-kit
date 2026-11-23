@@ -167,7 +167,8 @@ class OneBotChannel(ChannelPlugin):
         self.cfg = cfg
         self._clock = clock
         self._host: Any = None
-        self.actor = cfg.actor
+        self.actor = cfg.actor  # last resolved roommate; empty until the house has one (see `_resolve_actor`)
+        self._actor_state = ""  # last unusable-roommate state we logged ("" = fine), so the log fires on change only
         self.self_id = ""
         self._stop = threading.Event()
         self._ws: Any = None
@@ -257,18 +258,55 @@ class OneBotChannel(ChannelPlugin):
         if rt_dir is not None:
             self._spool = ChannelSpool(rt_dir)
             self._enqueue_recovered(only_ready=False)
-        roster = list(host.vocab.ROSTER)
-        if not self.actor:
-            self.actor = roster[0]
-        if self.actor not in roster:
-            raise ChannelConfigError(f"ONEBOT_ACTOR={self.actor!r} 不是这个世界里的室友（可选：{', '.join(roster)}）")
+        roster = self._live_roster()
+        if self.cfg.actor and roster and self.cfg.actor not in roster:
+            raise ChannelConfigError(f"ONEBOT_ACTOR={self.cfg.actor!r} 不是这个世界里的室友（可选：{', '.join(roster)}）")
+        actor, state = self._resolve_actor()
+        mate = actor or (f"{self.cfg.actor}（待住客创建）" if self.cfg.actor else "（尚无住客）")
         self._log(
-            f"enabled: {self.cfg.where}, roommate={self.actor}, owners={len(self.cfg.owners)}, groups={len(self.cfg.groups)}"
+            f"enabled: {self.cfg.where}, roommate={mate}, owners={len(self.cfg.owners)}, groups={len(self.cfg.groups)}"
         )
+        self._note_actor_state(state)
         for name, fn in (("reader", self._run), ("worker", self._work)):
             t = threading.Thread(target=fn, name=f"onebot-{name}", daemon=True)
             t.start()
             self._threads.append(t)
+
+    # ---- roommate resolution -------------------------------------------------------------------------------------
+    def _live_roster(self) -> List[str]:
+        """The residents the house has right now. `vocab.ROSTER` alone is not enough: an un-onboarded (or just reset)
+        house still carries the default pack's roster, so `needs_onboarding` / a missing authority means "nobody"."""
+        h = self._host
+        if h is None or getattr(h, "needs_onboarding", False) is True or getattr(h, "authority", True) is None:
+            return []
+        vocab = getattr(h, "vocab", None)
+        return [str(x) for x in (getattr(vocab, "ROSTER", None) or ())]
+
+    def _resolve_actor(self) -> Tuple[Optional[str], str]:
+        """(roommate, "") or (None, state): state is `no_resident` or `actor_missing` (configured one is gone)."""
+        roster = self._live_roster()
+        if not roster:
+            return None, "no_resident"
+        if self.cfg.actor:
+            if self.cfg.actor not in roster:
+                return None, "actor_missing"
+            self.actor = self.cfg.actor
+        else:
+            self.actor = roster[0]
+        return self.actor, ""
+
+    def _note_actor_state(self, state: str) -> None:
+        """One log line per state change (never per event, never message text or QQ numbers)."""
+        if state == self._actor_state:
+            return
+        self._actor_state = state
+        if state == "no_resident":
+            self._log("房子里还没有住客（尚未初始化或已重置），QQ 消息暂不回复；请先在网页里创建第一位住客")
+        elif state == "actor_missing":
+            self._log(
+                f"ONEBOT_ACTOR={self.cfg.actor} 已不在当前住客名单里（世界被重置或换了包），QQ 消息暂不回复；"
+                "请改成现有住客的 ID，或留空让它跟随第一位住客"
+            )
 
     def stop(self) -> None:
         self._stop.set()
@@ -466,7 +504,7 @@ class OneBotChannel(ChannelPlugin):
                         target=tgt,
                         uid=info["uid"],
                         nick=info["nick"],
-                        actor=self.actor,
+                        actor=self._resolve_actor()[0] or "",
                     )
                     if spool_id is None:
                         self._bump("duplicates")
@@ -716,12 +754,18 @@ class OneBotChannel(ChannelPlugin):
                 if self._spool is not None and spool_ids:
                     self._spool.ack(spool_ids, state="skipped")
                 return self._ignore("bot_speaker")
+            roommate, why_actor = self._resolve_actor()
+            self._note_actor_state(why_actor)
+            if roommate is None:
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped", reason=why_actor)
+                return self._ignore(why_actor)
             if kind == "private":
-                channel, key, target, actor = f"private:{self.actor}", f"private:{uid}", uid, None
+                channel, key, target, actor = f"private:{roommate}", f"private:{uid}", uid, None
             else:
                 gid = info["gid"]
                 # the owner has their own budget in a group, so members cannot use it up
-                channel, key, target, actor = f"qq-group:{gid}", f"group:{gid}:{'owner' if speaker.is_owner else 'member'}", gid, self.actor
+                channel, key, target, actor = f"qq-group:{gid}", f"group:{gid}:{'owner' if speaker.is_owner else 'member'}", gid, roommate
                 if not text:
                     text = "（只@了你一下，没说别的）"
             if not text:
@@ -847,6 +891,13 @@ class OneBotChannel(ChannelPlugin):
                 self._spool.ack(spool_ids, state="done")
             return False
 
+        send_actor, why_actor = self._resolve_actor()
+        if send_actor is None and self._host is not None:  # started, but the roommate is gone: never send as someone else
+            self._note_actor_state(why_actor)
+            if self._spool is not None and spool_ids:
+                self._spool.ack(spool_ids, state="skipped", reason=why_actor)
+            return False
+        send_actor = send_actor or self.actor
         gate = getattr(self._host, "send_gate", None) if self._host is not None else None
         did = f"ob-spool-{spool_ids[-1]}" if spool_ids else f"ob-direct-{uuid.uuid4().hex[:16]}"
         charge_key: Optional[str] = None
@@ -857,7 +908,7 @@ class OneBotChannel(ChannelPlugin):
                     self,
                     kind=kind,
                     target=str(target),
-                    actor=self.actor,
+                    actor=send_actor,
                     text="\n".join(parts),
                     delivery_id=did,
                     media_count=len(media_items),

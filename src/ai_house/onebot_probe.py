@@ -8,11 +8,35 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import time
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urlparse
 
 _DOCKER_HINT = "如果小屋跑在 Docker 里而协议端在宿主机上，地址要写 ws://host.docker.internal:端口，不能写 127.0.0.1"
+
+
+_FIREWALL_HINT = (
+    "多半是宿主机防火墙把 Docker 网络发来的包丢掉了：请放行 Docker 网桥网段访问这个端口，"
+    "或者让小屋用 host 网络运行并改用 ws://127.0.0.1:端口"
+)
+
+
+def _unreachable_hint(url: str, exc: BaseException) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if isinstance(exc, TimeoutError) and "handshake" in str(exc):
+        return "端口能连上，但对方没有应答 WebSocket 握手：这个端口可能不是 OneBot 的正向 WebSocket 端口"
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return f"协议端没有启动、端口不对，或被防火墙挡住。{_DOCKER_HINT}"
+    if isinstance(exc, TimeoutError):  # packets silently dropped: nothing refused us, nothing answered either
+        if host == "host.docker.internal":
+            return f"一直没有应答（超时）。{_FIREWALL_HINT}"
+        return "一直没有应答（超时）：地址或端口不对，或者中间有防火墙把包丢掉了"
+    if host == "host.docker.internal" and isinstance(exc, socket.gaierror):
+        return "解析不了 host.docker.internal：不在 Docker 里运行就改用 127.0.0.1；Linux 上的 Docker 需要加 extra_hosts: host.docker.internal:host-gateway"
+    if host == "host.docker.internal":  # the address is already right, so do not tell them to change it
+        return "协议端没有在宿主机上监听这个端口，或只监听了 127.0.0.1（要监听 0.0.0.0）；也请核对端口号"
+    return f"协议端没有启动、端口不对，或被防火墙挡住。{_DOCKER_HINT}"
 
 
 def _result(ok: bool, code: str, detail: str, **extra: Any) -> Dict[str, Any]:
@@ -44,7 +68,7 @@ def probe_onebot(
     if not url.startswith(("ws://", "wss://")):
         return _result(False, "bad_url", "ONEBOT_WS_URL 必须以 ws:// 或 wss:// 开头")
     try:
-        from websockets.exceptions import InvalidHandshake, InvalidStatus, WebSocketException
+        from websockets.exceptions import InvalidHandshake, InvalidMessage, InvalidStatus, WebSocketException
         from websockets.sync.client import connect
     except ImportError:
         return _result(False, "no_websockets", '缺少 websockets 依赖，请运行 `pip install ".[onebot]"`')
@@ -58,12 +82,15 @@ def probe_onebot(
         status = getattr(getattr(exc, "response", None), "status_code", 0)
         if status in (401, 403):
             hint = "ONEBOT_ACCESS_TOKEN 和协议端里设的令牌不一致" if token else "协议端设了令牌，但 ONEBOT_ACCESS_TOKEN 是空的"
+            hint += "；地址指到协议端的 HTTP 接口端口（它有自己的令牌）而不是正向 WebSocket 端口时，也会这样"
             return _result(False, "unauthorized", f"{where} 拒绝了连接（HTTP {status}）：{hint}")
         return _result(False, "bad_handshake", f"{where} 不是 OneBot 的正向 WebSocket 端口（握手返回 HTTP {status}）；请确认协议端开启了「正向 WebSocket 服务」而不是 HTTP 或反向 WebSocket")
+    except InvalidMessage:  # the peer answered, but not with an HTTP/WebSocket handshake (e.g. a plain HTTP port or garbage)
+        return _result(False, "bad_handshake", f"{where} 不是 OneBot 的正向 WebSocket 端口（对方没有按 WebSocket 握手应答）；请确认协议端开启了「正向 WebSocket 服务」而不是 HTTP 或反向 WebSocket")
     except InvalidHandshake as exc:
         return _result(False, "bad_handshake", f"{where} 握手失败（{type(exc).__name__}）；请确认这是协议端的正向 WebSocket 端口")
     except (OSError, TimeoutError, WebSocketException) as exc:
-        return _result(False, "unreachable", f"连不上 {where}（{type(exc).__name__}）：协议端没有启动、端口不对，或被防火墙挡住。{_DOCKER_HINT}")
+        return _result(False, "unreachable", f"连不上 {where}（{type(exc).__name__}）：{_unreachable_hint(url, exc)}")
     except Exception as exc:  # noqa: BLE001 - a doctor check must not crash the report
         return _result(False, "unreachable", f"连不上 {where}（{_scrub(f'{type(exc).__name__}: {exc}', token)}）")
 
