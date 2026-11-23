@@ -152,7 +152,7 @@ export async function render(view, _route, ctx){
             m.badge ? el('span', {class: 'tag'}, m.badge) : null,
             el('span', {class: 'tiny muted'}, fmtTime(m.created_at))),
           el('div', {class: 'txt'}, m.text),
-          chatMediaNodes(m.media)))) : empty(chatErr || '群里还没有对话，发一句和大家打个招呼吧。'));
+          chatMediaNodes(m.media))) : empty(chatErr || '群里还没有对话，发一句和大家打个招呼吧。'));
       listEl.scrollTop = listEl.scrollHeight;
     };
     drawMsgs();
