@@ -36,6 +36,7 @@ class _ScriptableOneBotWSServer:
 
     def __init__(self) -> None:
         self.sent_frames: list[dict[str, Any]] = []
+        self.close_after_acks: int = 0
         self.connected = threading.Event()
         self._stop = threading.Event()
         self._conns: list[Any] = []
@@ -59,6 +60,10 @@ class _ScriptableOneBotWSServer:
                 "data": {"message_id": 200 + len(self.sent_frames)},
                 "echo": frame.get("echo"),
             }))
+            if self.close_after_acks > 0 and len(self.sent_frames) >= self.close_after_acks:
+                self.close_after_acks = 0
+                ws.close()
+                return
 
     def push(self, payload: dict[str, Any]) -> None:
         ws = self._conns[-1]
@@ -236,6 +241,121 @@ class Stage2ChannelReliabilityTests(unittest.TestCase):
         self.assertTrue(_wait_until(lambda: len(ws_srv.sent_frames) == 1, timeout=5.0))
         self.assertEqual(ws_srv.sent_frames[0]["params"]["message"][0]["data"]["text"], "重启后补发第二段")
         self.assertEqual(len(calls), calls_before)  # Did NOT re-invoke LLM on restart recovery!
+
+    def test_debounced_two_message_batch_replays_remaining_bubble_only_once(self) -> None:
+        # 1) Direct ChannelSpool batch plan test
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        sp = ChannelSpool(tmp.name)
+        self.addCleanup(sp.close)
+        s1 = sp.enqueue_event(
+            "onebot_v11",
+            {"post_type": "message", "message_type": "private", "user_id": "8001", "message": "a"},
+            message_id="b-1",
+            session_key="private:8001",
+            kind="private",
+            target="8001",
+            uid="8001",
+            actor="sora",
+        )
+        s2 = sp.enqueue_event(
+            "onebot_v11",
+            {"post_type": "message", "message_type": "private", "user_id": "8001", "message": "b"},
+            message_id="b-2",
+            session_key="private:8001",
+            kind="private",
+            target="8001",
+            uid="8001",
+            actor="sora",
+        )
+        assert s1 is not None and s2 is not None
+        sp.save_reply_plan([s1, s2], ["合并泡一", "合并泡二"], target="8001", kind="private")
+        sp.record_part_sent([s1, s2], 1)
+        rec = sp.recover_unfinished("onebot_v11", only_ready=True)
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(rec[0]["spool_id"], s2)
+        self.assertEqual(rec[0]["sent_parts"], 1)
+
+        # 2) End-to-end OneBotChannel debounce + mid-reply disconnect + restart replay -> remaining bubble sent ONCE
+        tmp_ws = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_ws.cleanup)
+        ws_srv = _ScriptableOneBotWSServer()
+        self.addCleanup(ws_srv.close)
+        ws_srv.close_after_acks = 1
+
+        def _batch_llm(_sys: str, _user: str) -> tuple[str, int]:
+            return "连发合并第一段。\n\n连发合并第二段。", 16
+
+        d = HouseDaemon(
+            tmp_ws.name,
+            pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
+            env={"AI_HOUSE_TOOLS_LOOP": "0"},
+            llm_fn=_batch_llm,
+            virtual_clock=True,
+            allow_onboarding=False,
+        )
+        self.addCleanup(d.close)
+
+        ch1 = OneBotChannel(
+            OneBotConfig(
+                url=ws_srv.url,
+                owners=frozenset({"8001"}),
+                groups=frozenset({"9001"}),
+                actor="sora",
+                debounce_ms=120,
+                send_retries=0,
+                reconnect_min_s=10.0,
+                reconnect_max_s=10.0,
+            )
+        )
+        d.channels = [ch1]
+        ch1.start(d)
+        self.addCleanup(ch1.stop)
+        self.assertTrue(ws_srv.connected.wait(timeout=3.0))
+
+        ws_srv.push({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "7001",
+            "user_id": "8001",
+            "message_id": "9301",
+            "sender": {"nickname": "房主"},
+            "message": [{"type": "text", "data": {"text": "连发一"}}],
+        })
+        ws_srv.push({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "7001",
+            "user_id": "8001",
+            "message_id": "9302",
+            "sender": {"nickname": "房主"},
+            "message": [{"type": "text", "data": {"text": "连发二"}}],
+        })
+
+        assert ch1._spool is not None
+        self.assertTrue(_wait_until(lambda: len(ws_srv.sent_frames) == 1, timeout=5.0))
+        self.assertTrue(_wait_until(lambda: any(r["state"] == "reply_ready" and r["sent_parts"] == 1 for r in ch1._spool.list_rows()), timeout=5.0))
+        ch1.stop()
+
+        ws_srv.sent_frames.clear()
+        ws_srv.connected.clear()
+        ch2 = OneBotChannel(
+            OneBotConfig(
+                url=ws_srv.url,
+                owners=frozenset({"8001"}),
+                groups=frozenset({"9001"}),
+                actor="sora",
+                send_retries=1,
+                retry_backoff_s=0.05,
+            )
+        )
+        ch2.start(d)
+        self.addCleanup(ch2.stop)
+        self.assertTrue(ws_srv.connected.wait(timeout=3.0))
+        assert ch2._spool is not None
+        self.assertTrue(_wait_until(lambda: all(r["state"] == "done" for r in ch2._spool.list_rows()), timeout=5.0))
+        self.assertEqual(len(ws_srv.sent_frames), 1)
+        self.assertEqual(ws_srv.sent_frames[0]["params"]["message"][0]["data"]["text"], "连发合并第二段。")
 
 
 if __name__ == "__main__":
