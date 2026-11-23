@@ -664,6 +664,7 @@ class PluginRegistry:
             dice_tabletop,
             group_behavior,
             image_gen,
+            meme_library,
             mini_games,
             onebot_ws,
             proactive_talk,
@@ -690,6 +691,7 @@ class PluginRegistry:
             voice_io,
             image_gen,
             web_search,
+            meme_library,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 

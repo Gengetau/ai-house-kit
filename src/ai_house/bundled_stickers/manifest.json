@@ -1,0 +1,16 @@
+{
+  "pack": "ai-house-cozy-stickers",
+  "version": "1.0",
+  "license": "CC0-1.0",
+  "author": "AI House Kit Contributors",
+  "items": [
+    {"id": "cozy_tea", "title": "热茶慢饮", "mood": "relaxed", "tags": ["茶", "休息", "午后", "tea", "relax"], "file": "cozy_tea.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "cooking_pot", "title": "咕嘟炖菜中", "mood": "happy", "tags": ["做饭", "厨房", "晚饭", "cook", "dinner"], "file": "cooking_pot.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "sleepy_moon", "title": "困呼呼晚安", "mood": "sleepy", "tags": ["晚安", "睡觉", "困", "sleep", "night"], "file": "sleepy_moon.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "cheering_star", "title": "加油星星", "mood": "excited", "tags": ["加油", "开心", "赞", "cheer", "yay"], "file": "cheering_star.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "rainy_window", "title": "窗外听雨", "mood": "calm", "tags": ["下雨", "晴空都", "发呆", "rain", "calm"], "file": "rainy_window.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "cat_peek", "title": "悄悄探头", "mood": "playful", "tags": ["探头", "在吗", "猫", "peek", "hello"], "file": "cat_peek.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "note_ok", "title": "记在小本本", "mood": "helpful", "tags": ["收到", "记下", "买菜", "ok", "note"], "file": "note_ok.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"},
+    {"id": "sparkle_wave", "title": "闪亮打招呼", "mood": "cheerful", "tags": ["你好", "早安", "欢迎", "wave", "hi"], "file": "sparkle_wave.svg", "license": "CC0-1.0", "author": "AI House Kit Contributors"}
+  ]
+}
