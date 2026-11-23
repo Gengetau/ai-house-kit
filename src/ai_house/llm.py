@@ -90,10 +90,18 @@ class LLMDeadlineError(LLMAPIError):
 
     def __init__(self, message: str) -> None:
         super().__init__(504, message, detail="deadline_exceeded")
+        # True once this `ModelRouter.chat` call had put at least one HTTP request on the wire. False means the
+        # budget was already gone before anything was sent, so the endpoint was never asked (nothing was billed).
+        holder = _HTTP_SENT.get()
+        self.request_sent: bool = bool(holder and holder[0] > 0)
 
 
 # Monotonic deadline shared by everything running inside `deadline_scope` (same thread / context).
 _DEADLINE: "contextvars.ContextVar[Optional[float]]" = contextvars.ContextVar("ai_house_llm_deadline", default=None)
+
+
+# Counter of HTTP requests actually sent by the `ModelRouter.chat` call running in this context (see `request_sent`).
+_HTTP_SENT: "contextvars.ContextVar[Optional[List[int]]]" = contextvars.ContextVar("ai_house_llm_http_sent", default=None)
 
 
 @contextlib.contextmanager
@@ -105,6 +113,22 @@ def deadline_scope(budget_s: float):
     token = _DEADLINE.set(eff)
     try:
         yield eff
+    finally:
+        _DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def renewed_deadline_scope(budget_s: float):
+    """Like `deadline_scope`, but the clock restarts: the enclosing deadline is NOT inherited (not even when spent).
+
+    For work that follows a bounded step whose limit is already used up (e.g. the world step after a reply was
+    generated) and must get its own full budget. `deadline_scope` keeps its "nested scopes take the earliest"
+    rule; only a caller that explicitly asks for a renewed scope escapes the outer one, and inside it
+    `deadline_scope` nesting behaves as usual.
+    """
+    token = _DEADLINE.set(time.monotonic() + max(0.0, float(budget_s)))
+    try:
+        yield
     finally:
         _DEADLINE.reset(token)
 
@@ -260,6 +284,9 @@ def _send_chat_request(
     deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     req_timeout = _request_timeout(timeout_s, deadline)
+    sent = _HTTP_SENT.get()
+    if sent is not None:
+        sent[0] += 1
     req = urllib.request.Request(
         url,
         data=json.dumps(dict(payload), ensure_ascii=False).encode("utf-8"),
@@ -1233,7 +1260,12 @@ class ModelRouter:
         p = purpose if purpose in DEFAULT_TOTAL_BUDGET_S else "chat"
         with self._lock:
             raw = self.env.get(f"AI_HOUSE_{p.upper()}_TOTAL_BUDGET_S") or self.env.get("AI_HOUSE_LLM_TOTAL_BUDGET_S")
-        return max(_MIN_BUDGET_S, min(_safe_float(raw, DEFAULT_TOTAL_BUDGET_S[p]), _MAX_BUDGET_S))
+        # 0, negative or unparsable (and an empty value) mean "use this purpose's default", not "unlimited" and
+        # not the 0.5s floor; the floor/ceiling below only clamp positive values that were actually configured.
+        val = _safe_float(raw, DEFAULT_TOTAL_BUDGET_S[p])
+        if not val > 0:
+            val = DEFAULT_TOTAL_BUDGET_S[p]
+        return max(_MIN_BUDGET_S, min(val, _MAX_BUDGET_S))
 
     # ------------------------------------------------------------------ circuit breaker
     def _breaker_acquire(self, cap_key: Tuple[str, str]) -> str:
@@ -1332,7 +1364,16 @@ class ModelRouter:
                 return self._call_single_endpoint(ep, plain_payload, timeout_s, deadline)
             raise
 
-    def complete_messages(
+    def complete_messages(self, messages: Sequence[Dict[str, Any]], **kwargs: Any) -> LLMCallResult:
+        """Execute a chat completion (see `_complete_messages`); counts the HTTP requests this call sends so a
+        `LLMDeadlineError` can say whether the endpoint was ever asked (`request_sent`)."""
+        token = _HTTP_SENT.set([0])
+        try:
+            return self._complete_messages(messages, **kwargs)
+        finally:
+            _HTTP_SENT.reset(token)
+
+    def _complete_messages(
         self,
         messages: Sequence[Dict[str, Any]],
         *,
@@ -1458,7 +1499,10 @@ class ModelRouter:
                         err_code = "EMPTY_REPLY" if exc.detail == "empty_reply" else f"HTTP_{exc.status_code}"
                         err_tokens = int(getattr(exc, "total_tokens", 0) or 0)
                         if exc.status_code in _TRANSIENT_HTTP_CODES:
-                            opened = use_breaker and self._record_breaker_failure(cap_key)
+                            # An empty 200 means the endpoint answered (it is up) but this prompt got nothing: the call
+                            # still fails and falls back, but it must not open the breaker for the whole model (it
+                            # would also block this model's chat traffic).
+                            opened = use_breaker and exc.detail != "empty_reply" and self._record_breaker_failure(cap_key)
                             retryable = (not opened) and exc.detail not in ("empty_reasoning_length", "empty_reply")
                     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                         last_exc = exc

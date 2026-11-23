@@ -98,7 +98,6 @@ async function diaryReader(view, R){
         const paras = String(item.text || '').replace(/\r\n/g, '\n').split(/\n+/).map(s => s.trim()).filter(Boolean);
         const isHeroArt = Boolean(item === e && (single || cornerSide === 'r'));
         const artAttrs = {
-          src: item.image_data_uri || '',
           alt: item.image_title || `${item.day} 日记配图`,
           class: 'dimg',
           width: 480,
@@ -106,9 +105,14 @@ async function diaryReader(view, R){
         };
         if (isHeroArt) artAttrs.fetchpriority = 'high';
         else artAttrs.loading = 'lazy';
-        const artNode = item.image_data_uri
-          ? el('figure', {class: 'diary-art'}, el('img', artAttrs))
-          : null;
+        // The list no longer embeds pictures: each one is fetched (with the token) only when its page is drawn.
+        let artNode = null;
+        if (item.image_data_uri || item.image_media_rel){
+          if (item.image_data_uri) artAttrs.src = item.image_data_uri;
+          const artImg = el('img', artAttrs);
+          if (!item.image_data_uri) bindMediaBlob(artImg, item.image_media_rel);
+          artNode = el('figure', {class: 'diary-art'}, artImg);
+        }
         return el('div', {class: 'page'},
           el('div', {class: 'flow'},
             el('h3', {}, item.day + ' 的日记'),

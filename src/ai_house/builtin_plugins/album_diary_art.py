@@ -322,7 +322,8 @@ def _route_public_items(rctx: PluginRequestContext) -> Dict[str, Any]:
         raise ValueError("公开接口仅支持 scope=world（群聊与私密相册请访问 private 权限端点）")
     act = (rctx.query.get("actor") or [""])[0].strip() or None
     lim = int((rctx.query.get("limit") or [rctx.plugin_config.get("max_items") or 24])[0])
-    items = daemon.album.list_items(scope="world", actor=act, limit=lim, include_data_uri=True)
+    inline = (rctx.query.get("inline") or ["0"])[0].strip() == "1"  # off by default: fetch images via media_url
+    items = daemon.album.list_items(scope="world", actor=act, limit=lim, include_data_uri=inline)
     return {"ok": True, "scope": "world", "items": items}
 
 
@@ -335,7 +336,8 @@ def _route_private_items(rctx: PluginRequestContext) -> Dict[str, Any]:
         sc = "private"
     act = (rctx.query.get("actor") or [""])[0].strip() or None
     lim = int((rctx.query.get("limit") or [rctx.plugin_config.get("max_items") or 24])[0])
-    items = daemon.album.list_items(scope=sc, actor=act, limit=lim, include_data_uri=True)
+    inline = (rctx.query.get("inline") or ["0"])[0].strip() == "1"
+    items = daemon.album.list_items(scope=sc, actor=act, limit=lim, include_data_uri=inline)
     return {"ok": True, "scope": sc, "items": items}
 
 

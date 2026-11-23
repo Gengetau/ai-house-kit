@@ -42,7 +42,7 @@ from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .intents import CommitmentStore
-from .llm import ModelRouter, deadline_scope, remaining_budget
+from .llm import ModelRouter, deadline_scope, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
 from .proactive import ProactiveEngine
@@ -196,6 +196,13 @@ def _env_float(raw: Any, default: float) -> float:
         return v if v == v else default
     except (TypeError, ValueError):
         return default
+
+
+def _env_budget(raw: Any, default: float) -> float:
+    """A seconds budget from the environment: 0, negative, empty or unparsable means "use the default"
+    (not "unlimited" and not the minimum clamp)."""
+    v = _env_float(raw, default)
+    return v if v > 0 else default
 
 
 class HouseDaemon:
@@ -888,7 +895,12 @@ class HouseDaemon:
             out.append(d)
         return out
 
-    def list_diaries_view(self, actor: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    def list_diaries_view(
+        self, actor: Optional[str] = None, limit: int = 20, *, inline_images: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Diaries, newest first. An illustrated diary carries `image_media_rel` / `image_media_url`; the picture
+        itself is fetched separately. `inline_images=True` also embeds it as `image_data_uri` (one base64 image per
+        diary, so a long list gets large)."""
         if self.needs_onboarding or self.diary is None:
             return []
         rows = self.diary.list_diaries(actor=actor, limit=limit)
@@ -896,10 +908,13 @@ class HouseDaemon:
             for item in rows:
                 alb_id = str(item.get("image_album_id") or "").strip()
                 if alb_id:
-                    art = self.album.get_item(alb_id, expected_scope="world", include_data_uri=True)
-                    if art and art.get("data_uri"):
-                        item["image_data_uri"] = art["data_uri"]
+                    art = self.album.get_item(alb_id, expected_scope="world", include_data_uri=inline_images)
+                    if art and art.get("media_rel"):
+                        item["image_media_rel"] = art["media_rel"]
+                        item["image_media_url"] = art.get("media_url") or ""
                         item["image_title"] = art.get("title") or ""
+                        if inline_images and art.get("data_uri"):
+                            item["image_data_uri"] = art["data_uri"]
         return rows
 
     def list_album_view(
@@ -1202,6 +1217,10 @@ class HouseDaemon:
             raise ValueError(f"不支持的群聊行为操作：{op or '(空)'}")
         return self.get_group_behavior_view()
 
+    def _life_step_budget(self) -> float:
+        router = getattr(self, "model_router", None)
+        return router.resolve_total_budget("life") if router is not None else 45.0
+
     def converse(
         self,
         channel: str,
@@ -1214,16 +1233,17 @@ class HouseDaemon:
         """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
 
         Each reply (its retries, fallbacks and tool rounds) is bounded by the chat budget
-        (`AI_HOUSE_LLM_TOTAL_BUDGET_S`, default 45s). The whole turn - attachment analysis, every reply and the
-        life-model calls of the following world step - is bounded by a ceiling of one chat budget per possible
-        responder: the house `group` room may have up to two roommates answer, every other room has one.
-        `AI_HOUSE_CONVERSE_BUDGET_S` overrides the ceiling. A hanging endpoint therefore cannot stretch one turn
+        (`AI_HOUSE_LLM_TOTAL_BUDGET_S`, default 45s). Generating the replies (attachment analysis + every reply) is
+        bounded by a ceiling of one chat budget per possible responder: the house `group` room may have up to two
+        roommates answer, every other room has one. The world step that follows does not inherit what is left of
+        that ceiling: it gets a fresh life-purpose budget (`_life_step_budget`). `AI_HOUSE_CONVERSE_BUDGET_S` overrides the ceiling
+        (0 or empty = default). A hanging endpoint therefore cannot stretch one turn
         to minutes, while a healthy but slow model still gets to finish a two-roommate group turn.
         """
         router = getattr(self, "model_router", None)
         budget = router.resolve_total_budget("chat") if router is not None else 45.0
         responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
-        ceiling = _env_float(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
+        ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
             return self._converse(channel, text, speaker, actor=actor, attachments=attachments)
 
@@ -1253,7 +1273,8 @@ class HouseDaemon:
                 "channel": channel,
                 "replies": [],
                 "ignored": "bot_speaker",
-                "messages": self.list_chat(channel, limit=40),
+                # a bot is never shown a private room's history
+                "messages": [] if str(channel or "").strip().lower().startswith("private:") else self.list_chat(channel, limit=40),
             }
         if not speaker.is_owner:
             text = one_line(text)  # a member's message stays one line of its own in every later prompt
@@ -1389,7 +1410,7 @@ class HouseDaemon:
         post_reply_specs: List[Any] = []
         if isinstance(attachments, Mapping) and attachments and proc_specs:
             # Total budget for the pre-reply attachment pipeline (default 10s).
-            att_budget = max(0.5, min(_env_float(self.env.get("AI_HOUSE_ATTACHMENT_BUDGET_S"), 10.0), 120.0))
+            att_budget = max(0.5, min(_env_budget(self.env.get("AI_HOUSE_ATTACHMENT_BUDGET_S"), 10.0), 120.0))
             post_reply_specs = [x for x in proc_specs if getattr(x[1], "after_reply", False)]
             media_notes.extend(
                 _run_att_procs([x for x in proc_specs if not getattr(x[1], "after_reply", False)], att_budget)
@@ -1604,7 +1625,10 @@ class HouseDaemon:
                 )
                 replies.append(rep)
 
-            self.authority.step()
+            # The reply may have used up this turn's deadline; the world step is not part of "generate the reply", so
+            # it gets its own fresh life-purpose budget instead of inheriting the spent one.
+            with renewed_deadline_scope(self._life_step_budget()):
+                self.authority.step()
             if gb_enabled:
                 delivered_cnt = len([r for r in replies if r.get("mode") not in ("blocked", "sleeping")])
                 self.group_behavior.note_group_replies(channel, speaker, delivered_cnt, now=now)
@@ -2796,7 +2820,8 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 qs = parse_qs(parsed.query)
                 act = (qs.get("actor") or [None])[0]
                 lim = _qs_int(qs, "limit", 20)
-                self._send_json({"ok": True, "diaries": daemon.list_diaries_view(actor=act, limit=lim)})
+                inline = (qs.get("inline") or ["0"])[0].strip() == "1"  # off by default, same as /api/album
+                self._send_json({"ok": True, "diaries": daemon.list_diaries_view(actor=act, limit=lim, inline_images=inline)})
                 return
             if parsed.path == "/api/album":
                 qs = parse_qs(parsed.query)

@@ -322,6 +322,38 @@ class AlbumDefaultsAndArchiveTiming(unittest.TestCase):
         st, body = _http_get(f"{base}/api/album?scope=world&inline=1", token="owner-tok-t5")
         self.assertTrue(json.loads(body)["items"][0]["data_uri"].startswith("data:image/png;base64,"))
 
+    def test_plugin_album_routes_do_not_inline_images_unless_asked(self):
+        d = _album_daemon(self)
+        d.album.add_item(scope="world", actor="sora", channel="diary", kind="diary_art", raw_bytes=TINY_PNG, now=1.0)
+        d.album.add_item(scope="private", actor="sora", channel="private:sora", kind="chat_image", raw_bytes=TINY_PNG, now=2.0)
+        for sub, query in (("items", {}), ("private", {"scope": ["private"]})):
+            with self.subTest(route=sub):
+                path = f"/api/plugins/album_diary_art/{sub}"
+                hit = d.find_plugin_route("GET", path)
+                self.assertIsNotNone(hit)
+                res = d.execute_plugin_route(hit[0], hit[1], method="GET", path=path, query=dict(query), body=None)
+                self.assertTrue(res["items"], res)
+                self.assertNotIn("data_uri", res["items"][0])
+                self.assertTrue(res["items"][0]["media_url"].startswith("/api/album/media?path="))
+                res = d.execute_plugin_route(
+                    hit[0], hit[1], method="GET", path=path, query={**query, "inline": ["1"]}, body=None)
+                self.assertTrue(res["items"][0]["data_uri"].startswith("data:image/png;base64,"))
+
+    def test_bot_speaker_gets_no_private_history_back(self):
+        from ai_house.chat_identity import bot_speaker
+
+        d = _album_daemon(self)
+        d.converse("private:sora", "只对你说的一句话", owner_speaker("房主"))
+        self.assertTrue(d.list_chat("private:sora", limit=10))
+        for channel in ("private:sora", " PRIVATE:sora"):
+            with self.subTest(channel=channel):
+                res = d.converse(channel, "ping", bot_speaker("报时器", "8019", "bot:noise"))
+                self.assertEqual(res["ignored"], "bot_speaker")
+                self.assertEqual(res["messages"], [])
+        d.converse("group", "大家好", owner_speaker("房主"))
+        res = d.converse("group", "ping", bot_speaker("报时器", "8019", "bot:noise"))
+        self.assertTrue(res["messages"], "the public room's history is still returned")
+
     def test_chat_image_is_archived_after_the_reply_not_before(self):
         seen_during_reply = []
         holder = {}
