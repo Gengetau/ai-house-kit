@@ -875,6 +875,21 @@ class OneBotChannel(ChannelPlugin):
                 raise NotSent(code_a)
             else:
                 raise TimeoutError(code_a)
+        image_b64 = str(payload.get("image_base64") or "").strip()
+        if image_b64:
+            action = "send_group_msg" if kind == "group" else "send_private_msg"
+            param_key = "group_id" if kind == "group" else "user_id"
+            ok_i, code_i, ext_i, lw_i = self._call_detailed(
+                action,
+                {param_key: int(target), "message": [{"type": "image", "data": {"file": f"base64://{image_b64}"}}]},
+            )
+            if ok_i:
+                sent_any = True
+                last_ref = ext_i
+            elif not sent_any and not lw_i:
+                raise NotSent(code_i)
+            else:
+                raise TimeoutError(code_i)
         with self._ref_lock:
             self._delivered_refs[delivery_id] = last_ref
         return last_ref
