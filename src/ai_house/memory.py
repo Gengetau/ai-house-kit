@@ -587,9 +587,20 @@ _RELAY_RE = re.compile(
 )
 
 
+_RELAY_FIRST_PERSON_RE = re.compile(r"^[\s，,：:、“\"'「『]*(?:我|咱|俺|本人)")
+
+
 def _is_relayed_line(line: str) -> bool:
-    """True when a line reports what somebody else said ("小林说他对花生过敏"), not the speaker's own statement."""
-    return bool(_RELAY_RE.search(str(line or "")))
+    """True when a line reports what somebody else said about a third party ("小林说他对花生过敏").
+
+    A report whose content is about the speaker themself ("医生说我对花生过敏", "老板告诉我我下周出差") is still the
+    speaker's own first-hand information and is not treated as relayed.
+    """
+    text = str(line or "")
+    for m in _RELAY_RE.finditer(text):
+        if not _RELAY_FIRST_PERSON_RE.match(text[m.end():]):
+            return True
+    return False
 
 
 def resolve_db_path(data_dir_or_db: Union[str, Path]) -> Path:

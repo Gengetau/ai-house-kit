@@ -80,9 +80,16 @@ _DISH_WORDS = ("咖喱", "火锅", "寿喜锅", "乌冬", "拉面", "意面", "�
 _VALID_KINDS = frozenset({"errand", "cook", "memo", "outing", "together", "chat_promise"})
 _PAST_OR_NEG_BUY_WORDS = ("买好了", "买好啦", "买完了", "买完啦", "买到了", "买回来了", "买过了", "不用买", "别买")
 
-_BUY_VERB = r"(?:买|带(?=[点些一二两俩三四五六七八九十\d把包瓶盒袋份条])|捎|采购|补货)"
+_NUMERAL_CHARS = "一二两俩三四五六七八九十0123456789"
+_MEASURE_CHARS = "节包袋瓶盒斤个颗根把块份只串支条箱罐件双杯"
+# "买卖/买单/买账" are not purchases; "买一下X/买下X" is the verb plus a complement ("下午茶", "下酒菜" stay nouns).
+# "带" only counts with a quantity right after it ("带瓶可乐"), never as "带一下…" ("带一下路/孩子").
+_BUY_VERB = (
+    r"(?:买(?![卖单账])(?:一下|下(?![午酒饭班面载水]))?|带(?!一?下)(?=[点些一二两俩三四五六七八九十\d"
+    + _MEASURE_CHARS + r"])|捎|采购|补货)"
+)
 _QTY = (
-    r"\s*(?:[一二两俩三四五六七八九十\d]+\s*[节包袋瓶盒斤个颗根把块份只串支条箱罐件双]?|点(?!心)|些|[个把包瓶盒袋份条])?\s*"
+    r"\s*(?:[一二两俩三四五六七八九十\d]+\s*[" + _MEASURE_CHARS + r"]?|点(?!心)|些|[个把包瓶盒袋份条杯根只斤罐箱支颗串])?\s*"
 )
 _NOUN = r"([\u4e00-\u9fffA-Za-z0-9]{1,12})"
 _LENIENT_BUY_RE = re.compile(_BUY_VERB + _QTY + _NOUN)
@@ -114,11 +121,27 @@ _NEG_BUY_RE = re.compile(
     r"(?:不用|不必|无需|不需要|用不着|不要|不想|没有?|不)(?:再|要|用|去|来|给)?(?:买|带|捎|采购|补)|"
     r"别(?:再|去|要|乱)?(?:买|带|捎|采购)|[买带捎]不(?:起|到|了|着|成)"
 )
-_NOUN_CUT_RE = re.compile(r"回来|回去|给我|给你|给他|给她|还有|以及|然后|[和跟与及、吧呢啊呀哦嘛吗啦了啰喔哟噢哈呗来去就再]")
+_NOUN_CUT_RE = re.compile(r"回来|回去|上来|下来|过来|上去|进来|给我|给你|给他|给她|还有|以及|然后|[和跟与及、吧呢啊呀哦嘛吗啦了啰喔哟噢哈呗来去就再]")
 _NOUN_REJECT_RE = re.compile(
-    r"^(?:这|那|哪|什么|啥|它|他|她|自己|别的|其他|其它|东西|一点|[买带捎]|好吃|好喝|吃的|喝的|用的)|^[点些]$"
+    r"^(?:这|那|哪|什么|啥|它|他|她|自己|别的|其他|其它|东西|一点|[买带捎卖]|好吃|好喝|吃的|喝的|用的)|^(?:[点些单账]|一?下)$"
 )
-_ABSTRACT_NOUNS = frozenset({"钱", "觉", "时间", "运气", "命", "心", "力", "气", "自由"})
+_ABSTRACT_NOUNS = frozenset({
+    "钱", "觉", "时间", "运气", "命", "心", "力", "气", "自由", "教训", "开心", "安心", "放心", "明白", "面子", "单", "账",
+})
+# A lone measure word is not an item ("麻烦买一瓶"); "包" is also a real thing when no numeral precedes it ("买个包").
+_MEASURE_NOUN_OK = frozenset({"包"})
+# "买包子": the bare measure belongs to the noun.
+_MEASURE_COMPOUNDS = (
+    "包子", "包菜", "盒饭", "盒子", "瓶子", "袋子", "杯子", "杯面", "罐头", "罐子", "箱子", "条幅", "条纹", "个人", "根茎", "支架",
+)
+# Things one carries, passes on or leads rather than buys ("请带把伞", "捎个话", "带个头").
+_CARRY_NOT_BUY = (
+    "伞", "钥匙", "手机", "钱包", "身份证", "证件", "头", "话", "路", "队", "人", "孩子", "娃", "口信", "外套", "衣服",
+    "口罩", "充电器", "电脑", "书包", "耳机", "眼镜", "脑子",
+)
+_BUY_VERB_FIND_RE = re.compile(r"买|带|捎|采购|补货")
+# A request marker in the clause right before a verb-initial purchase clause ("路过便利店，捎份报纸").
+_PREV_CLAUSE_MARKER_RE = re.compile(r"路过|顺路|顺便|顺带|麻烦|拜托|劳驾|帮我|帮忙")
 _OUTING_DEST_MAP = (
     (("超市", "杂货", "买菜"), ("supermarket", "shop", "grocery", "market", "shotengai", "超市", "商店街")),
     (("商店街",), ("shotengai", "商店街")),
@@ -177,6 +200,26 @@ def _clean_buy_noun(raw: str) -> str:
     return noun[:24]
 
 
+def _match_buy_noun(m: "re.Match[str]") -> str:
+    """Item of a purchase match, or "" when the captured word is not something to buy."""
+    raw = m.group(1) or ""
+    if not raw:
+        return ""
+    head = m.string[m.start():m.start(1)].rstrip()
+    lead, before_lead = head[-1:], head[-2:-1]
+    if lead in _MEASURE_CHARS and before_lead not in _NUMERAL_CHARS and (lead + raw).startswith(_MEASURE_COMPOUNDS):
+        raw = lead + raw
+    noun = _clean_buy_noun(raw)
+    if not noun:
+        return ""
+    if len(noun) == 1 and noun in _MEASURE_CHARS and (lead in _NUMERAL_CHARS or noun not in _MEASURE_NOUN_OK):
+        return ""
+    verbs = _BUY_VERB_FIND_RE.findall(head)
+    if verbs and verbs[-1] in ("带", "捎") and noun.startswith(_CARRY_NOT_BUY):
+        return ""
+    return noun
+
+
 def extract_raw_buy_noun(text: str) -> str:
     """Noun of the first live (non-past, non-question, non-negated) purchase clause; no marker required.
 
@@ -188,7 +231,7 @@ def extract_raw_buy_noun(text: str) -> str:
             continue
         m = _LENIENT_BUY_RE.search(clause)
         if m:
-            noun = _clean_buy_noun(m.group(1))
+            noun = _match_buy_noun(m)
             if noun:
                 return noun
     return ""
@@ -196,12 +239,17 @@ def extract_raw_buy_noun(text: str) -> str:
 
 def extract_buy_request_noun(owner_text: str, reply_text: str = "") -> str:
     """Raw item only for an explicit request to the resident or an explicit promise by the resident."""
+    prev = ""
     for clause in _clauses(owner_text):
+        before, prev = prev, clause
         if _clause_blocked(clause) or _SELF_BUY_RE.search(clause):
             continue
         m = _REQUEST_BUY_RE.search(_FORGET_RE.sub("记得", clause))
+        if m is None and before and _PREV_CLAUSE_MARKER_RE.search(before) and not _BUY_VERB_FIND_RE.search(before):
+            if not (_clause_blocked(before) or _SELF_BUY_RE.search(before)):
+                m = _LENIENT_BUY_RE.match(clause)
         if m:
-            noun = _clean_buy_noun(m.group(1))
+            noun = _match_buy_noun(m)
             if noun:
                 return noun
     promised = False
@@ -211,7 +259,7 @@ def extract_buy_request_noun(owner_text: str, reply_text: str = "") -> str:
         m = _COMMIT_BUY_RE.search(clause)
         if m:
             promised = True
-            noun = _clean_buy_noun(m.group(1) or "")
+            noun = _match_buy_noun(m)
             if noun:
                 return noun
     return extract_raw_buy_noun(owner_text) if promised else ""

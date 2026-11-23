@@ -353,6 +353,26 @@ class AtomicWriteAndMaskTests(_Base):
             self.assertEqual(os.stat(target).st_ino, ino, "in-place fallback keeps the same inode (bind mount)")
             self.assertEqual([p.name for p in self.tmp.iterdir() if ".tmp" in p.name], [], "temp file cleaned up")
 
+    def test_n9_in_place_fallback_tightens_mode_before_any_content_is_written(self) -> None:
+        target = self.tmp / ".env"
+        target.write_text("OLD=1\n")
+        os.chmod(target, 0o644)
+        ino = os.stat(target).st_ino
+        seen: list = []
+        real_fdopen = os.fdopen
+
+        def spy(fd: int, *a: object, **kw: object):
+            st = os.fstat(fd)
+            if st.st_ino == ino:
+                seen.append(st.st_mode & 0o777)  # mode at the moment the secret starts being written
+            return real_fdopen(fd, *a, **kw)
+
+        with mock.patch("ai_house.onboarding.os.replace", side_effect=OSError(errno.EBUSY, "boom")), \
+                mock.patch("ai_house.onboarding.os.fdopen", side_effect=spy):
+            atomic_write_private_text(target, "NEW=3\n")
+        self.assertEqual(target.read_text(), "NEW=3\n")
+        self.assertEqual(seen, [0o600], "a previously 0644 file must be 0600 before the new content goes in")
+
     def test_e8_mask_does_not_leak_substance(self) -> None:
         self.assertEqual(mask_secret(""), "")
         for n in (1, 8, 12, 13, 16, 19):

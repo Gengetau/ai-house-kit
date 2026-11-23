@@ -68,6 +68,17 @@ class BuyRequestParsing(_IntentBase):
         # resident explicitly promises the purchase
         ("榴莲吃完了呢", "那我这就去买榴莲", "榴莲"),
         ("买点榴莲吧", "好，我去买", "榴莲"),
+        # second-review cases: verb complements, bare measures, cross-clause markers
+        ("帮我买一下榴莲", "好", "榴莲"),
+        ("帮我买下榴莲", "好", "榴莲"),
+        ("帮我买下午茶", "好", "下午茶"),
+        ("顺路带个榴莲", "好", "榴莲"),
+        ("帮我带两杯奶茶回来", "好", "奶茶"),
+        ("麻烦带杯热可可上来", "好", "热可可"),
+        ("路过便利店，捎份报纸", "好", "报纸"),
+        ("帮我买包子", "好", "包子"),
+        ("帮我买个包", "好", "包"),
+        ("帮我买根香草荚", "好", "香草荚"),
     ]
     SHOULD_NOT_CREATE = [
         "我今天买了榴莲回来",
@@ -90,6 +101,22 @@ class BuyRequestParsing(_IntentBase):
         "我今天买了牛奶回来",
         "你买了牛奶吗",
         "不用买牛奶",
+        # second-review cases: these used to create errands for "卖", "下", "瓶", "下路", "单", "下孩子", "伞"
+        "你再给我讲讲买卖",
+        "你帮忙买一下",
+        "酱油用完了，麻烦买一瓶",
+        "能不能带一下路",
+        "可以买单吗",
+        "帮忙买个单",
+        "帮我带一下孩子",
+        "请带把伞",
+        "麻烦带个话给小林",
+        "帮我捎个口信",
+        "请带个头",
+        "帮我买个教训",
+        # nobody is asked: a subject-less sentence may just as well be the owner's own plan
+        "下班带杯奶茶",
+        "明天买点榴莲",
     ]
 
     def _errands(self, actor: str = "sora") -> List[Dict[str, Any]]:
@@ -369,7 +396,7 @@ class MemoryTrust(_MemoryBase):
 
     # --- relayed statements
     def test_owner_relaying_a_third_party_is_a_claim_marked_as_relayed(self) -> None:
-        for line in ("小林说他对花生过敏", "听说小林对花生过敏", "小林告诉我他对花生过敏"):
+        for line in ("小林说他对花生过敏", "听说小林对花生过敏", "小林告诉我他对花生过敏", "医生说小林对花生过敏"):
             with self.subTest(line=line):
                 st = self._extract([(line, "owner", "房主")],
                                    [{"op": "add", "text": "小林对花生过敏", "kind": "fact", "src": [1]}])
@@ -379,7 +406,10 @@ class MemoryTrust(_MemoryBase):
 
     def test_owner_first_hand_statements_stay_verified(self) -> None:
         for line, text in (("我对花生过敏", "房主对花生过敏"), ("小林下周来", "小林下周要来"),
-                           ("我说过我对花生过敏", "房主对花生过敏")):
+                           ("我说过我对花生过敏", "房主对花生过敏"),
+                           # what somebody told the owner about the owner is still first-hand
+                           ("医生说我对花生过敏", "房主对花生过敏"), ("医生说，我对花生过敏", "房主对花生过敏"),
+                           ("妈妈说我不能吃海鲜", "房主不能吃海鲜"), ("老板告诉我我下周出差", "房主下周出差")):
             with self.subTest(line=line):
                 st = self._extract([(line, "owner", "房主")],
                                    [{"op": "add", "text": text, "kind": "fact", "src": [1]}])

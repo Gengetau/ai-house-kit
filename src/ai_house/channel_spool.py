@@ -102,6 +102,11 @@ class _Splitter:
             body = span[3:-3] if (span.endswith("```") and len(span) >= 6) else span[3:]
             nl = body.find("\n")
             lang, content = (body[:nl], body[nl + 1 :]) if nl >= 0 else ("", body)
+            if len(lang) > 24 or not re.fullmatch(r"[\w.+#-]*", lang.strip()):
+                # Not a language tag (a very long or free-text first line): it is part of the code, otherwise
+                # repeating it on every chunk would push each chunk over the hard limit.
+                lang, content = "", body
+            lang = lang.strip()
             room = max(20, hard - len(lang) - 8)
             chunks: List[str] = []
             cur = ""

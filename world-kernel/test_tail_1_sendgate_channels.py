@@ -429,6 +429,19 @@ class SplitBubbleTests(unittest.TestCase):
         self.assertTrue(any(code in p for p in parts), "code block was cut")
         self.assertTrue(any(url in p for p in parts), "URL was cut")
 
+    def test_4_oversized_code_block_with_a_long_first_line_stays_under_the_hard_limit(self) -> None:
+        body = "\n".join(f"line {i} = {i * 7}" for i in range(260))  # ~3600 chars: has to be cut
+        for first_line in ("x" * 300, "这一行不是语言标记而是一段很长的说明" * 20, "python"):
+            with self.subTest(first_line=first_line[:12]):
+                parts = split_bubbles(f"```{first_line}\n{body}\n```", max_part_chars=400, max_parts=3)
+                self.assertLessEqual(max(len(p) for p in parts), 800)
+                joined = "\n".join(parts)
+                self.assertIn("line 0 = 0", joined)
+                self.assertIn("line 100 = 700", joined)
+                for p in parts:
+                    if "line " in p:
+                        self.assertTrue(p.startswith("```") and p.rstrip().endswith("```"), p[:40])
+
 
 # ---------------------------------------------------------------------------------------------------------------
 class OutboxCrashTests(Base):

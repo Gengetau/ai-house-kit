@@ -318,12 +318,17 @@ def _format_dotenv_value(val: str) -> str:
 def _write_in_place_private(real: Path, text: str) -> None:
     """Overwrite `real` in place (keeps inode, e.g. Docker single-file bind mounts) and force 0600."""
     fd = os.open(str(real), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    # An existing file keeps its old mode (the 0600 above only applies on creation): tighten it before any
+    # secret is written, so a previously 0644 file is never readable by others while it holds the new content.
     try:
-        os.chmod(real, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # Windows
+            os.chmod(real, 0o600)
     except OSError:
         pass
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 def atomic_write_private_text(path: Path, text: str) -> None:
