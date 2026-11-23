@@ -374,7 +374,11 @@ kit 之前的做法与此不符：`POST /api/step` 对写档令牌开放，网�
 
 没有动的：以前在真实时钟小屋上点过快进留下的时间偏移（`clock_offset.json`）仍然生效，小屋时间会继续比真实时间快那么多。要回到真实时间，只能重置小屋或删掉这个文件后重启（后者未验证事件记录里“来自未来”的条目会怎样，不建议在有数据的小屋上做）。
 
-测试：`world-kernel/test_tail_12_kernel_owns_time.py`。
+测试：`world-kernel/test_tail_12_kernel_owns_time.py`（9 条）。两种小屋各起过一栋，在浏览器里确认过管家页和首页。改动后的全量结果（本地干净检出，Python 3.13）：
+
+| 提交 | world-kernel | world-catalog | world-contract-tests |
+|---|---|---|---|
+| `92e7ada` | 1063 通过 | 22 通过 | 11 通过 |
 
 ### 11.2 同一句话，两位室友各应一条约定
 
