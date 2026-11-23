@@ -175,6 +175,98 @@ def mask_secrets(text: str, api_key: str = "") -> str:
     return _SK_SECRET_RE.sub("[REDACTED]", cleaned)
 
 
+# (reason, next step) shown to newcomers; the reason alone is what a chat bubble shows.
+_LLM_HINTS: Dict[str, Tuple[str, str]] = {
+    "auth": ("Key 不对或没有权限", "请检查 AI_HOUSE_API_KEY（或设置页里填的 Key）是否完整、是否属于这个接口"),
+    "model": ("模型名不存在", "请检查 AI_HOUSE_MODEL（或设置页里的模型名），以及 AI_HOUSE_BASE_URL 是否写对"),
+    "rate": ("请求太频繁或额度用完了", "请稍后再试，或到服务商后台查看余额和限额"),
+    "server": ("模型服务方出错了", "这通常不是你的设置问题，请稍后再试"),
+    "timeout": ("连得上但等不到回复（太慢，或被网络拦住）", "请检查 AI_HOUSE_BASE_URL、代理和网络，必要时换一个更快的模型"),
+    "refused": ("地址或端口不对，或本地模型没有启动", "请检查 AI_HOUSE_BASE_URL；如果用的是本地模型，请先启动它"),
+    "dns": ("接口地址写错了，或者没有联网", "请检查 AI_HOUSE_BASE_URL 的拼写和网络连接"),
+    "tls": ("HTTPS 证书校验失败", "请检查 AI_HOUSE_BASE_URL 是 https 还是 http、系统时间是否正确，以及代理是否替换了证书"),
+    "param": ("模型拒绝了请求里的某个参数", "请换一个模型试试，或把下面的原始信息发给维护者"),
+    "empty": ("模型返回了空回复", "请重试；若一直如此，请换一个模型"),
+    "reasoning": ("模型把输出额度都用在思考上，没有留下正文", "请换一个非推理模型，或调大输出上限"),
+    "breaker": ("刚才连续失败，暂时停止调用这个模型", "请稍等片刻再试，并检查模型设置"),
+}
+_UNKNOWN_SHORT = "原因不明（详情见设置页的「测试连接」，或运行 ai-house doctor --live-ping）"
+
+
+def _llm_error_kind(err: Any, raw: str) -> str:
+    """Classify an error into a `_LLM_HINTS` key ('' when unknown)."""
+    import socket
+    import ssl
+
+    low = raw.lower()
+    code = int(getattr(err, "status_code", 0) or 0)
+    detail = str(getattr(err, "detail", "") or "")
+    if not code:
+        m = re.search(r"\bHTTP(?: Error)? (\d{3})\b", raw)
+        code = int(m.group(1)) if m else 0
+    if detail == "empty_reply" or "empty reply" in low:
+        return "empty"
+    if detail == "empty_reasoning_length" or "reasoning tokens exhausted" in low:
+        return "reasoning"
+    if detail == "circuit_open":
+        return "breaker"
+    if isinstance(err, LLMDeadlineError):
+        return "timeout"
+    chain: List[Any] = []
+    cur: Any = err
+    while cur is not None and len(chain) < 6 and not isinstance(cur, str):
+        chain.append(cur)
+        reason = getattr(cur, "reason", None)
+        if isinstance(reason, BaseException):
+            chain.append(reason)
+        cur = cur.__cause__ or cur.__context__
+    if any(isinstance(e, ssl.SSLError) for e in chain) or "certificate" in low or "ssl:" in low or "sslerror" in low:
+        return "tls"
+    if any(isinstance(e, socket.gaierror) for e in chain) or any(
+        t in low for t in ("name or service not known", "nodename nor servname", "getaddrinfo failed", "name resolution", "errno -2]", "errno -3]", "errno -5]")
+    ):
+        return "dns"
+    if any(isinstance(e, ConnectionRefusedError) for e in chain) or any(
+        t in low for t in ("connection refused", "errno 111", "winerror 10061", "errno 61")
+    ):
+        return "refused"
+    if any(isinstance(e, TimeoutError) for e in chain) or (not code and ("timed out" in low or "timeout" in low)):
+        return "timeout"
+    if code in (401, 403):
+        return "auth"
+    if code == 404 or "model_not_found" in low:
+        return "model"
+    if code == 429:
+        return "rate"
+    if 500 <= code <= 599:
+        return "server"
+    if code == 400 and any(t in low for t in ("param", "unsupported", "unrecognized", "max_tokens", "max_completion_tokens", "temperature")):
+        return "param"
+    return ""
+
+
+def explain_llm_error(err: Any, *, secrets: Sequence[str] = (), with_detail: bool = True) -> str:
+    """Turn a model-connection error into a short Chinese explanation plus the next step.
+
+    with_detail=True (doctor / setup wizard): "<reason>，<next step>。原始信息：<original text>", the original text
+    being what the surface showed before (secrets redacted). Unknown errors keep that original text unchanged.
+    with_detail=False (chat bubble): only the short Chinese reason, never raw provider text, URLs or key fragments.
+    """
+    if isinstance(err, LLMAPIError) and err.status_code == 0 and str(err).startswith("配置错误"):
+        raw = str(err)  # already Chinese and written by us
+        kind = ""
+    else:
+        raw = str(err) if isinstance(err, (str, LLMAPIError)) else f"{type(err).__name__}: {err}"
+        kind = _llm_error_kind(err, raw)
+    for sec in secrets:
+        raw = mask_secrets(raw, api_key=sec)
+    raw = mask_secrets(raw)
+    if not kind:
+        return raw if with_detail or raw.startswith("配置错误") else _UNKNOWN_SHORT
+    reason, step = _LLM_HINTS[kind]
+    return f"{reason}，{step}。原始信息：{raw}" if with_detail else reason
+
+
 def _extract_http_error_detail(exc: urllib.error.HTTPError, api_key: str = "") -> str:
     raw = ""
     try:

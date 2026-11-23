@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import errno
 import importlib.util
 import json
@@ -20,8 +21,9 @@ from worldkernel import vocab_life1
 from .auth import BindRefused, check_bind
 from .backup import BackupVersionError, DaemonRunningError, create_backup, restore_backup, verify_backup
 from .builtin_plugins.onebot_ws import ChannelConfigError
-from .chat_agent import LLMAPIError, mask_secrets, openai_compatible_chat
-from .daemon import DaemonLockError, HouseDaemon, make_http_server
+from .chat_agent import openai_compatible_chat
+from .daemon import JST, DaemonLockError, HouseDaemon, make_http_server
+from .llm import explain_llm_error
 from .plugin_api import PluginRegistry
 
 
@@ -127,7 +129,8 @@ def cmd_up(args: argparse.Namespace) -> int:
         f"   • 标准 Streamable MCP 端点: http://{display_host}:{port}/mcp\n"
         f"   • 健康检查接口:           http://{display_host}:{port}/api/health\n"
         f"   • 当前世界包: {pack_line}\n"
-        f"   • 模型模式: {mode_label}\n",
+        f"   • 模型模式: {mode_label}\n"
+        + (f"   • 虚拟时钟: 当前小屋时间 {dt.datetime.fromtimestamp(daemon.clock.now(), JST):%Y-%m-%d %H:%M}（只在快进时前进；重启后从上次到达的时间继续）\n" if args.virtual_clock else ""),
         flush=True,
     )
     # `systemctl stop` / `docker stop` send SIGTERM: leave through the same path as Ctrl+C so the channels are
@@ -382,14 +385,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 model = eff_env.get("AI_HOUSE_MODEL", "gpt-4o-mini").strip()
                 ans, toks = openai_compatible_chat("Reply OK.", "ping", api_key=api_key, base_url=base_url, model=model, timeout_s=12.0)
                 checks.append({"name": "llm_live_ping", "ok": bool(ans), "detail": f"模型 {model} 连通 ({toks} tokens)"})
-            except LLMAPIError as exc:
-                checks.append({"name": "llm_live_ping", "ok": False, "detail": f"连通失败: {exc}"})
             except Exception as exc:  # noqa: BLE001
-                checks.append({
-                    "name": "llm_live_ping",
-                    "ok": False,
-                    "detail": f"连通失败: {mask_secrets(f'{type(exc).__name__}: {exc}', api_key=api_key)}",
-                })
+                checks.append({"name": "llm_live_ping", "ok": False, "detail": f"连通失败: {explain_llm_error(exc, secrets=[api_key])}"})
     else:
         checks.append({
             "name": "llm_mode",
@@ -531,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
     p_up.add_argument("--packs-root", default="./packs", help="自定义 WorldPack 扫描根目录（默认 ./packs）")
     p_up.add_argument("--env-file", default=".env", help="启动前加载的 .env 配置文件路径（默认 .env）")
     p_up.add_argument("--step-seconds", type=float, default=60.0, help="后台时钟推进步长（秒，默认 60.0）")
-    p_up.add_argument("--virtual-clock", action="store_true", help="使用可倍速/重启独立运行的虚拟时钟")
+    p_up.add_argument("--virtual-clock", action="store_true", help="使用可倍速的虚拟时钟：时间只在快进时前进；重启后从小屋上次到达的时间继续（首次启动为 2026-11-21 09:00）")
     p_up.set_defaults(func=cmd_up)
 
     p_in = sub.add_parser("init", help="生成带强随机令牌的 .env 配置与 runtime 目录")

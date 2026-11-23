@@ -14,7 +14,7 @@ import re
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .chat_identity import Speaker, one_line, owner_speaker, quote_untrusted
-from .llm import LLMAPIError, ModelRouter, deadline_scope, mask_secrets, openai_compatible_chat, post_openai_chat_json
+from .llm import LLMAPIError, ModelRouter, deadline_scope, explain_llm_error, mask_secrets, openai_compatible_chat, post_openai_chat_json
 
 JST = dt.timezone(dt.timedelta(hours=9))
 
@@ -349,14 +349,8 @@ class RoommateChatAgent:
                 # an empty live reply is a failure the user must see, never a silent switch to the demo persona
                 fallback_note = "（接口暂不可用 模型返回了空回复，已自动切换本地演示回复）"
             except Exception as exc:  # noqa: BLE001
-                err_msg = str(exc)
-                for sec in [self.api_key, self.fallback_api_key, *self.router.collect_secrets()]:
-                    err_msg = mask_secrets(err_msg, api_key=sec)
-                err_msg = mask_secrets(err_msg)
-                if len(err_msg) > 140:
-                    err_msg = err_msg[:137] + "..."
-                detail_str = err_msg if isinstance(exc, LLMAPIError) else f"{type(exc).__name__}: {err_msg}"
-                fallback_note = f"（接口暂不可用 {detail_str}，已自动切换本地演示回复）"
+                secrets = [self.api_key, self.fallback_api_key, *self.router.collect_secrets()]
+                fallback_note = f"（接口暂不可用 {explain_llm_error(exc, secrets=secrets, with_detail=False)}，已自动切换本地演示回复）"
         else:
             fallback_note = ""
             issue = None if self._llm_fn is not None else self.router.config_issue(purpose="chat", actor=actor_id)

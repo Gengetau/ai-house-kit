@@ -42,7 +42,7 @@ from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .intents import CommitmentStore, diet_memo_blocked
-from .llm import ModelRouter, deadline_scope, remaining_budget, renewed_deadline_scope
+from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
 from .proactive import ProactiveEngine
@@ -150,6 +150,18 @@ class OffsetWallClock:
             pass
 
 
+def _latest_house_time(life_db: str | Path) -> float:
+    """Latest time the house reached according to the persisted event log (0.0 when there is none)."""
+    if not Path(life_db).is_file():
+        return 0.0
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{Path(life_db).as_posix()}?mode=ro", uri=True)) as c:
+            row = c.execute("SELECT MAX(MAX(recorded_at), MAX(occurred_at)) FROM events").fetchone()
+        return float(row[0] or 0.0)
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0.0
+
+
 class DaemonLockError(RuntimeError):
     """Another live daemon process already owns this runtime directory."""
 
@@ -248,7 +260,7 @@ class HouseDaemon:
             self.clock: Any = clock
         elif self._virtual_clock:
             t0 = start_ts or dt.datetime(2026, 11, 21, 9, 0, tzinfo=JST).timestamp()
-            self.clock = VirtualClock(t0)
+            self.clock = VirtualClock(max(t0, _latest_house_time(self.life_db)))  # resume after a restart
         else:
             self.clock = OffsetWallClock(self.runtime_dir / "clock_offset.json")
 
@@ -2250,10 +2262,8 @@ class HouseDaemon:
                 timeout_s=12.0,
             )
             return {"ok": bool(ans), "model": model, "reply": ans[:80], "tokens": toks}
-        except LLMAPIError as exc:
-            return {"ok": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": mask_secrets(f"{type(exc).__name__}: {exc}", api_key=api_key)}
+            return {"ok": False, "error": explain_llm_error(exc, secrets=[api_key])}
 
     def complete_setup(self, body: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(body or {})
