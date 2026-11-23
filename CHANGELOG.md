@@ -20,6 +20,13 @@
   - **2.6 提醒与无状态小游戏插件（`reminders` + `mini_games`）**：基于 `reminders.db` 的作用域隔离定时提醒与 `urgent` Outbox 推送，以及零副作用猜拳/抽签/随机选/接龙工具。
   - **2.7 模型用量账本页（`#/usage`）**：支持 `today / 7d / 30d / all` 多周期聚合与最近调用明细，遵循容器查询与无障碍表格规范（`role="region"`、`tabindex="0"`、吸顶表头/吸左列与窄容器卡片堆叠）。
   - **2.8 在线热备与 32 小时回归（`ai-house backup`）**：SQLite `Connection.backup()` 热备、`PRAGMA integrity_check`、SHA-256 `manifest.json`（不打包 `.env`）、保留裁剪与恢复检验，及 32 虚拟小时契约回归（含试住问题 #2 与 #4）。
+- **阶段 3 可选服务插件 3.1–3.6（默认全部关闭）**：
+  - **3.1 看图（`vision_understand`）**：OpenAI 兼容多模态图片理解与 `media_safety` SSRF/字节限制网关；接通网页端与 OneBot 图片段自动看图，未配/故障静默降级不断聊。
+  - **3.2 语音转文字与语音合成（`voice_io`）**：纯标准库 `multipart/form-data` 调用 `/v1/audio/transcriptions` 与经发前隐私审查的 `/v1/audio/speech`（自带 `wave` 头解析），接通 OneBot 语音入站转写与 `[record]` 发送。
+  - **3.3 文生图与自带引擎接口（`image_gen`）**：支持 OpenAI `/v1/images/generations`、自建 HTTP JSON 服务协议（`byo_http`）与内存 Python 回调接口（`custom_python`），发前执行隐私/关键词审查并落盘 `runtime/media/generated/`。
+  - **3.4 联网搜索（`web_search`）**：可选 SearXNG / Tavily / Brave / 自定义 JSON 接口，出站先拦私密记忆与敏感词，入站剥离 HTML 与提示词注入伪装。
+  - **3.5 表情包库（`meme_library` + `bundled_stickers/`）**：附带 8 张原创 CC0-1.0 暖灯风 SVG 贴纸及许可证/作者校验，防止未署名与越界路径加载，并支持 OneBot `[image]` 气泡发送。
+  - **3.6 相册与日记配图（`album_diary_art` + `AlbumStore`）**：严格按 `world` / `group` / `private` 分域隔离 `album.db`（私聊照片绝不进入公共相册与日记），支持晚间日记自动配图静默降级及控制台 `#/keep/album` 相册展示与翻书插画。
 
 ## 0.2.0
 
