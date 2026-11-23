@@ -669,6 +669,7 @@ class PluginRegistry:
             reminders,
             sticker_pack,
             svg_wardrobe_studio,
+            vision_understand,
         )
 
         for mod in (
@@ -682,6 +683,7 @@ class PluginRegistry:
             proactive_talk,
             reminders,
             mini_games,
+            vision_understand,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 
