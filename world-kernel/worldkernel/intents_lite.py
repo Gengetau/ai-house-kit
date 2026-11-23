@@ -263,7 +263,13 @@ def owner_proposes_plan(owner_text: str) -> bool:
 
 _DECLINE_RE = re.compile(
     r"没法|没办法|无法|不能|不可以|不行|做不到|办不到|去不了|买不了|来不了|做不了|不方便|没空|没时间|"
-    r"改天|改成|改到|换成|拒绝|不想|不去|不买|不做|不会(?=去|买|做|帮|带)"
+    r"改天|改成|改到|换成|拒绝|不想|不去|不买|不做|不会(?=去|买|做|帮|带)|"
+    # "买不到/带不了/帮不上/去不成": the item or the errand is out of reach
+    r"买不到|带不了|带不到|帮不上|去不成|买不成|来不成|做不成|"
+    # "今天不出门 / 暂时没打算出门 / 不打算去": she is staying in, so she is not going to fetch anything
+    r"不出门|[不没]打算(?:出门|出去|去|买|带)|"
+    # "大概率不出门 / 应该不会去 / 估计不买": a hedge is still a no
+    r"(?:大概率|大概|多半|八成|应该|估计|恐怕)(?:会)?不(?:会)?(?:出门|出去|去|买|带)"
 )
 _ACCEPT_RE = re.compile(
     r"好的|好呀|好啊|好哒|好嘞|好哦|好吧|行啊|没问题|可以|当然|我会|我去|我来|交给我|包在我|答应|马上|这就|一定|收到|乐意|愿意|嗯嗯"
@@ -271,7 +277,8 @@ _ACCEPT_RE = re.compile(
 
 
 def reply_declines(reply_text: str) -> bool:
-    """True when the resident's reply turns the request down ("没法出门买鸡蛋", "能不能改成下午？").
+    """True when the resident's reply turns the request down ("没法出门买鸡蛋", "能不能改成下午？", "今天大概率不出门",
+    "榴莲我买不到").
 
     The first clause that either declines or accepts decides, so "好的，我会买，不过现在没法出门" is still an
     agreement while "我现在在家发呆，没法出门买鸡蛋" is not. A reply that does neither is not read as a refusal.

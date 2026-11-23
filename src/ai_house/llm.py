@@ -356,6 +356,53 @@ def _is_empty_reasoning_length(doc: Mapping[str, Any]) -> bool:
     return (not content) and (not tcalls)
 
 
+def _is_length_cut(doc: Mapping[str, Any]) -> bool:
+    """`finish_reason=length`: the output limit ended the answer. Thinking models spend part of `max_tokens` on thoughts
+    that never show up in `completion_tokens`, so the visible text can be a fragment (or empty)."""
+    choice = (doc.get("choices") or [{}])[0]
+    return str(choice.get("finish_reason") or "").strip().lower() == "length"
+
+
+# Retry ceiling for the "answer was cut by the output limit" path (and the highest limit remembered per endpoint).
+_MAX_REMEMBERED_LIMIT = 16384
+_SENTENCE_END_RE = re.compile(r"[。！？!?…~～]|\.(?=\s|$)")
+_CLOSERS = "」』）)”’\"'】》"
+# Purposes whose output is structured (JSON), not prose: a "last full sentence" means nothing there.
+_STRUCTURED_PURPOSES = frozenset({"life", "memory_extract", "ping"})
+
+
+def _trim_to_last_sentence(text: str) -> str:
+    """Cut a reply that was ended by the output limit back to its last complete sentence.
+
+    Closing quotes/brackets right after the terminator stay with the sentence. Text that already ends on a terminator,
+    or has no terminator at all (nothing complete to fall back to), is returned as it is.
+    """
+    t = str(text or "").rstrip()
+    core = t.rstrip(_CLOSERS)
+    if not core or _SENTENCE_END_RE.search(core[-1]):
+        return t
+    last = None
+    for m in _SENTENCE_END_RE.finditer(t):
+        last = m
+    if last is None:
+        return t
+    end = last.end()
+    while end < len(t) and t[end] in _CLOSERS + "。！？!?…~～":
+        end += 1
+    return t[:end].rstrip()
+
+
+def _raise_output_limit(payload: Mapping[str, Any], floor: int) -> Dict[str, Any]:
+    """Same payload shape, output limit lifted to at least `floor` (keeps temperature and the parameter name)."""
+    out = dict(payload)
+    for key in ("max_completion_tokens", "max_tokens"):
+        if key in out:
+            if _safe_int(out.get(key), 0) < floor:
+                out[key] = floor
+            break
+    return out
+
+
 def _chat_completions_url(base_url: str) -> str:
     url = (base_url or "https://api.openai.com").strip().rstrip("/")
     if not url.endswith("/chat/completions"):
@@ -410,21 +457,37 @@ def _send_with_length_retry(
     deadline: Optional[float] = None,
     *,
     retry_empty: bool = False,
+    notes: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Send one request; an answer ended by the output limit (`finish_reason=length`) is retried once with more room.
+
+    Both "length and no text" (the thinking used everything) and "length with a text fragment" (the thinking used most of
+    it) mean the limit was too small, not that the model had finished. When the bigger request works, `notes["length_floor"]`
+    carries the limit that worked so the caller can start there next time. A fragment that is still cut after the retry is
+    returned as it is (`finish_reason` stays `length`; the caller decides what to do with it); an empty one raises.
+    """
     cur_payload: Mapping[str, Any] = payload
     doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
-    if _is_empty_reasoning_length(doc):
+    if _is_length_cut(doc):
+        first_doc = doc
+        first_empty = _is_empty_reasoning_length(doc)
         cur_limit = _safe_int(payload.get("max_completion_tokens") or payload.get("max_tokens"), 2048)
-        cur_payload = _adapt_reasoning_payload(payload, min_tokens=max(cur_limit * 2, 4096))
-        doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
-        if _is_empty_reasoning_length(doc):
-            err = LLMAPIError(
-                502,
-                "HTTP 502: reasoning tokens exhausted with empty content",
-                detail="empty_reasoning_length",
-            )
-            err.total_tokens = _doc_tokens(doc)  # type: ignore[attr-defined]
-            raise err
+        if first_empty or cur_limit < _MAX_REMEMBERED_LIMIT:
+            new_limit = max(cur_limit * 2, 4096)
+            cur_payload = _adapt_reasoning_payload(payload, min_tokens=new_limit)
+            doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
+            if _is_empty_reasoning_length(doc):
+                if first_empty:
+                    err = LLMAPIError(
+                        502,
+                        "HTTP 502: reasoning tokens exhausted with empty content",
+                        detail="empty_reasoning_length",
+                    )
+                    err.total_tokens = _doc_tokens(doc)  # type: ignore[attr-defined]
+                    raise err
+                doc = first_doc  # the bigger try produced nothing: keep the fragment we already had
+            elif notes is not None:
+                notes["length_floor"] = min(new_limit, _MAX_REMEMBERED_LIMIT)
     if retry_empty and _is_empty_reply(doc):
         # HTTP 200 + finish_reason=stop + nothing to say: one more try, then a loud failure (never a silent success)
         first_tokens = _doc_tokens(doc)
@@ -489,9 +552,11 @@ def openai_compatible_chat(
         },
         timeout_s=timeout_s,
     )
-    msg = (((doc.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+    msg = str((((doc.get("choices") or [{}])[0]).get("message") or {}).get("content") or "").strip()
+    if _is_length_cut(doc):
+        msg = _trim_to_last_sentence(msg)  # still cut after the bigger retry: no half sentences
     tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
-    return str(msg).strip(), tokens
+    return msg, tokens
 
 
 @dataclass(frozen=True)
@@ -520,6 +585,8 @@ class LLMCallResult:
     base_url: str
     fallback_used: bool
     latency_ms: int
+    # the output limit ended the answer (`finish_reason=length`) even after the bigger retry
+    truncated: bool = False
 
 
 def _safe_float(raw: Any, default: float) -> float:
@@ -569,6 +636,8 @@ class ModelRouter:
         self._clock = clock
         self.retry_delay_s = max(0.0, float(retry_delay_s))
         self._reasoning_caps: set[Tuple[str, str]] = set()
+        # per (base_url, model): the output limit that was needed after an answer got cut by `max_tokens`
+        self._length_floors: Dict[Tuple[str, str], int] = {}
         # per (base_url, model): {"fails": [ts, ...], "open_until": float, "probing": bool, "probe_ts": float}
         self._breaker_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._issue_logged: set[Tuple[str, str, str]] = set()
@@ -612,6 +681,7 @@ class ModelRouter:
     def close(self) -> None:
         with self._lock:
             self._reasoning_caps.clear()
+            self._length_floors.clear()
             self._breaker_state.clear()
             self._issue_logged.clear()
             self._plugin_visitor_calls.clear()
@@ -620,6 +690,7 @@ class ModelRouter:
         with self._lock:
             self.env = dict(env)
             self._reasoning_caps.clear()
+            self._length_floors.clear()
             self._breaker_state.clear()
             self._issue_logged.clear()
 
@@ -709,6 +780,7 @@ class ModelRouter:
 
             if changed:
                 self._reasoning_caps.clear()
+                self._length_floors.clear()
                 self._breaker_state.clear()
                 self._issue_logged.clear()
                 if persist:
@@ -1461,24 +1533,39 @@ class ModelRouter:
         cap_key = (ep.base_url, ep.model)
         with self._lock:
             is_reasoning = cap_key in self._reasoning_caps
+            length_floor = self._length_floors.get(cap_key, 0)
         payload = _adapt_reasoning_payload(base_payload) if is_reasoning else dict(base_payload)
+        if length_floor:
+            # this endpoint+model already cut an answer at the profile's limit: start with the room that worked
+            payload = _raise_output_limit(payload, length_floor)
+        notes: Dict[str, Any] = {}
         try:
-            return _send_with_length_retry(url, ep.api_key, payload, timeout_s, deadline, retry_empty=True)
+            doc = _send_with_length_retry(url, ep.api_key, payload, timeout_s, deadline, retry_empty=True, notes=notes)
+            self._remember_length_floor(cap_key, notes)
+            return doc
         except urllib.error.HTTPError as exc:
             detail = _extract_http_error_detail(exc, api_key=ep.api_key)
             if exc.code == 400 and not is_reasoning:
                 retry_payload = _compat_retry_payload(base_payload, detail)
                 if retry_payload is not None:
                     try:
-                        doc = _send_with_length_retry(url, ep.api_key, retry_payload, timeout_s, deadline, retry_empty=True)
+                        doc = _send_with_length_retry(url, ep.api_key, retry_payload, timeout_s, deadline, retry_empty=True, notes=notes)
                     except urllib.error.HTTPError as retry_exc:
                         r_detail = _extract_http_error_detail(retry_exc, api_key=ep.api_key)
                         raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {r_detail}", detail=r_detail) from retry_exc
                     # remember the adapted parameter shape only once the adapted request has actually succeeded
                     with self._lock:
                         self._reasoning_caps.add(cap_key)
+                    self._remember_length_floor(cap_key, notes)
                     return doc
             raise LLMAPIError(exc.code, f"HTTP {exc.code}: {detail}", detail=detail) from exc
+
+    def _remember_length_floor(self, cap_key: Tuple[str, str], notes: Mapping[str, Any]) -> None:
+        floor = _safe_int(notes.get("length_floor"), 0)
+        if floor > 0:
+            with self._lock:
+                if floor > self._length_floors.get(cap_key, 0):
+                    self._length_floors[cap_key] = floor
 
     def _attempt_once(
         self,
@@ -1688,6 +1775,13 @@ class ModelRouter:
         choice = (doc.get("choices") or [{}])[0]
         message = dict(choice.get("message") or {})
         content = str(message.get("content") or "").strip()
+        truncated = _is_length_cut(doc)
+        if truncated and content and not message.get("tool_calls") and purpose not in _STRUCTURED_PURPOSES \
+                and content[0] not in "{[":
+            # Still cut by the output limit after the bigger retry: never hand half a sentence on as the resident's words.
+            # (Structured output and tool calls are left alone: cutting those at a "sentence" would only damage them.)
+            content = _trim_to_last_sentence(content)
+            message["content"] = content
         usage = doc.get("usage") or {}
         pt = int(usage.get("prompt_tokens") or 0)
         ct = int(usage.get("completion_tokens") or 0)
@@ -1713,6 +1807,7 @@ class ModelRouter:
             base_url=ep.base_url,
             fallback_used=is_fallback,
             latency_ms=latency_ms,
+            truncated=truncated,
         )
 
     def complete_text(
