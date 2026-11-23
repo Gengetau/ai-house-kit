@@ -114,7 +114,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     listen_note = f"（监听 {host}:{port}，若在容器内请访问宿主机映射端口）" if display_host != host else ""
     mode_label = (
-        f"真实大模型 ({daemon.chat_agent.model})"
+        f"真实大模型 ({daemon.chat_agent.display_model()})"
         if daemon.chat_agent.live_llm_enabled
         else "零配置内置演示模式（可在网页向导或 .env 填入 AI_HOUSE_API_KEY 切换）"
     )
@@ -374,6 +374,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         })
     except Exception as exc:  # noqa: BLE001
         checks.append({"name": "worldpack", "ok": False, "detail": str(exc)})
+
+    from .agent import DIRECT, brain_for, build_engines
+
+    wanted = {brain_for(eff_env)}
+    wanted.update(
+        brain_for(eff_env, k[len("AI_HOUSE_ACTOR_BRAIN_"):].lower())
+        for k in eff_env
+        if k.startswith("AI_HOUSE_ACTOR_BRAIN_")
+    )
+    wanted.discard(DIRECT)
+    if wanted:
+        engines = build_engines(eff_env, data_dir / "agent")
+        for name in sorted(wanted):
+            eng = engines.get(name)
+            why = eng.unavailable_reason() if eng is not None else f"没有名为 {name} 的住客大脑引擎"
+            checks.append({
+                "name": f"agent_brain_{name}",
+                "ok": not why,
+                "detail": why or f"住客聊天由 {eng.default_model_label()} 来跑（只检查了安装与密钥是否就位，没有发起调用）",
+            })
 
     api_key = eff_env.get("AI_HOUSE_API_KEY", "").strip()
     if args.live_ping:

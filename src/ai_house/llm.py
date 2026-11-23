@@ -749,6 +749,12 @@ class ModelRouter:
                 str(self.env.get("AI_HOUSE_FALLBACK_API_KEY") or ""),
                 str(self.env.get("AI_HOUSE_MEMORY_API_KEY") or ""),
                 str((self._overrides.get("fallback") or {}).get("api_key") or ""),
+                # credentials of the agent shell that may run residents (see ai_house.agent)
+                str(self.env.get("AI_HOUSE_AGENT_API_KEY") or ""),
+                str(self.env.get("AI_HOUSE_AGENT_AUTH_TOKEN") or ""),
+                str(self.env.get("ANTHROPIC_API_KEY") or ""),
+                str(self.env.get("ANTHROPIC_AUTH_TOKEN") or ""),
+                str(self.env.get("CLAUDE_CODE_OAUTH_TOKEN") or ""),
             ]
             for k, v in self.env.items():
                 if k.startswith(("AI_HOUSE_ACTOR_API_KEY_", "AI_HOUSE_LIFE_API_KEY", "AI_HOUSE_DIARY_API_KEY", "AI_HOUSE_PING_API_KEY", "AI_HOUSE_CHAT_API_KEY")):
@@ -1007,6 +1013,33 @@ class ModelRouter:
                         str(error_code or "")[:64],
                     ),
                 )
+
+    def record_external_usage(
+        self,
+        *,
+        purpose: str,
+        actor: str,
+        model: str,
+        host: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: int = 0,
+        ok: bool = True,
+        error_code: str = "",
+    ) -> None:
+        """Ledger row for a model turn that did not go through this router (an agent shell ran it)."""
+        self._record_usage(
+            purpose=purpose,
+            actor=actor,
+            endpoint=ModelEndpoint(base_url=str(host or ""), api_key="", model=str(model or "")),
+            prompt_tokens=int(prompt_tokens or 0),
+            completion_tokens=int(completion_tokens or 0),
+            total_tokens=int(prompt_tokens or 0) + int(completion_tokens or 0),
+            latency_ms=int(latency_ms or 0),
+            ok=bool(ok),
+            fallback_used=False,
+            error_code=error_code,
+        )
 
     def get_usage_summary(
         self,

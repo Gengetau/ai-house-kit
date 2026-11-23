@@ -340,7 +340,17 @@ class HouseDaemon:
         router = getattr(self, "model_router", None)
         if router is not None:
             router.update_env(self.env)
-        self.chat_agent = RoommateChatAgent(self.vocab, env=self.env, llm_fn=self._llm_fn, router=router)
+        agent_rt = getattr(self, "agent_runtime", None)
+        if agent_rt is None:
+            from .agent import AgentRuntime
+
+            # cheap until a resident is actually run by an agent shell: no thread, no process
+            agent_rt = self.agent_runtime = AgentRuntime(self.runtime_dir / "agent", env=self.env, log=self.log)
+        else:
+            agent_rt.update_env(self.env)
+        self.chat_agent = RoommateChatAgent(
+            self.vocab, env=self.env, llm_fn=self._llm_fn, router=router, agent_runtime=agent_rt, log=self.log
+        )
         guard_env = dict(self.env)
         if router is not None:
             for idx, sec in enumerate(router.collect_secrets()):
@@ -615,6 +625,8 @@ class HouseDaemon:
                 self._teardown_world()
         else:
             self._teardown_world()
+        if getattr(self, "agent_runtime", None) is not None:
+            self.agent_runtime.close()
         if getattr(self, "model_router", None) is not None:
             self.model_router.close()
         if getattr(self, "identity_store", None) is not None:
@@ -808,7 +820,8 @@ class HouseDaemon:
                     "weather": {"temp_c": 16.0, "rain": False},
                     "llm_mode": "live_api" if self.chat_agent.live_llm_enabled else "zero_key_demo",
                     "manual_time_control": self.manual_time_control,
-                    "model_name": self.chat_agent.model if self.chat_agent.live_llm_enabled else "内置人设演示引擎",
+                    "model_name": self.chat_agent.display_model() if self.chat_agent.live_llm_enabled else "内置人设演示引擎",
+                    "brain": self.chat_agent.brain_for(""),
                     "house_wallet_yen": 0,
                     "owner_presence": None,
                     "residents": {},
@@ -898,7 +911,8 @@ class HouseDaemon:
                 "weather": weather_val,
                 "llm_mode": "live_api" if self.chat_agent.live_llm_enabled else "zero_key_demo",
                 "manual_time_control": self.manual_time_control,
-                "model_name": self.chat_agent.model if self.chat_agent.live_llm_enabled else "内置人设演示引擎",
+                "model_name": self.chat_agent.display_model() if self.chat_agent.live_llm_enabled else "内置人设演示引擎",
+                "brain": self.chat_agent.brain_for(""),
                 "house_wallet_yen": wallets.get("house", 0),
                 "owner_presence": dict(owner_row) if owner_row else None,
                 "residents": residents_out,
@@ -1315,6 +1329,9 @@ class HouseDaemon:
         """
         router = getattr(self, "model_router", None)
         budget = router.resolve_total_budget("chat") if router is not None else 45.0
+        if self.chat_agent.uses_agent():
+            # a turn run by an agent shell is several model calls, and now and then a process start
+            budget = max(budget, self.agent_runtime.turn_budget_s)
         responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
         ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
@@ -1619,8 +1636,14 @@ class HouseDaemon:
                 attachment_notes=media_notes,
                 extra_tools=extra_tools,
                 tool_runner=_run_tool,
+                channel=channel,
             )
             if rep["mode"] == "sleeping" and gb_enabled and gb_cfg.get("sleep_silence", True):
+                continue
+            if rep["mode"] == "quiet":
+                # an agent-backed resident chose not to join in: nothing is stored or sent as her reply
+                turn_media.clear()
+                raw_replies.append((aid, rep))
                 continue
             if rep["mode"] != "sleeping":
                 why = self.guard.check(channel, rep["text"])
@@ -1633,6 +1656,7 @@ class HouseDaemon:
                     self.log(f"reply held back ({why}) channel={'private' if is_private else 'group'} actor={aid}")
                     turn_media.clear()
                     rep = {**rep, "text": "（这条回复含有不该说出去的内容，已被拦下）", "mode": "blocked", "media": []}
+                    self.chat_agent.note_reply_blocked(aid, channel)
                 elif turn_media:
                     rep = {**rep, "media": list(turn_media)}
                 if rep["mode"] != "blocked" and speaker.is_owner:
@@ -1652,6 +1676,19 @@ class HouseDaemon:
                     "messages": [],
                 }
             for aid, rep in raw_replies:
+                if rep["mode"] == "quiet":
+                    self.memory.observe(
+                        aid,
+                        scope,
+                        text,
+                        channel=mem_ch,
+                        speaker=speaker.name,
+                        speaker_role=speaker_role,
+                        speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
+                        reply="",
+                        now=now,
+                    )
+                    continue
                 stored_media = [
                     {
                         k: m[k]
@@ -1985,6 +2022,7 @@ class HouseDaemon:
         }
         if getattr(self, "model_router", None) is not None:
             out.update(self.model_router.status_view())
+        out["brain"] = self.chat_agent.brain_status()
         return out
 
     def get_usage_summary(
@@ -2384,6 +2422,8 @@ class HouseDaemon:
         with self._async_job_lock, self._lock:
             self._reset_epoch += 1
             self._teardown_world()
+            if getattr(self, "agent_runtime", None) is not None:
+                self.agent_runtime.forget_all()  # those residents are gone; their conversations go with them
             if getattr(self, "model_router", None) is not None:
                 self.model_router.close()
             if getattr(self, "identity_store", None) is not None:

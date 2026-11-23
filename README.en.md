@@ -22,7 +22,7 @@
 git clone https://github.com/Gengetau/ai-house-kit.git
 cd ai-house-kit
 python3 -m venv .venv && . .venv/bin/activate   # Windows: py -3 -m venv .venv, then .venv\Scripts\activate
-python3 -m pip install -e .          # add ".[onebot]" for QQ, ".[dev]" to run the tests
+python3 -m pip install -e .          # add ".[onebot]" for QQ, ".[dev]" to run the tests, ".[agent]" for agent-backed residents (docs/AGENT-BRAIN.md)
 ai-house init && ai-house doctor
 ai-house up
 ```
