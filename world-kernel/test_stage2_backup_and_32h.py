@@ -342,6 +342,27 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         leaked_rep = d.converse("qq-group:9001", "晚饭买什么食材呀？", member_speaker("阿晴", "8002"), actor="sora")
         self.assertEqual(leaked_rep["replies"][0]["mode"], "blocked")
 
+        # Verify `tools/run_stage2_32h_live.py` invariant checker passes cleanly on valid state
+        sys.path.insert(0, str(ROOT / "tools"))
+        from run_stage2_32h_live import verify_stage2_32h_invariants  # noqa: E402
+
+        self.assertEqual(verify_stage2_32h_invariants(d), [])
+        # Injecting a leaked group message triggers non-empty failure list (non-zero exit in live runner)
+        with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
+            with wc:
+                wc.execute(
+                    "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, created_at) "
+                    "VALUES('qq-group:9001', 'sora', '苍空', 'member', '房主其实对虾仁过敏', '', 'live_api', ?)",
+                    (d.clock.now(),),
+                )
+        fails = verify_stage2_32h_invariants(d)
+        self.assertTrue(any("问题#4失败" in f for f in fails))
+        with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
+            with wc:
+                wc.execute("UPDATE house_intents SET state='completed' WHERE kind='memo'")
+        fails2 = verify_stage2_32h_invariants(d)
+        self.assertTrue(any("问题#2失败" in f for f in fails2))
+
 
 if __name__ == "__main__":
     unittest.main()

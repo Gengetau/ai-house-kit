@@ -238,12 +238,20 @@ class ChannelSpool:
             return
         ts = self._now(now)
         plan = json.dumps({"bubbles": list(bubbles), "target": target, "kind": kind, "at": at}, ensure_ascii=False)
-        marks = ",".join("?" for _ in ids)
+        primary_id = ids[-1]
+        merged_ids = ids[:-1]
         with self._lock, self._connect() as c:
+            if merged_ids:
+                m_marks = ",".join("?" for _ in merged_ids)
+                c.execute(
+                    f"UPDATE inbound_spool SET state='done', reply_bubbles_json='[]', sent_parts=0, updated_at=? "
+                    f"WHERE spool_id IN ({m_marks})",
+                    [ts, *merged_ids],
+                )
             c.execute(
-                f"UPDATE inbound_spool SET state='reply_ready', reply_bubbles_json=?, sent_parts=0, updated_at=? "
-                f"WHERE spool_id IN ({marks})",
-                [plan, ts, *ids],
+                "UPDATE inbound_spool SET state='reply_ready', reply_bubbles_json=?, sent_parts=0, updated_at=? "
+                "WHERE spool_id=?",
+                [plan, ts, primary_id],
             )
 
     def record_part_sent(self, spool_ids: Sequence[int], sent_parts: int, *, now: Optional[float] = None) -> None:
@@ -251,11 +259,11 @@ class ChannelSpool:
         if not ids:
             return
         ts = self._now(now)
-        marks = ",".join("?" for _ in ids)
+        primary_id = ids[-1]
         with self._lock, self._connect() as c:
             c.execute(
-                f"UPDATE inbound_spool SET sent_parts=?, updated_at=? WHERE spool_id IN ({marks})",
-                [int(sent_parts), ts, *ids],
+                "UPDATE inbound_spool SET sent_parts=?, updated_at=? WHERE spool_id=?",
+                [int(sent_parts), ts, primary_id],
             )
 
     def ack(self, spool_ids: Sequence[int], *, state: str = "done", now: Optional[float] = None) -> None:
