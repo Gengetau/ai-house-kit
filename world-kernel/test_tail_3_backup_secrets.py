@@ -392,6 +392,30 @@ class AtomicWriteAndMaskTests(_Base):
 
 
 class MiscBackupTests(_Base):
+    def test_album_rows_and_their_image_files_survive_backup_and_restore(self) -> None:
+        import base64
+
+        from ai_house.album import AlbumStore
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+        src = AlbumStore(self.rt)
+        made = [
+            src.add_item(scope="world", actor="sora", channel="diary", kind="diary_art", raw_bytes=png, now=1.0),
+            src.add_item(scope="group", actor="sora", channel="qq-group:9001", kind="chat_image", raw_bytes=png + b"g", now=2.0),
+            src.add_item(scope="private", actor="rin", channel="private:rin", kind="chat_image", raw_bytes=png + b"p", now=3.0),
+        ]
+        arc = create_backup(self.rt)["archive"]
+        dest = self.tmp / "restored"
+        restore_backup(arc, dest)
+        back = AlbumStore(dest)
+        for item in made:
+            with self.subTest(scope=item["scope"]):
+                got = back.get_by_media_rel(item["media_rel"], include_data_uri=False)
+                self.assertIsNotNone(got, "album row missing after restore")
+                self.assertEqual((got["scope"], got["actor"], got["channel"]), (item["scope"], item["actor"], item["channel"]))
+                self.assertEqual((dest / item["media_rel"]).read_bytes(), (self.rt / item["media_rel"]).read_bytes())
+
     def test_d2_user_supplied_out_dir_permissions_untouched_new_dir_is_0700(self) -> None:
         shared = self.tmp / "shared"
         shared.mkdir()

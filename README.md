@@ -36,7 +36,7 @@ ai-house up
 - **首位 AI 住客向导（`#/setup`）**：空屋首次启动不再硬塞 6 个演示角色，直接进入 **「迎接你的第一位 AI 住客」** 向导——自定义第 1 位住客的昵称、像素立绘、主题色、作息与厨艺，选择并测试 OpenAI 兼容大模型 API（或先以零配置演示模式体验），也支持一键载入 3 人 `indie-studio-3` 或 6 人 `life1` 示例世界包；入住后可在首页或管家页随时 **「+ 邀请新住客」**、编辑档案或重置小屋；
 - **暖灯像素控制台与等轴互动**：浏览两层全屋像素剖面与 11 间等轴测房间，点房间让房主化身走进去当面说话、递零食，或点 **「⏩ 快进 +15 分钟」** 推进三餐、日记与晴空都行程流转；
 - **多板块生活与记忆管理**：覆盖 **「住客」**（此刻状态 / 衣柜换装 / 档案编辑 / 私聊与群聊）、**「日子」**（时间线 / 约定履行 / 厨房货架补货 / 晴空都行程）、**「珍藏」**（精装翻页日记 / 作用域记忆检索与遗忘 / 书架便签）与 **「管家」**（模拟步进 / 住客管理 / 大模型热更新 / MCP 接入配置），另有独立聊天页 `http://127.0.0.1:8780/chat`；
-- **想在 QQ 上聊**：支持通用 OneBot v11 正向 WebSocket（如 SnowLuma / NapCat / Lagrange / LLOneBot），**目前仅在模拟 OneBot 服务器测试通过，未在真实 QQ 账号测试**；接入风险自担，先读 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)；后台常驻（systemd / compose）和与协议端并排部署见 [docs/DEPLOY.md](docs/DEPLOY.md)，`ai-house doctor --onebot-ping` 可检查连通。
+- **想在 QQ 上聊**：支持通用 OneBot v11 正向 WebSocket（协议端需自备，本项目不提供也不绑定某一家，接口要求见 [docs/DEPLOY.md](docs/DEPLOY.md)），**目前仅在模拟 OneBot 服务器测试通过，未在真实 QQ 账号测试**；接入风险自担，先读 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)；后台常驻（systemd / compose）和与协议端并排部署见 [docs/DEPLOY.md](docs/DEPLOY.md)，`ai-house doctor --onebot-ping` 可检查连通。
 
 > **默认只在本机可访问**：`ai-house up` 缺省只监听 `127.0.0.1`。要让局域网里别的设备访问，必须同时设置至少 16 位的 `AI_HOUSE_OWNER_TOKEN`（环境变量或 `.env`）再用 `--host 0.0.0.0`，不设会直接拒绝启动。`owner` 房主令牌开启全部控制与向导/管理接口；另可按需配置 `AI_HOUSE_READ_TOKEN`、`AI_HOUSE_WRITE_TOKEN`、`AI_HOUSE_PRIVATE_TOKEN`（读 / 写 / 私聊三档），脚本与 MCP 客户端统一通过 `Authorization: Bearer <令牌>` 传参。
 

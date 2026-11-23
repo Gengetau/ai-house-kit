@@ -1,7 +1,7 @@
-# 小屋和 OneBot v11 协议端（SnowLuma，或 NapCat / Lagrange 等）都跑在 Docker 里时用：
+# 小屋和你自备的 OneBot v11 协议端都跑在 Docker 里时用：
 # 让两个容器进同一个 Docker 网络，小屋用服务名直接连协议端的正向 WebSocket，端口不必发布到宿主机。
 #
-# 这个文件不会启动协议端。协议端请按它自己的官方文档部署；本项目不打包、不分发任何协议端。
+# 这个文件不会启动协议端。本项目不提供、不打包、不分发任何协议端；它需要满足的接口见 docs/DEPLOY.md 第 2.1 节。
 #
 # 1) 建一个共用网络（只需一次）：
 #        docker network create onebot
@@ -13,7 +13,7 @@
 #          onebot:
 #            external: true
 # 3) 在小屋的 .env 里写（主机名 = 协议端的服务名或容器名，端口 = 它的正向 WebSocket 端口）：
-#        ONEBOT_WS_URL=ws://snowluma:3001
+#        ONEBOT_WS_URL=ws://onebot:3001
 #        ONEBOT_ACCESS_TOKEN=<协议端里为这个 WebSocket 服务设的令牌>
 #        ONEBOT_OWNER_QQ=<你本人的 QQ 号>
 # 4) 启动并检查：

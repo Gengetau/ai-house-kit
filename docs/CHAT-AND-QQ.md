@@ -24,12 +24,12 @@ ai-house up
 你需要自己准备：
 
 1. 一个 QQ 号（给室友用的小号）；
-2. 一个 OneBot v11 实现，并打开它的**正向 WebSocket** 服务（本程序主动去连它）。本项目推荐、后续部署模板和真实 QQ 验证也优先对齐的是 **SnowLuma**（独立运行、自带 OneBot v11 的协议端）；NapCat、Lagrange 等其他 OneBot v11 实现按同样的方式接入；
+2. 一个 OneBot v11 实现（协议端），并打开它的**正向 WebSocket** 服务（本程序主动去连它）。协议端需要你自己取得：本项目不提供、不分发任何协议端，也不绑定某一家，只要求它满足 [DEPLOY.md](DEPLOY.md) 第 2.1 节列出的接口；
 3. 本程序的可选依赖：`python3 -m pip install -e ".[onebot]"`（用到 `websockets`，核心仍然零依赖）。
 
 > **Docker 方式接 QQ 说明**：`Dockerfile` 已内置安装 `.[onebot]`，`compose.yaml` 也配置了 `host.docker.internal:host-gateway`。
-> 若 OneBot 端（如 SnowLuma / NapCat / Lagrange）跑在宿主机上，在 `.env` 里请把 `ONEBOT_WS_URL` 写成 `ws://host.docker.internal:3001`（不要写 `127.0.0.1`，容器里指向容器自身）。
-> 协议端也在 Docker 里、后台常驻（systemd / compose）以及 SnowLuma 侧要开哪些设置，见 [DEPLOY.md](DEPLOY.md)。
+> 若 OneBot 端跑在宿主机上，在 `.env` 里请把 `ONEBOT_WS_URL` 写成 `ws://host.docker.internal:3001`（不要写 `127.0.0.1`，容器里指向容器自身）。
+> 协议端也在 Docker 里、后台常驻（systemd / compose）以及协议端那边要开哪些设置，见 [DEPLOY.md](DEPLOY.md)。
 
 在 `.env` 里写：
 
