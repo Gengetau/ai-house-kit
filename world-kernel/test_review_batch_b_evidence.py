@@ -325,7 +325,7 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
             with c:
                 c.execute(
                     "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 11, ?, ?)",
-                    ("plan_finished:sora", t0 + 60, json.dumps({"kind": "plan_finished", "actor": "sora", "at": t0 + 60})),
+                    ("plan_finished:sora", t0 + 60, json.dumps({"kind": "plan_finished", "actor": "sora", "outcome": "done", "at": t0 + 60})),
                 )
         d.intents.sweep(t0 + 60)
         self.assertEqual(d.intents.list_intents(actor="sora")[0]["state"], "completed")

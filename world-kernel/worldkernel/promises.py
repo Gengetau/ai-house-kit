@@ -101,6 +101,8 @@ class Promises:
                         else plan["start_at"] + 4 * 3600 if plan["start_at"] is not None else None)
         elif kind == "plan_finished":
             body["outcome"] = payload.get("outcome")
+            # Lets the intent matcher tell a shared plan from a solo one.
+            body["members"] = payload.get("planned_members")
         else:
             return None
         return body
