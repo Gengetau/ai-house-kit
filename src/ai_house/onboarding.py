@@ -315,13 +315,28 @@ def _format_dotenv_value(val: str) -> str:
     return clean
 
 
+def _write_in_place_private(real: Path, text: str) -> None:
+    """Overwrite `real` in place (keeps inode, e.g. Docker single-file bind mounts) and force 0600."""
+    fd = os.open(str(real), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    try:
+        os.chmod(real, 0o600)
+    except OSError:
+        pass
+
+
 def atomic_write_private_text(path: Path, text: str) -> None:
-    """Atomically write UTF-8 text via a 0600 temporary file before replacing `path`."""
-    target = Path(path)
+    """Atomically write UTF-8 text via a 0600 temp file, preserving symlinks.
+
+    The real path of `path` is resolved first so a symlinked `.env` stays a link and the file it points to is
+    updated. If `os.replace` fails (cross-device, EBUSY on a bind-mounted single file, ...), fall back to an
+    in-place overwrite of the real file with 0600 permissions.
+    """
+    target = Path(os.path.realpath(str(path)))
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(tmp), flags, 0o600)
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         try:
             os.chmod(tmp, 0o600)
@@ -335,7 +350,17 @@ def atomic_write_private_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
-    os.replace(tmp, target)
+    try:
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            _write_in_place_private(target, text)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
     try:
         os.chmod(target, 0o600)
     except OSError:
@@ -370,9 +395,12 @@ def upsert_dotenv_vars(env_path: Path, updates: Mapping[str, str]) -> None:
 
 
 def mask_secret(val: str) -> str:
+    """Mask a secret for display: short values (<20 chars) are fully hidden; longer ones show at most a
+    vendor-style prefix such as `sk-` plus the last 4 characters."""
     clean = str(val or "").strip()
     if not clean:
         return ""
-    if len(clean) <= 12:
+    if len(clean) < 20:
         return "••••••••"
-    return f"{clean[:3]}…{clean[-4:]}"
+    head = clean[:3] if clean[:3].endswith(("-", "_")) else ""
+    return f"{head}…{clean[-4:]}"
