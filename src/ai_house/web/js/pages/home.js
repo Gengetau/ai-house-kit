@@ -1,5 +1,5 @@
 // 今天 (v2 暖灯小屋首页): 小屋实景与房间、住客一览、生活剧本片段与快速群聊。
-import {el, put, api, icon, ava, jstHour, fmtTime, num, pageHead, pageTabs, empty, go, currentActor, hasTier, setOnboarding, toast, LoginNeeded} from '../core.js';
+import {el, put, api, icon, ava, jstHour, fmtTime, num, pageHead, pageTabs, empty, go, currentActor, hasTier, setOnboarding, toast, LoginNeeded, chatMediaNodes} from '../core.js';
 import {RESIDENTS, byActor, nameOf, toneStyle, setResidentsFromState} from '../residents.js';
 import {ACTIVITIES, PUBLIC_ROOMS, lifeState, moodWord, moodTone, feelOf, roomLabel} from '../vocab.js';
 
@@ -151,7 +151,8 @@ export async function render(view, _route, ctx){
             el('b', {}, m.sender_name || nameOf(m.sender)),
             m.badge ? el('span', {class: 'tag'}, m.badge) : null,
             el('span', {class: 'tiny muted'}, fmtTime(m.created_at))),
-          el('div', {class: 'txt'}, m.text))) : empty(chatErr || '群里还没有对话，发一句和大家打个招呼吧。'));
+          el('div', {class: 'txt'}, m.text),
+          chatMediaNodes(m.media)))) : empty(chatErr || '群里还没有对话，发一句和大家打个招呼吧。'));
       listEl.scrollTop = listEl.scrollHeight;
     };
     drawMsgs();

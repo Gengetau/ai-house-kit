@@ -233,9 +233,16 @@ class SendGate:
 
         if is_webchat:
             if eff_kind == "group":
-                if raw_tch and raw_tch != "group" and not raw_tch.startswith("qq-group:"):
+                if raw_tch and raw_target and raw_tch != raw_target:
+                    raise BlockedDelivery("inconsistent_target")
+                chosen_grp = raw_tch or raw_target or "group"
+                if (
+                    chosen_grp != "group"
+                    and not chosen_grp.startswith("qq-group:")
+                    and not chosen_grp.startswith("group:")
+                ) or any(c.isspace() for c in chosen_grp):
                     raise BlockedDelivery("unsupported_target_channel")
-                eff_target = raw_tch if raw_tch.startswith("qq-group:") else "group"
+                eff_target = chosen_grp
                 out["kind"] = "group"
                 out["scope"] = "group"
                 out["target"] = eff_target
@@ -373,6 +380,11 @@ class SendGate:
             actor = str(out_payload.get("actor") or "").strip()
             to_identity = str(out_payload.get("to_identity") or "").strip()
             now = float(d.clock.now())
+            if str(out_payload.get("source") or "") == "proactive":
+                created_ts = float(out_payload.get("created_ts") or 0.0)
+                if created_ts > 0 and (now - created_ts) > 1800.0:
+                    self._stats["blocked"] += 1
+                    raise BlockedDelivery("expired_ttl")
             check_ch = f"private:{actor}" if eff_scope == "private" else channel_id
             if getattr(d, "guard", None) is not None:
                 why = d.guard.check(check_ch, text)
@@ -427,3 +439,64 @@ class SendGate:
             done_day = dt.datetime.fromtimestamp(done_now, JST).date().isoformat()
             self._record_sent(delivery_id, recip_key, done_day, done_now)
         return ref
+
+    def authorize_direct_send(
+        self,
+        channel_id: str,
+        plugin: Any,
+        *,
+        kind: str,
+        target: str,
+        actor: str,
+        text: str,
+        delivery_id: str = "",
+        urgent: bool = True,
+        enforce_rate_cap: bool = True,
+    ) -> str:
+        """Gate direct channel replies (e.g. OneBot WS) through destination, guard, leak & cap checks."""
+        d = self.daemon
+        body = str(text or "").strip()
+        if not body:
+            with self._lock:
+                self._stats["blocked"] += 1
+            raise BlockedDelivery("empty_text")
+        with self._lock:
+            try:
+                eff_scope, eff_target, _ = self.resolve_destination(
+                    channel_id,
+                    plugin,
+                    {"kind": kind, "target": target, "actor": actor, "text": body, "urgent": urgent},
+                    is_webchat=False,
+                )
+            except BlockedDelivery:
+                self._stats["blocked"] += 1
+                raise
+
+            now = float(d.clock.now())
+            check_ch = f"private:{actor}" if eff_scope == "private" else f"qq-group:{eff_target}" if channel_id == "onebot_v11" and eff_scope == "group" else channel_id
+            if getattr(d, "guard", None) is not None:
+                why = d.guard.check(check_ch, body)
+                if why:
+                    self._stats["blocked"] += 1
+                    raise BlockedDelivery(f"guard:{why}")
+            if eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
+                if d.memory.check_outbound_leak(actor, "group", body, now=now):
+                    self._stats["blocked"] += 1
+                    raise BlockedDelivery("memory_leak:private_to_public")
+
+            recip_key = f"direct:{channel_id}:{eff_target or eff_scope}"
+            today_jst = dt.datetime.fromtimestamp(now, JST).date().isoformat()
+            if enforce_rate_cap:
+                hourly_cap = _safe_int(d.env.get("AI_HOUSE_DIRECT_HOURLY_CAP") or d.env.get("AI_HOUSE_OUTBOX_HOURLY_CAP"), 60)
+                daily_cap = _safe_int(d.env.get("AI_HOUSE_DIRECT_DAILY_CAP") or d.env.get("AI_HOUSE_OUTBOX_DAILY_CAP"), 300)
+                h_count, d_count = self._rate_counts(recip_key, now, today_jst)
+                if h_count >= hourly_cap:
+                    self._stats["deferred_rate_limit"] += 1
+                    raise NotSent("hourly_cap")
+                if d_count >= daily_cap:
+                    self._stats["deferred_rate_limit"] += 1
+                    raise NotSent("daily_cap")
+
+            did = delivery_id or f"direct-{channel_id}-{now:.6f}-{len(self._sent_daily)}"
+            self._record_sent(did, recip_key, today_jst, now)
+            return recip_key

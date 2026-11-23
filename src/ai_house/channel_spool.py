@@ -8,14 +8,15 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 SPOOL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS inbound_dedup (
     platform TEXT NOT NULL,
+    scope_key TEXT NOT NULL DEFAULT '',
     message_id TEXT NOT NULL,
     seen_at REAL NOT NULL,
-    PRIMARY KEY(platform, message_id)
+    PRIMARY KEY(platform, scope_key, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_dedup_seen ON inbound_dedup(seen_at);
 CREATE TABLE IF NOT EXISTS inbound_spool (
@@ -39,17 +40,27 @@ CREATE TABLE IF NOT EXISTS inbound_spool (
 CREATE INDEX IF NOT EXISTS idx_inbound_spool_state ON inbound_spool(state, kind, spool_id);
 """
 
-_PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
+_PARA_SPLIT_RE = re.compile(r"\s*<sep>\s*|\n\s*\n+")
 _BREAK_CHARS = "。！？!?；;\n，, "
+_FENCE_RE = re.compile(r"```[\s\S]*?```")
+_URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
+_TERMINAL_STATES = frozenset({"done", "skipped", "expired", "blocked", "dropped", "failed_wire"})
 
 
-def _split_long_piece(chunk: str, max_len: int) -> List[str]:
+def _split_long_piece(chunk: str, max_len: int, span_tokens: Sequence[str] = ()) -> List[str]:
     pieces: List[str] = []
     rest = chunk.strip()
     while rest:
         if len(rest) <= max_len:
             pieces.append(rest)
             break
+        # Protect atomic spans (code blocks / URLs): if the chunk starts with one longer than max_len, emit it whole.
+        leading_tok = next((t for t in span_tokens if rest.startswith(t)), None)
+        if leading_tok and len(leading_tok) > max_len:
+            pieces.append(leading_tok)
+            rest = rest[len(leading_tok) :].strip()
+            continue
+
         win = rest[:max_len]
         cut = -1
         # Search for a natural sentence/clause break in the second half so bubbles don't chop right at the start.
@@ -60,6 +71,15 @@ def _split_long_piece(chunk: str, max_len: int) -> List[str]:
                 cut = pos + 1
         if cut <= 0:
             cut = max_len
+        # Ensure `cut` never bisects any placeholder token (`prefix_idx@@`).
+        for tok in span_tokens:
+            start = rest.find(tok)
+            while start != -1 and start < cut:
+                end = start + len(tok)
+                if start < cut < end:
+                    cut = start if start > 0 else end
+                    break
+                start = rest.find(tok, end)
         head = rest[:cut].strip()
         tail = rest[cut:].strip()
         if not head:
@@ -72,22 +92,49 @@ def _split_long_piece(chunk: str, max_len: int) -> List[str]:
 
 
 def split_bubbles(text: str, *, max_part_chars: int = 400, max_parts: int = 3) -> List[str]:
-    """Split a reply into natural chat bubbles (`\\n\\n` paragraphs first, then sentence/clause breaks)."""
+    """Split a reply into natural chat bubbles (`<sep>` / `\\n\\n` first), preserving code blocks, URLs & overflow."""
     raw = str(text or "").strip()
     if not raw:
         return []
     limit = max(20, int(max_part_chars or 400))
     cap = max(1, int(max_parts or 3))
-    out: List[str] = []
-    for para in _PARA_SPLIT_RE.split(raw):
+
+    # Mask fenced code blocks and URLs with collision-free tokens so splits never break inside them.
+    spans: List[str] = []
+    prefix = "@@AHKSPAN"
+    while prefix in raw:
+        prefix += "X"
+
+    def _sub(m: re.Match[str]) -> str:
+        idx = len(spans)
+        spans.append(m.group(0))
+        return f"{prefix}_{idx}@@"
+
+    masked = _FENCE_RE.sub(_sub, raw)
+    masked = _URL_RE.sub(_sub, masked)
+    span_tokens = [f"{prefix}_{i}@@" for i in range(len(spans))]
+
+    all_pieces: List[str] = []
+    for para in _PARA_SPLIT_RE.split(masked):
         cleaned = para.strip()
         if not cleaned:
             continue
-        for piece in _split_long_piece(cleaned, limit):
-            out.append(piece)
-            if len(out) >= cap:
-                return out
-    return out
+        all_pieces.extend(_split_long_piece(cleaned, limit, span_tokens))
+
+    if not all_pieces:
+        return []
+    if len(all_pieces) > cap:
+        # PR-C6: Never drop trailing content beyond `max_parts` — fold remaining pieces into the final bubble.
+        merged_tail = "\n".join(all_pieces[cap - 1 :])
+        all_pieces = all_pieces[: cap - 1] + [merged_tail]
+
+    def _unmask(s: str) -> str:
+        for tok, val in zip(span_tokens, spans):
+            if tok in s:
+                s = s.replace(tok, val)
+        return s
+
+    return [_unmask(p) for p in all_pieces]
 
 
 class ChannelSpool:
@@ -107,6 +154,7 @@ class ChannelSpool:
         self._clock = clock
         self.dedup_ttl_s = max(60.0, float(dedup_ttl_s))
         self._lock = threading.RLock()
+        self._last_prune_ts = 0.0
         self.migrate()
 
     @contextlib.contextmanager
@@ -124,6 +172,22 @@ class ChannelSpool:
 
     def migrate(self) -> None:
         with self._lock, self._connect() as c:
+            has_dedup = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbound_dedup'").fetchone() is not None
+            if has_dedup:
+                cols = {r[1] for r in c.execute("PRAGMA table_info(inbound_dedup)").fetchall()}
+                if "scope_key" not in cols:
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS inbound_dedup_v2 ("
+                        "platform TEXT NOT NULL, scope_key TEXT NOT NULL DEFAULT '', "
+                        "message_id TEXT NOT NULL, seen_at REAL NOT NULL, "
+                        "PRIMARY KEY(platform, scope_key, message_id))"
+                    )
+                    c.execute(
+                        "INSERT OR IGNORE INTO inbound_dedup_v2(platform, scope_key, message_id, seen_at) "
+                        "SELECT platform, '', message_id, seen_at FROM inbound_dedup"
+                    )
+                    c.execute("DROP TABLE inbound_dedup")
+                    c.execute("ALTER TABLE inbound_dedup_v2 RENAME TO inbound_dedup")
             c.executescript(SPOOL_SCHEMA)
 
     def close(self) -> None:
@@ -138,24 +202,32 @@ class ChannelSpool:
     def _now(self, now: Optional[float] = None) -> float:
         return float(now) if now is not None else float(self._clock())
 
-    def check_and_mark_dedup(self, platform: str, message_id: str, *, now: Optional[float] = None) -> bool:
-        """Return `True` if `message_id` was already seen recently on `platform`."""
+    def check_and_mark_dedup(
+        self,
+        platform: str,
+        message_id: str,
+        *,
+        scope_key: str = "",
+        now: Optional[float] = None,
+    ) -> bool:
+        """Return `True` if `message_id` was already seen recently on `(platform, scope_key)`."""
         mid = str(message_id or "").strip()
         if not mid:
             return False
         plat = str(platform or "unknown").strip()
+        skey = str(scope_key or "").strip()
         ts = self._now(now)
         with self._lock, self._connect() as c:
             c.execute("DELETE FROM inbound_dedup WHERE seen_at < ?", (ts - self.dedup_ttl_s,))
             row = c.execute(
-                "SELECT 1 FROM inbound_dedup WHERE platform=? AND message_id=?",
-                (plat, mid),
+                "SELECT 1 FROM inbound_dedup WHERE platform=? AND scope_key=? AND message_id=?",
+                (plat, skey, mid),
             ).fetchone()
             if row is not None:
                 return True
             c.execute(
-                "INSERT INTO inbound_dedup(platform, message_id, seen_at) VALUES(?, ?, ?)",
-                (plat, mid, ts),
+                "INSERT INTO inbound_dedup(platform, scope_key, message_id, seen_at) VALUES(?, ?, ?, ?)",
+                (plat, skey, mid, ts),
             )
             return False
 
@@ -166,6 +238,7 @@ class ChannelSpool:
         *,
         message_id: str = "",
         session_key: str = "",
+        scope_key: str = "",
         kind: str = "",
         target: str = "",
         uid: str = "",
@@ -177,19 +250,20 @@ class ChannelSpool:
         ts = self._now(now)
         plat = str(platform or "unknown").strip()
         mid = str(message_id or "").strip()
+        eff_scope = str(scope_key or session_key or (f"{kind}:{target}" if (kind or target) else "")).strip()
         raw_json = json.dumps(dict(raw_event), ensure_ascii=False)
         with self._lock, self._connect() as c:
             if mid:
                 c.execute("DELETE FROM inbound_dedup WHERE seen_at < ?", (ts - self.dedup_ttl_s,))
                 hit = c.execute(
-                    "SELECT 1 FROM inbound_dedup WHERE platform=? AND message_id=?",
-                    (plat, mid),
+                    "SELECT 1 FROM inbound_dedup WHERE platform=? AND scope_key=? AND message_id=?",
+                    (plat, eff_scope, mid),
                 ).fetchone()
                 if hit is not None:
                     return None
                 c.execute(
-                    "INSERT INTO inbound_dedup(platform, message_id, seen_at) VALUES(?, ?, ?)",
-                    (plat, mid, ts),
+                    "INSERT INTO inbound_dedup(platform, scope_key, message_id, seen_at) VALUES(?, ?, ?, ?)",
+                    (plat, eff_scope, mid, ts),
                 )
             cur = c.execute(
                 "INSERT INTO inbound_spool(platform, message_id, session_key, kind, target, uid, nick, actor, "
@@ -198,7 +272,7 @@ class ChannelSpool:
                 (
                     plat,
                     mid,
-                    str(session_key or ""),
+                    str(session_key or eff_scope or ""),
                     str(kind or ""),
                     str(target or ""),
                     str(uid or ""),
@@ -209,7 +283,11 @@ class ChannelSpool:
                     ts,
                 ),
             )
-            return int(cur.lastrowid)
+            row_id = int(cur.lastrowid)
+        if abs(ts - self._last_prune_ts) >= 300.0:
+            self._last_prune_ts = ts
+            self.prune(now=ts)
+        return row_id
 
     def mark_processing(self, spool_ids: Sequence[int], *, now: Optional[float] = None) -> None:
         ids = [int(i) for i in spool_ids if i]
@@ -244,7 +322,7 @@ class ChannelSpool:
             if merged_ids:
                 m_marks = ",".join("?" for _ in merged_ids)
                 c.execute(
-                    f"UPDATE inbound_spool SET state='done', reply_bubbles_json='[]', sent_parts=0, updated_at=? "
+                    f"UPDATE inbound_spool SET state='done', raw_event_json='{{}}', reply_bubbles_json='[]', sent_parts=0, updated_at=? "
                     f"WHERE spool_id IN ({m_marks})",
                     [ts, *merged_ids],
                 )
@@ -271,22 +349,44 @@ class ChannelSpool:
         if not ids:
             return
         ts = self._now(now)
+        eff_state = str(state or "done")
         marks = ",".join("?" for _ in ids)
         with self._lock, self._connect() as c:
-            c.execute(
-                f"UPDATE inbound_spool SET state=?, updated_at=? WHERE spool_id IN ({marks})",
-                [str(state or "done"), ts, *ids],
+            if eff_state in _TERMINAL_STATES:
+                c.execute(
+                    f"UPDATE inbound_spool SET state=?, raw_event_json='{{}}', updated_at=? WHERE spool_id IN ({marks})",
+                    [eff_state, ts, *ids],
+                )
+            else:
+                c.execute(
+                    f"UPDATE inbound_spool SET state=?, updated_at=? WHERE spool_id IN ({marks})",
+                    [eff_state, ts, *ids],
+                )
+
+    def prune(self, *, keep_done_s: float = 86400.0, now: Optional[float] = None) -> int:
+        """Delete terminal spool rows and expired dedup records older than `keep_done_s`."""
+        ts = self._now(now)
+        cutoff = ts - max(60.0, float(keep_done_s))
+        term = tuple(sorted(_TERMINAL_STATES))
+        marks = ",".join("?" for _ in term)
+        with self._lock, self._connect() as c:
+            c.execute("DELETE FROM inbound_dedup WHERE seen_at < ?", (ts - self.dedup_ttl_s,))
+            cur = c.execute(
+                f"DELETE FROM inbound_spool WHERE state IN ({marks}) AND updated_at < ?",
+                [*term, cutoff],
             )
+            return int(cur.rowcount or 0)
 
     def recover_unfinished(
         self,
         platform: str = "onebot_v11",
         *,
         stale_s: float = 120.0,
+        reply_stale_s: float = 1800.0,
         only_ready: bool = False,
         now: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch unfinished inbound or `reply_ready` rows (owner private chat first) on startup/reconnect."""
+        """Fetch unfinished inbound or non-stale `reply_ready` rows on startup/reconnect."""
         ts = self._now(now)
         states = ("reply_ready",) if only_ready else ("queued", "processing", "reply_ready")
         st_marks = ",".join("?" for _ in states)
@@ -294,9 +394,15 @@ class ChannelSpool:
         with self._lock, self._connect() as c:
             if not only_ready and stale_s > 0:
                 c.execute(
-                    "UPDATE inbound_spool SET state='expired', updated_at=? "
+                    "UPDATE inbound_spool SET state='expired', raw_event_json='{}', updated_at=? "
                     "WHERE platform=? AND state IN ('queued', 'processing') AND received_at < ?",
                     (ts, platform, ts - float(stale_s)),
+                )
+            if reply_stale_s > 0:
+                c.execute(
+                    "UPDATE inbound_spool SET state='expired', raw_event_json='{}', updated_at=? "
+                    "WHERE platform=? AND state='reply_ready' AND updated_at < ?",
+                    (ts, platform, ts - float(reply_stale_s)),
                 )
             rows = c.execute(
                 f"SELECT * FROM inbound_spool WHERE platform=? AND state IN ({st_marks}) "

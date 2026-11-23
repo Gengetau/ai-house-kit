@@ -596,3 +596,113 @@ export async function go(hash){
   if (!(await leaveOk())) return;
   location.hash = hash;
 }
+
+/* ---------- Scoped Authenticated Lazy Media ---------- */
+const _mediaBlobCache = new Map();
+const _mediaInflight = new Map();
+const _lazyObserver = (typeof IntersectionObserver !== 'undefined')
+  ? new IntersectionObserver((entries, observer) => {
+      for (const entry of entries){
+        if (!entry.isIntersecting) continue;
+        const target = entry.target;
+        const rel = target.dataset.mediaRel;
+        if (rel){
+          delete target.dataset.mediaRel;
+          _loadAuthenticatedBlob(target, rel);
+        }
+        observer.unobserve(target);
+      }
+    }, {rootMargin: '200px 0px'})
+  : null;
+
+function _loadAuthenticatedBlob(target, rel){
+  if (!rel) return;
+  if (_mediaBlobCache.has(rel)){
+    target.src = _mediaBlobCache.get(rel);
+    return;
+  }
+  let p = _mediaInflight.get(rel);
+  if (!p){
+    const headers = {};
+    const tok = getToken();
+    if (tok) headers['Authorization'] = `Bearer ${tok}`;
+    p = fetch('/api/album/media?path=' + encodeURIComponent(rel), {headers})
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(blob => {
+        const objUrl = URL.createObjectURL(blob);
+        if (_mediaBlobCache.size >= 80){
+          const firstKey = _mediaBlobCache.keys().next().value;
+          const oldUrl = _mediaBlobCache.get(firstKey);
+          _mediaBlobCache.delete(firstKey);
+          if (oldUrl) URL.revokeObjectURL(oldUrl);
+        }
+        _mediaBlobCache.set(rel, objUrl);
+        return objUrl;
+      })
+      .finally(() => _mediaInflight.delete(rel));
+    _mediaInflight.set(rel, p);
+  }
+  p.then(objUrl => {
+    target.src = objUrl;
+    if (target.tagName === 'AUDIO' && typeof target.load === 'function') target.load();
+  }).catch(() => { /* degraded offline or expired media */ });
+}
+
+export function bindMediaBlob(node, mediaRel){
+  if (!node || !mediaRel) return node;
+  if (_mediaBlobCache.has(mediaRel)){
+    node.src = _mediaBlobCache.get(mediaRel);
+    return node;
+  }
+  const supportsNativeAudioLazy = node.tagName !== 'AUDIO' || Object.hasOwn(HTMLMediaElement.prototype, 'loading');
+  if (_lazyObserver){
+    node.dataset.mediaRel = mediaRel;
+    if (!supportsNativeAudioLazy && node.tagName === 'AUDIO') node.preload = 'none';
+    _lazyObserver.observe(node);
+  } else {
+    _loadAuthenticatedBlob(node, mediaRel);
+  }
+  return node;
+}
+
+export function chatMediaNodes(mediaList){
+  if (!Array.isArray(mediaList) || !mediaList.length) return null;
+  const wrap = el('div', {class: 'msg-media'});
+  for (const m of mediaList){
+    if (!m || typeof m !== 'object') continue;
+    const kind = String(m.kind || '');
+    if (kind === 'audio' && m.media_rel){
+      const aud = el('audio', {
+        controls: true,
+        loading: 'lazy',
+        preload: 'none',
+        'aria-label': m.title || '语音消息',
+      });
+      bindMediaBlob(aud, String(m.media_rel));
+      wrap.append(aud);
+    } else if (kind === 'sticker' && (m.data_uri || m.media_rel)){
+      const img = el('img', {
+        src: m.data_uri || '',
+        alt: m.title || '贴纸表情',
+        class: 'msg-sticker',
+        loading: 'lazy',
+        width: 84,
+        height: 84,
+      });
+      if (!m.data_uri && m.media_rel) bindMediaBlob(img, String(m.media_rel));
+      wrap.append(img);
+    } else if ((kind === 'image' || kind === 'sticker') && (m.media_rel || m.data_uri)){
+      const img = el('img', {
+        src: m.data_uri || '',
+        alt: m.title || '图片附件',
+        loading: 'lazy',
+      });
+      if (!m.data_uri && m.media_rel) bindMediaBlob(img, String(m.media_rel));
+      wrap.append(img);
+    }
+  }
+  return wrap.childElementCount ? wrap : null;
+}

@@ -187,6 +187,13 @@ class GroupBehaviorController:
                 self._state["streak"].clear()
             self._save()
 
+    def is_muted(self, channel: str = "group", *, now: Optional[float] = None) -> bool:
+        ts = self._now(now)
+        ch = str(channel or "group")
+        with self._lock:
+            until = float(self._state["muted_until"].get(ch) or 0.0)
+            return until > ts
+
     def status_view(self, *, now: Optional[float] = None) -> Dict[str, Any]:
         ts = self._now(now)
         with self._lock:

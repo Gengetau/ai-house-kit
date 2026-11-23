@@ -391,8 +391,17 @@ def _tool_synthesize_voice(
     scope = ctx.scope if ctx is not None else "group"
     actor = ctx.actor if ctx is not None else ""
     res = synthesize_speech(text, scope=scope, actor=actor, voice=voice, cfg=cfg, daemon=daemon)
-    # Keep tool output compact for LLM tool loop while preserving media_rel
+    # Keep tool output compact for LLM tool loop while staging rich audio attachment for channel delivery
     if res.get("ok"):
+        if ctx is not None and isinstance(ctx.pending_media, list):
+            ctx.pending_media.append({
+                "kind": "audio",
+                "media_rel": str(res.get("media_rel") or ""),
+                "mime": str(res.get("mime") or "audio/wav"),
+                "format": str(res.get("format") or "wav"),
+                "title": str(text or "语音消息")[:40],
+                "audio_base64": str(res.get("audio_base64") or ""),
+            })
         return {
             "ok": True,
             "media_rel": res.get("media_rel"),

@@ -212,6 +212,7 @@ class ToolContext:
     now: float
     plugin_config: Mapping[str, Any] = field(default_factory=dict)
     daemon: Any = None
+    pending_media: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)

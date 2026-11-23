@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import json
+import struct
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -20,6 +22,41 @@ from ..plugin_api import (
 PLUGIN_ID = "meme_library"
 _BUNDLED_DIR = Path(__file__).resolve().parent.parent / "bundled_stickers"
 _ALLOWED_EXTS = frozenset({".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif"})
+_MOOD_PALETTES = {
+    "happy": (255, 224, 130, 240, 140, 60),
+    "relaxed": (198, 226, 200, 78, 128, 86),
+    "sleepy": (205, 214, 244, 92, 108, 168),
+    "shy": (255, 205, 210, 210, 92, 118),
+    "cozy": (255, 228, 196, 178, 108, 62),
+}
+
+
+def _render_sticker_png(mood: str = "relaxed", *, size: int = 64) -> bytes:
+    """Render a compact valid 64x64 RGBA PNG badge via stdlib `zlib`+`struct` for channels that reject SVG."""
+    bg_r, bg_g, bg_b, fg_r, fg_g, fg_b = _MOOD_PALETTES.get(str(mood or "").lower(), (220, 232, 224, 82, 118, 96))
+
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+
+    rows = bytearray()
+    half = size / 2.0
+    rad2 = (size * 0.42) ** 2
+    inner2 = (size * 0.22) ** 2
+    for y in range(size):
+        rows.append(0)
+        dy = y + 0.5 - half
+        for x in range(size):
+            dx = x + 0.5 - half
+            d2 = dx * dx + dy * dy
+            if d2 > rad2:
+                rows.extend((0, 0, 0, 0))
+            elif d2 <= inner2:
+                rows.extend((fg_r, fg_g, fg_b, 255))
+            else:
+                rows.extend((bg_r, bg_g, bg_b, 255))
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    idat = zlib.compress(bytes(rows), level=6)
+    return b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
 
 
 def _load_pack_dir(
@@ -219,10 +256,24 @@ def _tool_send_meme(
             if mem.check_outbound_leak(actor, "group", clean_cap, now=float(daemon.clock.now())):
                 return {"ok": False, "status": "blocked", "error": "memory_leak:private_to_public"}
 
-    res = get_meme_payload(meme_id, cfg=cfg, include_bytes=False)
+    res = get_meme_payload(meme_id, cfg=cfg, include_bytes=True)
     if not res.get("ok"):
         return res
     item = res["item"]
+    if ctx is not None and isinstance(ctx.pending_media, list):
+        item_mime = str(item.get("mime") or "image/svg+xml")
+        if item_mime == "image/svg+xml":
+            wire_png_b64 = base64.b64encode(_render_sticker_png(str(item.get("mood") or ""))).decode("ascii")
+        else:
+            wire_png_b64 = str(item.get("image_base64") or "")
+        ctx.pending_media.append({
+            "kind": "sticker",
+            "meme_id": item["id"],
+            "title": item["title"],
+            "mime": item_mime,
+            "data_uri": str(item.get("data_uri") or ""),
+            "image_base64": wire_png_b64,
+        })
     return {
         "ok": True,
         "meme_id": item["id"],
