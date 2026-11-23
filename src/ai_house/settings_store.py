@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .onboarding import mask_secret, upsert_dotenv_vars
+from .onboarding import atomic_write_private_text, mask_secret, upsert_dotenv_vars
 from .plugin_api import PluginDefinition, PluginManifest, is_plugin_enabled, resolve_plugin_config
 
 
@@ -36,14 +36,7 @@ class SettingsStore:
         return {"version": int(doc.get("version") or 1), "plugins": dict(plugins) if isinstance(plugins, dict) else {}}
 
     def _save_disk(self) -> None:
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.runtime_dir / f".{self.FILENAME}.tmp.{os.getpid()}"
-        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
+        atomic_write_private_text(self.path, json.dumps(self._data, ensure_ascii=False, indent=2))
 
     def reload_from_disk(self) -> None:
         with self._lock:

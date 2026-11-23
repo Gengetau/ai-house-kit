@@ -10,7 +10,7 @@ from ..media_safety import (
     fetch_media_bytes,
     mime_for_path,
     parse_data_uri,
-    resolve_runtime_media_path,
+    resolve_scoped_media_path,
     to_data_uri,
 )
 from ..plugin_api import (
@@ -62,6 +62,9 @@ def _load_image_as_data_uri(
     *,
     daemon: Any = None,
     allow_loopback: bool = False,
+    scope: str = "private",
+    actor: str = "",
+    channel: str = "",
 ) -> str:
     raw_src = str(source or "").strip()
     if not raw_src:
@@ -80,7 +83,14 @@ def _load_image_as_data_uri(
         rt_dir = getattr(daemon, "runtime_dir", None)
         if not rt_dir:
             raise ValueError("运行时目录未初始化")
-        fp = resolve_runtime_media_path(rt_dir, raw_src)
+        fp = resolve_scoped_media_path(
+            rt_dir,
+            raw_src,
+            scope=scope,
+            actor=actor,
+            channel=channel,
+            album=getattr(daemon, "album", None),
+        )
         if not fp.is_file():
             raise ValueError("未找到本地媒体图片")
         raw = fp.read_bytes()
@@ -97,6 +107,8 @@ def describe_image_source(
     cfg: Optional[Mapping[str, Any]] = None,
     daemon: Any = None,
     actor: str = "",
+    scope: str = "private",
+    channel: str = "",
 ) -> Dict[str, Any]:
     """Understand one image via an OpenAI-compatible vision endpoint, degrading quietly on any fault."""
     conf = dict(cfg or {})
@@ -120,7 +132,14 @@ def describe_image_source(
 
     allow_loopback = bool(conf.get("allow_loopback_media", False))
     try:
-        data_uri = _load_image_as_data_uri(source, daemon=daemon, allow_loopback=allow_loopback)
+        data_uri = _load_image_as_data_uri(
+            source,
+            daemon=daemon,
+            allow_loopback=allow_loopback,
+            scope=scope,
+            actor=actor,
+            channel=channel,
+        )
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -187,12 +206,21 @@ def enrich_chat_images(
     *,
     daemon: Any,
     actor: str = "",
+    scope: str = "group",
+    channel: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
 ) -> List[str]:
     """Inspect up to 2 inbound image refs cleanly; faults degrade to empty annotations."""
     notes: List[str] = []
     for raw_src in list(images or ())[:2]:
-        res = describe_image_source(str(raw_src), daemon=daemon, cfg=cfg, actor=actor)
+        res = describe_image_source(
+            str(raw_src),
+            daemon=daemon,
+            cfg=cfg,
+            actor=actor,
+            scope=scope,
+            channel=channel,
+        )
         if res.get("ok") and res.get("summary"):
             notes.append(f"[附带图片画面参考：{res['summary']}]")
     return notes
@@ -207,7 +235,9 @@ def _tool_inspect_image(
     cfg = ctx.plugin_config if ctx is not None else {}
     daemon = ctx.daemon if ctx is not None else None
     actor = ctx.actor if ctx is not None else ""
-    return describe_image_source(source, prompt=prompt, cfg=cfg, daemon=daemon, actor=actor)
+    scope = ctx.scope if ctx is not None else "group"
+    channel = ctx.channel if ctx is not None else ""
+    return describe_image_source(source, prompt=prompt, cfg=cfg, daemon=daemon, actor=actor, scope=scope, channel=channel)
 
 
 def _route_describe(rctx: PluginRequestContext) -> Dict[str, Any]:
@@ -215,7 +245,7 @@ def _route_describe(rctx: PluginRequestContext) -> Dict[str, Any]:
     source = str(body.get("source") or body.get("url") or body.get("data_uri") or "").strip()
     prompt = str(body.get("prompt") or "").strip()
     actor = str(body.get("actor") or "").strip()
-    return describe_image_source(source, prompt=prompt, cfg=rctx.plugin_config, daemon=rctx.daemon, actor=actor)
+    return describe_image_source(source, prompt=prompt, cfg=rctx.plugin_config, daemon=rctx.daemon, actor=actor, scope="group")
 
 
 PLUGIN_DEF = PluginDefinition(

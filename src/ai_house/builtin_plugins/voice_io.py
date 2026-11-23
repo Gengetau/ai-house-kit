@@ -20,7 +20,7 @@ from ..media_safety import (
     media_ext_for_mime,
     mime_for_path,
     parse_data_uri,
-    resolve_runtime_media_path,
+    resolve_scoped_media_path,
     to_data_uri,
 )
 from ..plugin_api import (
@@ -66,6 +66,9 @@ def _load_audio_bytes(
     *,
     daemon: Any = None,
     allow_loopback: bool = False,
+    scope: str = "private",
+    actor: str = "",
+    channel: str = "",
 ) -> Tuple[bytes, str, str]:
     raw_src = str(source or "").strip()
     if not raw_src:
@@ -83,7 +86,14 @@ def _load_audio_bytes(
         rt_dir = getattr(daemon, "runtime_dir", None)
         if not rt_dir:
             raise ValueError("运行时目录未初始化")
-        fp = resolve_runtime_media_path(rt_dir, raw_src)
+        fp = resolve_scoped_media_path(
+            rt_dir,
+            raw_src,
+            scope=scope,
+            actor=actor,
+            channel=channel,
+            album=getattr(daemon, "album", None),
+        )
         if not fp.is_file():
             raise ValueError("未找到本地语音文件")
         raw = fp.read_bytes()
@@ -126,6 +136,9 @@ def transcribe_audio_source(
     language: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
     daemon: Any = None,
+    scope: str = "private",
+    actor: str = "",
+    channel: str = "",
 ) -> Dict[str, Any]:
     """Transcribe an audio source via OpenAI-compatible `/v1/audio/transcriptions`, degrading cleanly on fault."""
     conf = dict(cfg or {})
@@ -145,7 +158,14 @@ def transcribe_audio_source(
 
     allow_loopback = bool(conf.get("allow_loopback_media", False))
     try:
-        raw, mime, filename = _load_audio_bytes(source, daemon=daemon, allow_loopback=allow_loopback)
+        raw, mime, filename = _load_audio_bytes(
+            source,
+            daemon=daemon,
+            allow_loopback=allow_loopback,
+            scope=scope,
+            actor=actor,
+            channel=channel,
+        )
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -285,12 +305,13 @@ def synthesize_speech(
     media_rel = ""
     rt_dir = getattr(daemon, "runtime_dir", None) if daemon is not None else None
     if rt_dir:
+        eff_scope = "private" if str(scope or "").strip().lower() == "private" else ("world" if str(scope or "").strip().lower() == "world" else "group")
         digest = hashlib.sha256(raw_audio).hexdigest()[:16]
-        out_dir = Path(rt_dir) / "media" / "tts"
+        out_dir = Path(rt_dir) / "media" / "tts" / eff_scope
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{digest}.{fmt}"
         out_path.write_bytes(raw_audio)
-        media_rel = f"media/tts/{out_path.name}"
+        media_rel = f"media/tts/{eff_scope}/{out_path.name}"
 
     out: Dict[str, Any] = {
         "ok": True,
@@ -316,12 +337,22 @@ def enrich_chat_records(
     records: Sequence[str],
     *,
     daemon: Any,
+    scope: str = "group",
+    actor: str = "",
+    channel: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
 ) -> List[str]:
     """Transcribe up to 2 inbound voice refs cleanly; faults degrade to empty annotations."""
     notes: List[str] = []
     for raw_src in list(records or ())[:2]:
-        res = transcribe_audio_source(str(raw_src), daemon=daemon, cfg=cfg)
+        res = transcribe_audio_source(
+            str(raw_src),
+            daemon=daemon,
+            cfg=cfg,
+            scope=scope,
+            actor=actor,
+            channel=channel,
+        )
         if res.get("ok") and res.get("text"):
             notes.append(f"[语音转写：{res['text']}]")
     return notes
@@ -335,7 +366,18 @@ def _tool_transcribe_audio(
 ) -> Dict[str, Any]:
     cfg = ctx.plugin_config if ctx is not None else {}
     daemon = ctx.daemon if ctx is not None else None
-    return transcribe_audio_source(source, language=language, cfg=cfg, daemon=daemon)
+    scope = ctx.scope if ctx is not None else "group"
+    actor = ctx.actor if ctx is not None else ""
+    channel = ctx.channel if ctx is not None else ""
+    return transcribe_audio_source(
+        source,
+        language=language,
+        cfg=cfg,
+        daemon=daemon,
+        scope=scope,
+        actor=actor,
+        channel=channel,
+    )
 
 
 def _tool_synthesize_voice(
@@ -364,7 +406,7 @@ def _route_transcribe(rctx: PluginRequestContext) -> Dict[str, Any]:
     body = rctx.body if isinstance(rctx.body, Mapping) else {}
     source = str(body.get("source") or body.get("url") or body.get("data_uri") or "").strip()
     language = str(body.get("language") or "").strip()
-    return transcribe_audio_source(source, language=language, cfg=rctx.plugin_config, daemon=rctx.daemon)
+    return transcribe_audio_source(source, language=language, cfg=rctx.plugin_config, daemon=rctx.daemon, scope="group")
 
 
 def _route_speak(rctx: PluginRequestContext) -> Dict[str, Any]:

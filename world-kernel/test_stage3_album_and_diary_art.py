@@ -232,15 +232,27 @@ class Stage3AlbumAndDiaryArtTests(unittest.TestCase):
         self.assertEqual(alb_priv["items"][0]["kind"], "chat_image")
 
         # Never appears in world/group album, public plugin route, or public diaries
-        for pub_url in (
+        # Never appears in world/group album, public plugin route, or public diaries
+        for world_url in (
             f"{base}/api/album?scope=world&limit=50",
-            f"{base}/api/album?scope=group&limit=50",
             f"{base}/api/plugins/album_diary_art/items?scope=world&limit=50",
-            f"{base}/api/plugins/album_diary_art/items?scope=group&limit=50",
         ):
-            st_p, res_p = _http_json(pub_url, token=read_tok)
+            st_p, res_p = _http_json(world_url, token=read_tok)
             self.assertEqual(st_p, 200)
             self.assertNotIn(priv_id, {it["album_id"] for it in res_p["items"]})
+
+        # `read` token must NOT read group album photos (`private` tier required)
+        st_read_grp, _ = _http_json(f"{base}/api/album?scope=group&limit=50", token=read_tok)
+        self.assertEqual(st_read_grp, 403)
+        st_items_grp, _ = _http_json(f"{base}/api/plugins/album_diary_art/items?scope=group&limit=50", token=read_tok)
+        self.assertEqual(st_items_grp, 400)
+        for priv_scope_url in (
+            f"{base}/api/album?scope=group&limit=50",
+            f"{base}/api/plugins/album_diary_art/private?scope=group&limit=50",
+        ):
+            st_g2, res_g2 = _http_json(priv_scope_url, token=owner_tok)
+            self.assertEqual(st_g2, 200)
+            self.assertNotIn(priv_id, {it["album_id"] for it in res_g2["items"]})
 
         _, res_diaries_all = _http_json(f"{base}/api/diaries?limit=50", token=read_tok)
         self.assertNotIn(priv_id, {row.get("image_album_id") for row in res_diaries_all["diaries"]})

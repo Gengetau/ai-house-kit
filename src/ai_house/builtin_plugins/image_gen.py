@@ -273,12 +273,13 @@ def generate_image_asset(
     media_rel = ""
     rt_dir = getattr(daemon, "runtime_dir", None) if daemon is not None else None
     if rt_dir:
+        eff_scope = "private" if str(scope or "").strip().lower() == "private" else ("world" if str(scope or "").strip().lower() == "world" else "group")
         digest = hashlib.sha256(img_bytes).hexdigest()[:16]
-        out_dir = Path(rt_dir) / "media" / "generated"
+        out_dir = Path(rt_dir) / "media" / "generated" / eff_scope
         out_dir.mkdir(parents=True, exist_ok=True)
         fp = out_dir / f"{digest}.{ext}"
         fp.write_bytes(img_bytes)
-        media_rel = f"media/generated/{fp.name}"
+        media_rel = f"media/generated/{eff_scope}/{fp.name}"
 
     return {
         "ok": True,

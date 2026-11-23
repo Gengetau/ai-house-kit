@@ -103,3 +103,8 @@ ONEBOT_STALE_S=120
 - 网页/MCP 这边，凡是带了写档以上令牌能发消息的人都被当作房主（令牌本身就是身份）。想区分，就别把写档令牌发给别人。
 - 私聊档令牌能读所有 QQ 群的聊天记录（含群友发言）。
 - 没有在真实 QQ、真实 OneBot 实现上测过。第一次接请用测试群和小号，并观察日志。
+
+## 5. 在线热备与凭据处理
+
+- 运行 `ai-house backup`（或控制台发起备份）会通过 SQLite `Connection.backup()` 对 `runtime/*.db` 生成热备并校验 `PRAGMA integrity_check` 与 SHA-256 `manifest.json`，输出目录默认收口为 `0700`、归档文件为 `0600`。
+- 为防止凭据外泄，备份归档**不包含 `.env`**，且会对 `llm_config.json` 与 `plugin_settings.json` 中的 `api_key` / `token` / `secret` 等敏感字段自动脱敏置空；恢复到新环境后，请通过 `.env` 或设置页重新填入对应密钥。

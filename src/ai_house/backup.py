@@ -22,6 +22,8 @@ JST = dt.timezone(dt.timedelta(hours=9))
 DEFAULT_KEEP_COUNT = 10
 DEFAULT_KEEP_DAYS = 14
 _SENSITIVE_NAMES = frozenset({".env", ".env.local", ".env.prod", ".env.production"})
+_SECRET_FIELD_KEYS = frozenset({"api_key", "access_token", "token", "secret", "password", "bot_token"})
+_REDACT_CONFIG_FILES = frozenset({"llm_config.json", "plugin_settings.json"})
 
 
 def _sha256_file(path: Path) -> str:
@@ -35,11 +37,44 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _safe_chmod_600(path: Path) -> None:
+def _safe_chmod(path: Path, mode: int = 0o600) -> None:
     try:
-        os.chmod(path, 0o600)
+        os.chmod(path, mode)
     except OSError:
         pass
+
+
+def _redact_obj(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            kl = str(k).strip().lower()
+            if (kl in _SECRET_FIELD_KEYS or kl.endswith(("_api_key", "_secret", "_token", "_password"))) and isinstance(v, str) and v.strip():
+                out[k] = ""
+            else:
+                out[k] = _redact_obj(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_obj(x) for x in obj]
+    return obj
+
+
+def _copy_json_redacted(src: Path, dst: Path) -> bool:
+    """Copy a JSON runtime file into the backup stage, stripping plaintext secrets."""
+    raw_text = src.read_text(encoding="utf-8")
+    redacted = False
+    if src.name.lower() in _REDACT_CONFIG_FILES:
+        try:
+            doc = json.loads(raw_text)
+            cleaned = _redact_obj(doc)
+            dst.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+            redacted = True
+        except ValueError:
+            shutil.copy2(src, dst)
+    else:
+        shutil.copy2(src, dst)
+    _safe_chmod(dst, 0o600)
+    return redacted
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -132,13 +167,14 @@ def create_backup(
     keep_days: int = DEFAULT_KEEP_DAYS,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Create a verified hot SQLite + runtime config `.tar.gz` backup (excluding `.env` secrets)."""
+    """Create a verified hot SQLite + redacted runtime config `.tar.gz` backup (excluding `.env` and plaintext keys)."""
     rt = Path(runtime_dir).resolve()
     if not rt.is_dir():
         raise FileNotFoundError(f"运行目录不存在：{rt}")
     ts = float(now if now is not None else time.time())
     backups_dir = (Path(out_dir) if out_dir else (rt / "backups")).resolve()
     backups_dir.mkdir(parents=True, exist_ok=True)
+    _safe_chmod(backups_dir, 0o700)
 
     stamp = dt.datetime.fromtimestamp(ts, JST).strftime("%Y%m%d-%H%M%S")
     archive_path = backups_dir / f"ai-house-backup-{stamp}.tar.gz"
@@ -166,15 +202,18 @@ def create_backup(
                 "sha256": _sha256_file(dst_db),
             })
 
-        # 2) Non-secret runtime JSON configs
+        # 2) Non-secret runtime JSON configs (strip API keys before writing)
+        any_redacted = False
         for jf in sorted(rt.glob("*.json")):
             if not jf.is_file() or _is_sensitive_name(jf.name):
                 continue
             dst_jf = stage_root / jf.name
-            shutil.copy2(jf, dst_jf)
+            was_redacted = _copy_json_redacted(jf, dst_jf)
+            any_redacted = any_redacted or was_redacted
             manifest_files.append({
                 "path": jf.name,
                 "kind": "json",
+                "secrets_redacted": was_redacted,
                 "size": int(dst_jf.stat().st_size),
                 "sha256": _sha256_file(dst_jf),
             })
@@ -201,6 +240,7 @@ def create_backup(
             "created_at": ts,
             "created_jst": dt.datetime.fromtimestamp(ts, JST).strftime("%Y-%m-%d %H:%M:%S JST"),
             "source_name": rt.name,
+            "secrets_redacted": any_redacted,
             "files": manifest_files,
         }
         manifest_path = stage_root / "manifest.json"
@@ -212,7 +252,7 @@ def create_backup(
             for entry in manifest_files:
                 tf.add(stage_root / entry["path"], arcname=entry["path"])
         tmp_arc.replace(archive_path)
-        _safe_chmod_600(archive_path)
+        _safe_chmod(archive_path, 0o600)
 
     pruned = _prune_backups(
         backups_dir,
@@ -326,7 +366,7 @@ def restore_backup(
             dst.parent.mkdir(parents=True, exist_ok=True)
             data = tf.extractfile(members[rel]).read()
             dst.write_bytes(data)
-            _safe_chmod_600(dst)
+            _safe_chmod(dst, 0o600)
             restored.append(rel)
     return {
         "ok": True,

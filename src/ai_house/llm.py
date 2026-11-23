@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-from .onboarding import mask_secret
+from .onboarding import atomic_write_private_text, mask_secret
 
 JST = dt.timezone(dt.timedelta(hours=9))
 _SK_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
@@ -304,14 +304,7 @@ class ModelRouter:
     def _save_overrides(self) -> None:
         if self._config_path is None or self.runtime_dir is None:
             return
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.runtime_dir / f".{self.CONFIG_FILENAME}.tmp.{os.getpid()}"
-        tmp.write_text(json.dumps(self._overrides, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self._config_path)
-        try:
-            os.chmod(self._config_path, 0o600)
-        except OSError:
-            pass
+        atomic_write_private_text(self._config_path, json.dumps(self._overrides, ensure_ascii=False, indent=2))
 
     def _init_usage_schema(self) -> None:
         assert self._usage_db is not None
@@ -545,6 +538,17 @@ class ModelRouter:
         mdl = str(ov.get("model") or self.env.get(f"AI_HOUSE_ACTOR_MODEL_{ak}") or "").strip()
         return url, key, mdl
 
+    @staticmethod
+    def _origin_tuple(url: str) -> Tuple[str, str, int]:
+        try:
+            p = urlparse(str(url or "").strip())
+        except ValueError:
+            return "", "", 0
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").strip().lower().rstrip(".")
+        port = int(p.port or (443 if scheme == "https" else 80))
+        return scheme, host, port
+
     def resolve_endpoints(self, *, purpose: str = "chat", actor: str = "") -> List[Tuple[ModelEndpoint, bool]]:
         """Return ordered `[(ModelEndpoint, is_fallback), ...]` for the given task purpose and roommate."""
         with self._lock:
@@ -552,16 +556,26 @@ class ModelRouter:
             t_url, t_key, t_model = self._task_endpoint_override(purpose)
             r_url, r_key, r_model = self._resident_endpoint_override(actor)
 
-            # Explicit dedicated task overrides (e.g. AI_HOUSE_MEMORY_MODEL) govern memory_extract/ping,
-            # while per-resident overrides customize chat, life decisions, and diaries.
+            # Precedence: dedicated memory_extract/ping task override > resident override > primary;
+            # all other purposes: resident override > task override > primary.
             if purpose in ("memory_extract", "ping") and (t_url or t_key or t_model):
-                sel_url = t_url or r_url or p_url
-                sel_key = t_key or r_key or p_key
-                sel_model = t_model or r_model or p_model
+                layers = [(t_url, t_key, t_model), (r_url, r_key, r_model), (p_url, p_key, p_model)]
             else:
-                sel_url = r_url or t_url or p_url
-                sel_key = r_key or t_key or p_key
-                sel_model = r_model or t_model or p_model
+                layers = [(r_url, r_key, r_model), (t_url, t_key, t_model), (p_url, p_key, p_model)]
+
+            sel_url = next((u for u, _, _ in layers if u), p_url)
+            sel_origin = self._origin_tuple(sel_url)
+            sel_model = next((m for _, _, m in layers if m), p_model)
+
+            # Never send a primary/fallback key from a different origin to a custom override base_url
+            sel_key = ""
+            for l_url, l_key, _ in layers:
+                if not l_key:
+                    continue
+                layer_eff_url = l_url or p_url
+                if self._origin_tuple(layer_eff_url) == sel_origin:
+                    sel_key = l_key
+                    break
 
             eps: List[Tuple[ModelEndpoint, bool]] = []
             if sel_key:

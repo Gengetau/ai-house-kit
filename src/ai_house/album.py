@@ -210,3 +210,25 @@ class AlbumStore:
         if row is None:
             return None
         return self._hydrate_item(row, include_data_uri=include_data_uri)
+
+    def get_by_media_rel(
+        self,
+        media_rel: str,
+        *,
+        include_data_uri: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        clean_rel = str(media_rel or "").strip().replace("\\", "/").lstrip("/")
+        if not clean_rel:
+            return None
+        if not clean_rel.startswith("media/"):
+            clean_rel = f"media/{clean_rel}"
+        self.init_schema()
+        with self._lock, contextlib.closing(self._conn()) as c:
+            row = c.execute(
+                "SELECT album_id, scope, actor, channel, kind, title, caption, media_rel, mime, diary_day, created_at "
+                "FROM album_items WHERE media_rel=?",
+                (clean_rel,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._hydrate_item(row, include_data_uri=include_data_uri)
