@@ -1,0 +1,32 @@
+# 小屋在 Docker 里、OneBot v11 协议端在同一台 Linux 宿主机上（或以宿主网络运行），
+# 而 `ws://host.docker.internal:端口` 连不上时用：让小屋直接用宿主机的网络，按 ws://127.0.0.1:端口 去连。
+#
+# 什么时候需要它：`doctor --onebot-ping` 报「连不上 host.docker.internal:…（TimeoutError）」。常见原因是宿主机的防火墙
+# 丢弃了从 Docker 网桥到宿主机端口的流量。两条路任选其一：
+#   a) 在防火墙里放行 Docker 网桥网段访问那个端口（不用这个文件）；
+#   b) 用这个文件，小屋走宿主网络，协议端可以只监听 127.0.0.1，不需要放行任何端口。
+#
+# 注意：
+#   - 只适用于 Linux。Docker Desktop（macOS / Windows）的宿主网络是另一回事，请用默认的 host.docker.internal。
+#   - 宿主网络下没有端口映射这一层：小屋监听在哪里，就暴露在哪里。这个文件把它固定在 127.0.0.1:8780，
+#     只有本机能访问；要给别的设备用，请在前面放带 HTTPS 的反向代理，不要把下面的 127.0.0.1 改成 0.0.0.0。
+#   - 宿主机的 8780 端口必须空着。
+#   - 不能和 --profile city（本地城市引擎）或 deploy/onebot/compose.onebot.yaml 同时用，它们依赖 Docker 网络。
+#
+# 在 .env 里写：
+#        ONEBOT_WS_URL=ws://127.0.0.1:3001
+#        ONEBOT_ACCESS_TOKEN=<协议端里为这个 WebSocket 服务设的令牌>
+#        ONEBOT_OWNER_QQ=<你本人的 QQ 号>
+# 启动并检查：
+#        docker compose -f compose.yaml -f deploy/onebot/compose.host-network.yaml up -d
+#        docker compose -f compose.yaml -f deploy/onebot/compose.host-network.yaml exec ai-house ai-house doctor --onebot-ping
+# 需要常驻就再叠一个 -f deploy/compose.always-on.yaml。
+#
+# 完整说明见 docs/DEPLOY.md。
+services:
+  ai-house:
+    network_mode: host
+    networks: !reset null
+    ports: !reset null
+    extra_hosts: !reset null
+    command: ["ai-house", "up", "--host", "127.0.0.1", "--port", "8780", "--data-dir", "/app/runtime"]
