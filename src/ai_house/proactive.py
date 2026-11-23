@@ -329,7 +329,10 @@ class ProactiveEngine:
         llm_fn = getattr(getattr(daemon, "chat_agent", None), "_llm_fn", None)
         if callable(llm_fn):
             try:
-                txt = str(llm_fn(sys_p, user_p) or "").strip()
+                got = llm_fn(sys_p, user_p)
+                if isinstance(got, (tuple, list)):  # (text, tokens) convention of the chat agent
+                    got = got[0] if got else ""
+                txt = str(got or "").strip()
                 if txt:
                     return txt[:240], "injected_llm"
             except Exception:  # noqa: BLE001
@@ -394,6 +397,14 @@ class ProactiveEngine:
                 eff_group_channel != "group" and gb.is_muted("group", now=ts)
             ):
                 return {"ok": True, "triggered": False, "reason": "group_muted"}
+
+        if target_channel != "webchat":
+            # Nothing can deliver to a channel that is not loaded: do not consume events, spend an LLM call, enqueue
+            # an outbox row that would sit pending forever, or charge the daily quota.
+            wanted = "onebot_v11" if target_channel == "onebot" else target_channel
+            loaded = {str(getattr(c, "channel_id", "") or "") for c in getattr(daemon, "channels", ())}
+            if wanted not in loaded:
+                return {"ok": True, "triggered": False, "reason": "channel_unavailable"}
 
         with self._lock:
             st = self._load_locked(ts)
