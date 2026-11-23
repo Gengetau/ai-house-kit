@@ -590,6 +590,63 @@ _RELAY_RE = re.compile(
 _RELAY_FIRST_PERSON_RE = re.compile(r"^[\s，,：:、“\"'「『]*(?:我|咱|俺|本人)")
 
 
+_SUPPORT_SUBJECT_RE = re.compile(r"房主|主人|自己|我们|你们|他们|她们|非常|特别|比较|真的|一直|总是|经常|[我你您他她它为给替]")
+_SUPPORT_NOTE_RE = re.compile(r"[（(][^）)]*[）)]")
+_SUPPORT_DATE_RE = re.compile(r"\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2}|\d{1,2}月\d{1,2}[日号]")
+_SUPPORT_CLAUSE_RE = re.compile(r"[，,。！!？?；;\n、]+|但是?|可是|不过|却")
+_SUPPORT_NEG_RE = re.compile(r"[不没别无非未]")
+_SUPPORT_NEG_FALSE_RE = re.compile(r"非常|特别|分别|别人|别的|未来|不错|不过|没错|没关系")
+_SUPPORT_STOP_RE = re.compile("[" + "".join(sorted(_CJK_STOP_CHARS)) + "]+")
+PRIVATE_SUPPORT_MIN = 0.6  # share of the item's content units that the cited owner lines must contain
+
+
+def _support_units(text: str, *, chars: bool = False) -> set[str]:
+    """Content units for the evidence check: subject words / function chars removed, CJK bigrams + ASCII words.
+
+    A lone content char ("虾") is a unit of its own; with `chars=True` (the evidence side) every char is one too.
+    """
+    s = _SUPPORT_SUBJECT_RE.sub(" ", str(text or "").lower())
+    units: set[str] = set(re.findall(r"[a-z0-9]+", s))
+    for run in _CJK_RUN_RE.findall(s):
+        for piece in _SUPPORT_STOP_RE.split(run):
+            if len(piece) == 1 or chars:
+                units.update(piece)
+            units.update(piece[i : i + 2] for i in range(len(piece) - 1))
+    return units
+
+
+def _is_negated(text: str) -> bool:
+    return bool(_SUPPORT_NEG_RE.search(_SUPPORT_NEG_FALSE_RE.sub("", text)))
+
+
+def _owner_lines_support(text: str, cited_lines: Sequence[str], names: Sequence[str] = ()) -> bool:
+    """Deterministic check that the cited owner line(s) really say `text` (the model never decides this).
+
+    The item's content units (see `_support_units`) must be covered >= PRIVATE_SUPPORT_MIN by the cited clauses.
+    Clauses whose negation differs from the item's are ignored, so 「我不吃香菜」 cannot back 「房主爱吃香菜」.
+    """
+    cited = "\n".join(cited_lines)
+    # The roommate's own name is a subject word too: the owner says 「你」, the extractor writes 「奈尔」.
+    for name in names:
+        text = text.replace(name, " ") if name else text
+    # Parenthetical notes, and a record date the extractor added to a line that names no date, are not claims.
+    body = _SUPPORT_NOTE_RE.sub("", text)
+    if not _SUPPORT_DATE_RE.search(cited):
+        body = _SUPPORT_DATE_RE.sub(" ", body)
+    want = _support_units(body)
+    if not want:
+        return False
+    neg = _is_negated(body)
+    have: set[str] = set()
+    for clause in _SUPPORT_CLAUSE_RE.split(cited):
+        if clause.strip() and _is_negated(clause) == neg:
+            have |= _support_units(clause, chars=True)
+    # Numbers / latin names are exact: "3月6日" must not ride on a line that says "3月5日".
+    if any(u.isascii() and u not in have for u in want):
+        return False
+    return len(want & have) / len(want) >= PRIVATE_SUPPORT_MIN
+
+
 def _is_relayed_line(line: str) -> bool:
     """True when a line reports what somebody else said about a third party ("小林说他对花生过敏").
 
@@ -1462,7 +1519,9 @@ class MemoryStore:
         if row.get("_conflict_verified"):
             head = "群聊未核实传言·与已知事实冲突，勿采信"
         elif kind == "claim" or trust in ("group_stated", "hearsay"):
-            head = "群聊陈述·未核实"
+            # In a private room nobody but the owner speaks, so an unverified row there is the extractor's own
+            # inference that the owner's words did not back, not something a group member said.
+            head = "推断·未核实" if str(row.get("scope") or "") == "private" else "群聊陈述·未核实"
         else:
             tag = (
                 "·私密"
@@ -1726,6 +1785,7 @@ class MemoryStore:
         text_val: str,
         is_update: bool = False,
         info: Optional[Dict[str, Any]] = None,
+        actor: str = "",
     ) -> Tuple[str, str]:
         non_self_all = [r for r in selected if str(r["speaker_role"] or "member").lower() != "self"]
         self_rows = [r for r in selected if str(r["speaker_role"] or "member").lower() == "self"]
@@ -1819,6 +1879,16 @@ class MemoryStore:
                     return "claim", "group_stated"
                 return eff_kind, "group_stated"
             return eff_kind, ("group_stated" if eff_kind == "claim" else "verified")
+
+        if scope == "private" and not is_update:
+            # Citing *some* owner line is not enough: the line must actually say it, else same downgrade as group.
+            cited = [_strip_speaker_prefix(r["line"]) for r in ev_rows if not _is_pure_question_line(r["line"])]
+            if not _owner_lines_support(text_val, cited, [actor, self.names.get(actor, "")]):
+                if eff_kind == "rule":
+                    raise ValueError("私聊规则缺乏房主原话支持")
+                if eff_kind in ("fact", "preference", "person", "claim"):
+                    return "claim", "group_stated"
+                return eff_kind, "group_stated"
 
         return eff_kind, ("group_stated" if eff_kind == "claim" else "verified")
 
@@ -1929,6 +1999,7 @@ class MemoryStore:
                         text_val=str(text_val or ""),
                         is_update=False,
                         info=trust_info,
+                        actor=actor,
                     )
                     is_shared = bool(allow_shared and scope in ("group", "world") and raw_op.get("shared"))
                     eff_source = "auto:owner_verified" if (scope == "group" and eff_trust == "verified") else "auto"
