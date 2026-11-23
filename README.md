@@ -32,6 +32,7 @@ ai-house up
 
 - 建议装在虚拟环境里（上面第三行）：不少系统的 Python 不允许直接往系统目录里装包。以后每次开新终端先执行一次 `. .venv/bin/activate`，`ai-house` 命令才找得到。
 - 核心没有第三方依赖。要接 QQ 再装 `python3 -m pip install -e ".[onebot]"`；要跑测试装 `".[dev]"`。
+- 可选：把住客的聊天交给 agent 外壳（Claude Code）来跑，会话能续接、住客自己决定说不说话。装 `".[agent]"` 并设 `AI_HOUSE_BRAIN=claude`，详见 [docs/AGENT-BRAIN.md](docs/AGENT-BRAIN.md)。**这条路径用真的外壳加模拟模型端测过，还没有用真的 Claude 模型跑过。**
 
 - 可选直接绑定内置 3 人工作室包：`ai-house init --pack indie-studio-3 --force && ai-house up`
 - 也可在 `.env` 预填 `AI_HOUSE_API_KEY`、`AI_HOUSE_BASE_URL`、`AI_HOUSE_MODEL`，并用 `ai-house doctor --live-ping` 测通后再启动（或启动后直接在网页向导里填写并测试）。
