@@ -61,7 +61,8 @@ def _parse_dotenv_file(path: Path) -> Tuple[Dict[str, str], List[str], List[str]
 def _load_dotenv(path: str = ".env") -> None:
     vals, _, _ = _parse_dotenv_file(Path(path))
     for k, v in vals.items():
-        os.environ.setdefault(k, v)
+        if not (os.environ.get(k) or "").strip():
+            os.environ[k] = v
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -212,12 +213,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_token(args: argparse.Namespace) -> int:
     env_path = Path(args.env_file).resolve()
     vals, _errs, _warns = _parse_dotenv_file(env_path)
-    if vals.get("AI_HOUSE_OWNER_TOKEN"):
-        owner_token = vals["AI_HOUSE_OWNER_TOKEN"].strip()
-        source = "dotenv"
-    elif os.environ.get("AI_HOUSE_OWNER_TOKEN", "").strip():
-        owner_token = os.environ["AI_HOUSE_OWNER_TOKEN"].strip()
+    env_tok = os.environ.get("AI_HOUSE_OWNER_TOKEN", "").strip()
+    dotenv_tok = (vals.get("AI_HOUSE_OWNER_TOKEN") or "").strip()
+    if env_tok:
+        owner_token = env_tok
         source = "env"
+    elif dotenv_tok:
+        owner_token = dotenv_tok
+        source = "dotenv"
     else:
         owner_token = ""
         source = "unset"
@@ -238,7 +241,13 @@ def cmd_token(args: argparse.Namespace) -> int:
         return 0 if owner_token else 1
 
     if owner_token:
-        print(f"配置文件: {env_path}\nAI_HOUSE_OWNER_TOKEN: {owner_token}", flush=True)
+        lines = [
+            f"配置文件: {env_path}",
+            f"AI_HOUSE_OWNER_TOKEN: {owner_token}",
+        ]
+        if source == "env":
+            lines.append("生效来源: 环境变量 AI_HOUSE_OWNER_TOKEN（覆盖配置文件）")
+        print("\n".join(lines), flush=True)
         return 0
 
     print(
@@ -253,7 +262,7 @@ def cmd_token(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     env_path = Path(args.env_file)
     parsed, env_errs, env_warns = _parse_dotenv_file(env_path)
-    eff_env = {**os.environ, **parsed}
+    eff_env = {**parsed, **{k: v for k, v in os.environ.items() if v != ""}}
     host = args.host or eff_env.get("AI_HOUSE_HOST") or "127.0.0.1"
     data_dir = Path(args.data_dir or eff_env.get("AI_HOUSE_DATA_DIR") or "./runtime")
     pack_arg = args.pack if args.pack is not None else (eff_env.get("AI_HOUSE_PACK_DIR") or None)

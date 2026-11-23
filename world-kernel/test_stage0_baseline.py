@@ -193,6 +193,62 @@ class Stage0ErrandIntentTests(unittest.TestCase):
         self.assertTrue(allergy_rows)
         self.assertNotEqual(allergy_rows[0]["state"], "completed")
 
+    def test_errand_not_closed_by_unrelated_arrival_and_handles_over_500_evidences(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rt = Path(tmp.name) / "rt"
+        start = dt.datetime(2026, 11, 22, 10, 0, tzinfo=JST).timestamp()
+        d = HouseDaemon(runtime_dir=rt, virtual_clock=True, start_ts=start, env={})
+        self.addCleanup(d.close)
+
+        # Case A: "去超市买鸡蛋" + park arrival evidence must NOT auto-complete the errand
+        d.intents.enqueue_chat("nell", "去超市买鸡蛋", "好嘞，我去看看", where="group", now=start + 10.0)
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            with c:
+                c.execute(
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                    (
+                        "ev-park-arrive",
+                        1,
+                        start + 20.0,
+                        json.dumps({"kind": "arrived", "actor": "nell", "place": "park", "at": start + 20.0}),
+                    ),
+                )
+        d.intents.sweep(start + 30.0)
+        egg_rows = [r for r in d.intents.list_intents(actor="nell") if r.get("item") == "egg"]
+        self.assertEqual(len(egg_rows), 1)
+        self.assertEqual(egg_rows[0]["state"], "open")
+        self.assertEqual(len(d.intents.errands("nell", start + 30.0)), 1)
+
+        # Case B: Insert 505 earlier unrelated evidence rows; 506th matching purchase must still complete!
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            with c:
+                for idx in range(505):
+                    ev_ts = start - 5000.0 + idx
+                    c.execute(
+                        "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                        (
+                            f"ev-noise-{idx}",
+                            10 + idx,
+                            ev_ts,
+                            json.dumps({"kind": "activity", "actor": "sora", "activity": "reading", "at": ev_ts}),
+                        ),
+                    )
+                c.execute(
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                    (
+                        "ev-buy-egg-506",
+                        600,
+                        start + 60.0,
+                        json.dumps({"kind": "purchased", "actor": "nell", "item": "egg", "qty": 2, "at": start + 60.0}),
+                    ),
+                )
+        d.intents.sweep(start + 70.0)
+        after_rows = [r for r in d.intents.list_intents(actor="nell") if r.get("item") == "egg"]
+        self.assertEqual(after_rows[0]["state"], "completed")
+        self.assertEqual(after_rows[0]["evidence_key"], "ev-buy-egg-506")
+        self.assertEqual(d.intents.errands("nell", start + 70.0), [])
+
 
 class Stage0ModelCompatTests(unittest.TestCase):
     def _start_mock_llm_server(self, mode: str, secret_key: str):
@@ -441,6 +497,43 @@ class Stage0CliAndHealthTests(unittest.TestCase):
             rc_missing = cli.main(["token", "--env-file", str(missing_env)])
         self.assertEqual(rc_missing, 1)
         self.assertIn("AI_HOUSE_OWNER_TOKEN", err_missing.getvalue())
+
+    def test_token_and_doctor_match_up_when_env_overrides_dotenv(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env_path = Path(tmp.name) / "override.env"
+        file_tok = "tok-from-dotenv-file-1111"
+        env_tok = "tok-from-process-env-2222"
+        env_path.write_text(f"AI_HOUSE_OWNER_TOKEN={file_tok}\nAI_HOUSE_PORT=8799\n", encoding="utf-8")
+
+        out_plain = io.StringIO()
+        out_json = io.StringIO()
+        with mock.patch.dict("os.environ", {"AI_HOUSE_OWNER_TOKEN": env_tok}, clear=False):
+            with contextlib.redirect_stdout(out_plain):
+                rc_plain = cli.main(["token", "--env-file", str(env_path)])
+            with contextlib.redirect_stdout(out_json):
+                rc_json = cli.main(["token", "--env-file", str(env_path), "--json"])
+            cli._load_dotenv(str(env_path))
+            effective_after_load = os.environ.get("AI_HOUSE_OWNER_TOKEN")
+
+        out_empty_env = io.StringIO()
+        with mock.patch.dict("os.environ", {"AI_HOUSE_OWNER_TOKEN": ""}, clear=False):
+            with contextlib.redirect_stdout(out_empty_env):
+                rc_empty = cli.main(["token", "--env-file", str(env_path), "--json"])
+            cli._load_dotenv(str(env_path))
+            effective_when_empty = os.environ.get("AI_HOUSE_OWNER_TOKEN")
+
+        self.assertEqual(rc_plain, 0)
+        self.assertEqual(rc_json, 0)
+        self.assertEqual(rc_empty, 0)
+        self.assertEqual(effective_after_load, env_tok)
+        self.assertEqual(effective_when_empty, file_tok)
+        self.assertEqual(json.loads(out_empty_env.getvalue())["owner_token"], file_tok)
+        self.assertIn(env_tok, out_plain.getvalue())
+        self.assertNotIn(file_tok, out_plain.getvalue())
+        doc = json.loads(out_json.getvalue())
+        self.assertEqual(doc["owner_token"], env_tok)
+        self.assertEqual(doc["source"], "env")
 
     def test_pack_aliases_life1_and_missing_pack_lists_available(self):
         v1 = vocab_life1.load_pack("life1")
