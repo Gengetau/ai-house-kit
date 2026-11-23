@@ -134,13 +134,14 @@ class TgLikeChannel(ChannelPlugin):
             if rep.get("mode") in ("blocked", "demo", "sleeping") or not rep.get("text"):
                 continue
             try:
-                self.host.authorize_send(
+                key = self.host.authorize_send(
                     self, kind="private" if private else "group", target=uid, actor=actor, text=rep["text"],
                 )
             except BlockedDelivery as exc:
                 self.blocked.append(exc.reason)
                 continue
-            self.sent.append({"to": uid, "text": rep["text"]})
+            self.sent.append({"to": uid, "text": rep["text"]})  # (the real wire send would happen here)
+            self.host.record_sent("", key)  # tail 7a: charge the caps only after the send succeeded
             n += 1
         return n
 

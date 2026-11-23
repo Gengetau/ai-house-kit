@@ -859,11 +859,12 @@ class ModelRouter:
         ok: bool,
         fallback_used: bool,
         error_code: str = "",
+        day_jst: Optional[str] = None,
     ) -> None:
         if self._usage_db is None:
             return
         ts = self._now()
-        day_jst = dt.datetime.fromtimestamp(ts, JST).date().isoformat()
+        day_jst = day_jst or dt.datetime.fromtimestamp(ts, JST).date().isoformat()
         host = _host_label(endpoint.base_url)
         with self._lock, contextlib.closing(sqlite3.connect(self._usage_db, timeout=5)) as c:
             with c:
@@ -1095,10 +1096,16 @@ class ModelRouter:
         plugin / speaker / owner flag. Limits: `daily_limit` for everybody together; visitors (non-owners) together
         may use at most `daily_limit - ceil(daily_limit * owner_reserve_ratio)` of it (default ratio 0.3, env
         `AI_HOUSE_PLUGIN_OWNER_RESERVE`), so the owner always keeps a floor; each visitor key gets
-        `visitor_hourly_limit` attempts (successful or not) per rolling hour.
+        `visitor_hourly_limit` attempts (successful or not) per rolling hour. `daily_limit=None` means the default
+        (60); `0` (or less) means "no calls allowed today" - the settings page never offers 0 (minimum 1), so a 0
+        that reaches this function is an operator error and the paid call fails closed rather than being granted.
         """
         pid = str(plugin_id or "").strip() or "unknown"
-        eff_daily = max(1, min(int(daily_limit or 60), 5000))
+        try:
+            wanted_daily = 60 if daily_limit is None else int(daily_limit)
+        except (TypeError, ValueError):
+            wanted_daily = 60
+        eff_daily = max(0, min(wanted_daily, 5000))  # 0 (or negative) = no calls at all; only "unset" means 60
         eff_hourly = max(1, int(visitor_hourly_limit or 20))
         ratio = self._owner_reserve_ratio(owner_reserve_ratio)
         now_ts = self._now()
@@ -1178,15 +1185,18 @@ class ModelRouter:
         vkey = self._quota_key(speaker_id)
         owner_flag = 1 if is_owner else 0
         new_state = "ok" if ok else "failed"
+        usage_day = day_jst
         with self._lock, self._quota_conn() as c:
             c.execute("BEGIN IMMEDIATE")
             try:
                 row = c.execute(
-                    "SELECT id FROM plugin_quota WHERE plugin_id=? AND visitor_key=? AND is_owner=? AND state='held' "
-                    "AND ts>=? ORDER BY id LIMIT 1",
+                    "SELECT id, day_jst FROM plugin_quota WHERE plugin_id=? AND visitor_key=? AND is_owner=? "
+                    "AND state='held' AND ts>=? ORDER BY id LIMIT 1",
                     (pid, vkey, owner_flag, now_ts - self.PLUGIN_QUOTA_HOLD_TTL_S),
                 ).fetchone()
                 if row is not None:
+                    # a reservation made before midnight and settled after it still belongs to the day it was made
+                    usage_day = str(row[1] or day_jst)
                     c.execute("UPDATE plugin_quota SET state=? WHERE id=?", (new_state, int(row[0])))
                 else:  # recorded without a prior reservation (legacy caller): still account for it
                     c.execute(
@@ -1215,6 +1225,7 @@ class ModelRouter:
             ok=ok,
             fallback_used=False,
             error_code=error_code,
+            day_jst=usage_day,
         )
 
     def resolve_total_budget(self, purpose: str = "chat") -> float:

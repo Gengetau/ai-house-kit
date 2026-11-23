@@ -9,7 +9,10 @@ Demonstrates how an external Python package registers:
 Third-party plugins never get the real daemon: `ctx.daemon` is a `PluginHostProxy`. This example uses only its
 documented, narrow surface: `ctx.daemon.plugin_dir` (a private per-plugin directory where the brew counter is
 persisted) and, in a real channel plugin, `resolve_speaker` / `converse` / `authorize_send` (see `PluginHostProxy`).
-Secrets are not reachable through it: `env` is a credential-free view, and settings come via `plugin_config`.
+A channel authorizes a reply first, sends it, and calls `record_sent(delivery_id, key)` only once it really went
+out; that is what fills the gate's hourly / daily caps (`authorize_send` alone never counts anything).
+Secrets are not reachable through it: `env` is a whitelist (only variables this manifest declares via `env_var`,
+plus harmless basics), and settings come via `plugin_config`. Private-room data is for channel plugins only.
 """
 from __future__ import annotations
 
