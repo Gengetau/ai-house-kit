@@ -19,6 +19,10 @@ TEMPLATES = {
 class NotSent(Exception):
     """The channel refused before anything left (provably not delivered); safe to try again."""
 
+    def __init__(self, reason="not_sent"):
+        self.reason = str(reason or "not_sent")
+        super().__init__(self.reason)
+
 
 class BlockedDelivery(Exception):
     """Blocked permanently by the outbound send gate (e.g. leak guard or bot recipient)."""
@@ -143,14 +147,25 @@ class Dispatcher:
             out[r["delivery_id"]] = state
         return out
 
-    def reconcile(self):
-        """Ask the channel about every unknown delivery; resend only where the channel is idempotent."""
+    MAX_AUTO_RETRIES = 3
+
+    def reconcile(self, sending_grace_s=0.0):
+        """Ask the channel about every unknown/stuck delivery and persist the verdict.
+
+        A channel reference means it was delivered. Without one: an idempotent channel gets the delivery back as
+        `pending` (bounded by MAX_AUTO_RETRIES attempts); any other channel keeps it `unknown` for a person, never a
+        blind resend. A `sending` row left behind by a crash is written back as `pending` or `unknown`, so it can
+        no longer stay stuck. `sending_grace_s` skips `sending` rows touched more recently than that (a send that
+        may still be in flight in another dispatcher)."""
         out = {}
+        now = self.s.clock.now()
         with self.s.read() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state IN ('unknown','sending')").fetchall()
         for r in rows:
             ch = self.channels.get(r["channel"])
             if ch is None:
+                continue
+            if r["state"] == "sending" and sending_grace_s and (now - float(r["updated_at"])) < sending_grace_s:
                 continue
             ref = ch.lookup(r["delivery_id"])
             with self.s.tx() as db:
@@ -159,12 +174,17 @@ class Dispatcher:
                                (ref, self.s.clock.now(), r["delivery_id"]))
                     self._receipt(db, r["delivery_id"], "delivered", ref, self.s.epoch or 0)
                     out[r["delivery_id"]] = "sent"
-                elif ch.idempotent:
+                elif getattr(ch, "idempotent", False) and int(r["attempts"]) <= self.MAX_AUTO_RETRIES:
                     db.execute("UPDATE outbox SET state='pending', updated_at=? WHERE delivery_id=?",
                                (self.s.clock.now(), r["delivery_id"]))
                     out[r["delivery_id"]] = "pending"
                 else:
-                    out[r["delivery_id"]] = "unknown"  # needs a person; never a blind resend
+                    # needs a person; never a blind resend. A stuck `sending` row is made visible as `unknown`.
+                    if r["state"] == "sending":
+                        db.execute("UPDATE outbox SET state='unknown', updated_at=? WHERE delivery_id=?",
+                                   (self.s.clock.now(), r["delivery_id"]))
+                        self._receipt(db, r["delivery_id"], "error", "interrupted_while_sending", self.s.epoch or 0)
+                    out[r["delivery_id"]] = "unknown"
         return out
 
     def receive(self, delivery_id, status, ref, epoch):

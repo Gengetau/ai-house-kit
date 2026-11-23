@@ -141,6 +141,14 @@ class Meals:
                 c.execute("UPDATE meal_attendance SET status='declined',reason=? WHERE day=? AND slot=? AND actor=? AND status='pending'",
                           (reason if reason in SKIP_REASONS else 'personal_choice',row['day'],row['slot'],actor))
 
+    def release_decision(self, actor):
+        """Give back the claim of `claim_decision` when the model was never reached (nothing was asked)."""
+        row = self.current(actor)
+        if row:
+            with self.s.tx() as c:
+                c.execute("DELETE FROM meal_decisions WHERE day=? AND slot=? AND actor=?",
+                          (row['day'], row['slot'], actor))
+
     def claim_decision(self, actor):
         """Reserve at most one preparation decision per person/meal, including unknown failures.
 

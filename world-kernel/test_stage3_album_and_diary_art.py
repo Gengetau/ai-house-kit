@@ -192,13 +192,17 @@ class Stage3AlbumAndDiaryArtTests(unittest.TestCase):
         mock_srv.fail_mode = False
         day3 = dt.date(2026, 11, 25)
         _advance_day_to_evening(d, day3)
-        _, dia3 = _http_json(f"{base}/api/diaries?limit=30", token=read_tok)
+        _, dia3_plain = _http_json(f"{base}/api/diaries?limit=30", token=read_tok)
+        for row in (r for r in dia3_plain["diaries"] if r["day"] == day3.isoformat()):
+            self.assertNotIn("image_data_uri", row, "the diary list does not embed pictures unless asked")
+            self.assertTrue(str(row.get("image_media_url", "")).startswith("/api/album/media?path="))
+        _, dia3 = _http_json(f"{base}/api/diaries?limit=30&inline=1", token=read_tok)
         d3_rows = [row for row in dia3["diaries"] if row["day"] == day3.isoformat()]
         self.assertTrue(d3_rows)
         self.assertTrue(all(row.get("image_album_id") for row in d3_rows))
         self.assertTrue(all(str(row.get("image_data_uri", "")).startswith("data:image/png;base64,") for row in d3_rows))
 
-        _, alb3 = _http_json(f"{base}/api/album?scope=world&limit=24", token=read_tok)
+        _, alb3 = _http_json(f"{base}/api/album?scope=world&limit=24&inline=1", token=read_tok)
         self.assertEqual(len(alb3["items"]), len(d3_rows))
         self.assertTrue(all(it["kind"] == "diary_art" and it["scope"] == "world" for it in alb3["items"]))
         self.assertTrue(all(it["data_uri"].startswith("data:image/png;base64,") for it in alb3["items"]))
@@ -212,7 +216,7 @@ class Stage3AlbumAndDiaryArtTests(unittest.TestCase):
         })
         day4 = dt.date(2026, 11, 26)
         _advance_day_to_evening(d, day4)
-        _, dia4 = _http_json(f"{base}/api/diaries?limit=30", token=read_tok)
+        _, dia4 = _http_json(f"{base}/api/diaries?limit=30&inline=1", token=read_tok)
         d4_rows = [row for row in dia4["diaries"] if row["day"] == day4.isoformat()]
         self.assertTrue(d4_rows)
         self.assertTrue(all(str(row.get("image_data_uri", "")).startswith("data:image/svg+xml;base64,") for row in d4_rows))
@@ -224,6 +228,7 @@ class Stage3AlbumAndDiaryArtTests(unittest.TestCase):
             "这是只给我们看的晚安拍立得",
             attachments={"images": [TINY_DATA_URI]},
         )
+        self.assertTrue(d.drain_post_reply_jobs(5.0))  # chat photos are archived after the reply
         st_priv, alb_priv = _http_json(f"{base}/api/album?scope=private", token=owner_tok)
         self.assertEqual(st_priv, 200)
         self.assertEqual(len(alb_priv["items"]), 1)

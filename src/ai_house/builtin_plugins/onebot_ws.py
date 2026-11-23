@@ -15,6 +15,9 @@ Rules enforced here:
   * a stand-in "demo" reply (no model configured, or the model call failed) is never sent to QQ;
   * messages go out as OneBot segment arrays (no CQ-code parsing); the daemon's reply guard runs first;
   * a send that fails (non-zero retcode, timeout, closed socket) is logged by error code and dropped, not retried;
+    only a failure before anything touched the wire is kept (with its pictures/voice) and resumed on reconnect;
+  * a reply that the send gate's quota holds back is not sent and not announced on QQ: the reason is stored on the
+    spool row and shown by `status_view()`;
   * the socket reconnects with exponential backoff; the access token is only sent as a header and never logged.
 
 Threads: one reader (only receives, resolves echo futures, queues events), one worker (talks to the model and
@@ -29,6 +32,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -189,7 +193,9 @@ class OneBotChannel(ChannelPlugin):
         self.stats: Dict[str, int] = {
             "connects": 0, "received": 0, "replied": 0, "ignored": 0, "rate_limited": 0,
             "send_failed": 0, "blocked": 0, "dropped": 0, "demo_skipped": 0, "duplicates": 0,
+            "gate_limited": 0,
         }
+        self.last_limit: Optional[Dict[str, Any]] = None
 
     # ---- configuration -------------------------------------------------------------------------------------------
     @classmethod
@@ -279,9 +285,57 @@ class OneBotChannel(ChannelPlugin):
         if self._spool is not None:
             self._spool.close()
 
+    def on_world_reset(self) -> None:
+        """Called by the daemon after `reset_house` wiped the runtime dir: start again with an empty inbound cache."""
+        for q in (self._owner_events, self._events):
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        self._owner_backlog.clear()
+        self._group_backlog.clear()
+        with self._dedup_lock:
+            self._inflight_spool_ids.clear()
+            self._mem_dedup.clear()
+        if self._spool is not None:
+            self._spool.reset()
+
     def _bump(self, key: str) -> None:
         with self._stats_lock:
             self.stats[key] += 1
+
+    def status_view(self) -> Dict[str, Any]:
+        """Channel status for the owner: connection, counters, why the last reply was held back, spool states."""
+        with self._stats_lock:
+            stats = dict(self.stats)
+            last = dict(self.last_limit) if self.last_limit else None
+        spool_states: Dict[str, int] = {}
+        reasons: Dict[str, int] = {}
+        if self._spool is not None:
+            try:
+                for row in self._spool.list_rows(limit=200):
+                    spool_states[row["state"]] = spool_states.get(row["state"], 0) + 1
+                    if row.get("reason"):
+                        reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
+            except Exception:  # noqa: BLE001 - a status page must not fail
+                pass
+        with self._ws_lock:
+            connected = self._ws is not None
+        return {
+            "channel_id": self.channel_id,
+            "connected": connected,
+            "stats": stats,
+            "limited": stats.get("gate_limited", 0),
+            "last_limit": last,
+            "spool_states": spool_states,
+            "spool_reasons": reasons,
+        }
+
+    def _note_limit(self, reason: str, kind: str, target: str) -> None:
+        with self._stats_lock:
+            self.stats["gate_limited"] += 1
+            self.last_limit = {"reason": reason, "kind": kind, "target": str(target), "at": time.time()}
 
     def _enqueue_recovered(self, *, only_ready: bool) -> None:
         if self._spool is None:
@@ -462,12 +516,13 @@ class OneBotChannel(ChannelPlugin):
         spool_ids = [int(x) for x in (ev.get("_spool_ids") or ()) if x]
         plan = ev.get("_resume_plan") or {}
         bubbles = [str(x) for x in (plan.get("bubbles") or ()) if str(x).strip()]
+        media = self._sendable_media(plan.get("media") or ())
         start_idx = max(0, int(ev.get("_sent_parts") or 0))
         kind = str(plan.get("kind") or ev.get("message_type") or "private")
         target = str(plan.get("target") or ev.get("user_id") or "")
         at_uid = str(plan.get("at") or "") or None
         try:
-            if not bubbles or start_idx >= len(bubbles) or not target:
+            if (not bubbles and not media) or start_idx >= len(bubbles) + len(media) or not target:
                 if self._spool is not None and spool_ids:
                     self._spool.ack(spool_ids, state="done")
                 return
@@ -479,6 +534,7 @@ class OneBotChannel(ChannelPlugin):
                 start_idx=start_idx,
                 spool_ids=spool_ids,
                 save_plan=False,
+                media=media,
             )
             if sent_any:
                 self._bump("replied")
@@ -704,11 +760,11 @@ class OneBotChannel(ChannelPlugin):
                 if rep.get("mode") == "demo":
                     self._bump("demo_skipped")  # a canned stand-in line (and maybe an exception name) is not for QQ
                     continue
-                if rep.get("mode") == "sleeping" or not str(rep.get("text") or "").strip():
-                    continue  # asleep: stay quiet on QQ
-                parts = self._split(str(rep["text"]))
-                media_list = [dict(m) for m in (rep.get("media") or ()) if isinstance(m, Mapping)]
-                if parts:
+                media_list = self._sendable_media(rep.get("media") or ())
+                if rep.get("mode") == "sleeping" or not (str(rep.get("text") or "").strip() or media_list):
+                    continue  # asleep (or nothing to say): stay quiet on QQ
+                parts = self._split(str(rep.get("text") or ""))
+                if parts or media_list:
                     send_groups.append((parts, media_list))
             if not send_groups:
                 if self._spool is not None and spool_ids:
@@ -732,6 +788,40 @@ class OneBotChannel(ChannelPlugin):
     def _split(self, text: str) -> List[str]:
         return split_bubbles(text, max_part_chars=self.cfg.max_part_chars, max_parts=self.cfg.max_parts)
 
+    MAX_MEDIA_PER_REPLY = 6
+
+    @classmethod
+    def _sendable_media(cls, media: Any) -> List[Dict[str, str]]:
+        """Reduce reply media to what can go over OneBot: `{"kind": "image"|"audio", "<kind>_base64": ...}`."""
+        out: List[Dict[str, str]] = []
+        for m in media or ():
+            if not isinstance(m, Mapping):
+                continue
+            mkind = str(m.get("kind") or "")
+            img = str(m.get("image_base64") or "").strip()
+            aud = str(m.get("audio_base64") or "").strip()
+            if mkind in ("image", "sticker") and img:
+                out.append({"kind": "image", "image_base64": img})
+            elif mkind == "audio" and aud:
+                out.append({"kind": "audio", "audio_base64": aud})
+            if len(out) >= cls.MAX_MEDIA_PER_REPLY:
+                break
+        return out
+
+    def _call_with_retry(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, bool]:
+        """One OneBot call; retries only failures that never touched the wire. Returns (ok, code, left_wire)."""
+        ok, code, left_wire = False, "not_connected", False
+        max_attempts = 1 + (self.cfg.send_retries if not self._stop.is_set() else 0)
+        for attempt in range(max_attempts):
+            ok, code, _, left_wire = self._call_detailed(action, params)
+            if ok:
+                break
+            # Retry ONLY when nothing touched the wire yet and not a server retcode rejection.
+            if left_wire or code.startswith("retcode_") or attempt + 1 >= max_attempts or self._stop.is_set():
+                break
+            self._stop.wait(self.cfg.retry_backoff_s * (attempt + 1))
+        return ok, code, left_wire
+
     def _send_bubbles(
         self,
         kind: str,
@@ -744,93 +834,86 @@ class OneBotChannel(ChannelPlugin):
         save_plan: bool = True,
         media: Sequence[Mapping[str, Any]] = (),
     ) -> bool:
-        """Deliver bubble chunks through `SendGate`, retrying only pre-wire failures and keeping `reply_ready`."""
+        """Deliver a reply (text bubbles, then pictures/voice) through `SendGate`.
+
+        `start_idx` counts delivered units: bubbles first, then media items. A failure before anything touched the
+        wire keeps the saved reply (media included) as `reply_ready` for the reconnect resume; any other failure is
+        logged and recorded on the spool row. The reply is charged to the quota once, after its first unit is out."""
         parts = [str(p).strip() for p in bubbles if str(p).strip()]
-        if not parts:
+        media_items = self._sendable_media(media)
+        units = len(parts) + len(media_items)
+        if units == 0:
             if self._spool is not None and spool_ids:
                 self._spool.ack(spool_ids, state="done")
             return False
 
         gate = getattr(self._host, "send_gate", None) if self._host is not None else None
+        did = f"ob-spool-{spool_ids[-1]}" if spool_ids else f"ob-direct-{uuid.uuid4().hex[:16]}"
+        charge_key: Optional[str] = None
         if start_idx == 0 and gate is not None:
             try:
-                gate.authorize_direct_send(
+                charge_key = gate.authorize_direct_send(
                     "onebot_v11",
                     self,
                     kind=kind,
                     target=str(target),
                     actor=self.actor,
                     text="\n".join(parts),
-                    delivery_id=(f"ob-spool-{spool_ids[-1]}" if spool_ids else ""),
+                    delivery_id=did,
+                    media_count=len(media_items),
                 )
             except BlockedDelivery as exc:
                 self._bump("blocked")
                 self._log(f"send blocked by SendGate ({exc.reason})")
                 if self._spool is not None and spool_ids:
-                    self._spool.ack(spool_ids, state="blocked")
+                    self._spool.ack(spool_ids, state="blocked", reason=f"send_gate:{exc.reason}")
                 return False
             except NotSent as exc:
                 self._bump("rate_limited")
-                self._log(f"send limited by SendGate ({exc.reason})")
+                self._note_limit(exc.reason, kind, str(target))
+                self._log(f"send limited by SendGate ({exc.reason}); reply not sent")
                 if self._spool is not None and spool_ids:
-                    self._spool.ack(spool_ids, state="skipped")
+                    self._spool.ack(spool_ids, state="skipped", reason=f"send_gate:{exc.reason}")
                 return False
 
         if save_plan and self._spool is not None and spool_ids:
-            self._spool.save_reply_plan(spool_ids, parts, target=target, kind=kind, at=at or "")
+            self._spool.save_reply_plan(spool_ids, parts, target=target, kind=kind, at=at or "", media=media_items)
 
+        action = "send_group_msg" if kind == "group" else "send_private_msg"
+        param_key = "group_id" if kind == "group" else "user_id"
         sent_any = start_idx > 0
-        for i in range(start_idx, len(parts)):
-            part = parts[i]
-            segs: List[Dict[str, Any]] = [{"type": "text", "data": {"text": part}}]
-            if at and i == 0:
-                segs = [{"type": "at", "data": {"qq": at}}, {"type": "text", "data": {"text": " " + part}}]
-            action = "send_group_msg" if kind == "group" else "send_private_msg"
-            params = {("group_id" if kind == "group" else "user_id"): int(target), "message": segs}
-
-            ok = False
-            code = "not_connected"
-            left_wire = False
-            max_attempts = 1 + (self.cfg.send_retries if not self._stop.is_set() else 0)
-            for attempt in range(max_attempts):
-                ok, code, _, left_wire = self._call_detailed(action, params)
-                if ok:
-                    break
-                # Retry ONLY when nothing touched the wire yet and not a server retcode rejection.
-                if left_wire or code.startswith("retcode_") or attempt + 1 >= max_attempts or self._stop.is_set():
-                    break
-                self._stop.wait(self.cfg.retry_backoff_s * (attempt + 1))
+        charged = False
+        for i in range(start_idx, units):
+            is_media = i >= len(parts)
+            if not is_media:
+                part = parts[i]
+                segs: List[Dict[str, Any]] = [{"type": "text", "data": {"text": part}}]
+                if at and i == 0:
+                    segs = [{"type": "at", "data": {"qq": at}}, {"type": "text", "data": {"text": " " + part}}]
+            else:
+                m = media_items[i - len(parts)]
+                if m["kind"] == "image":
+                    segs = [{"type": "image", "data": {"file": f"base64://{m['image_base64']}"}}]
+                else:
+                    segs = [{"type": "record", "data": {"file": f"base64://{m['audio_base64']}"}}]
+            ok, code, left_wire = self._call_with_retry(action, {param_key: int(target), "message": segs})
 
             if not ok:
                 # PR-C4: Preserve `reply_ready` for reconnect resume whenever the frame never left the wire!
                 if (not left_wire) and (not code.startswith("retcode_")) and self._spool is not None and spool_ids:
                     return sent_any
                 self._bump("send_failed")
-                self._log(f"send failed ({code}); dropped, not retried")
+                self._log(f"{'media ' if is_media else ''}send failed ({code}); dropped, not retried")
                 if self._spool is not None and spool_ids:
-                    self._spool.ack(spool_ids, state="failed_wire")
+                    self._spool.ack(spool_ids, state="failed_wire", reason=f"{'media_' if is_media else ''}{code}")
                 return sent_any
 
             sent_any = True
+            if not charged and gate is not None and charge_key is not None:
+                gate.record_direct_sent(did, charge_key)
+                charged = True
             if self._spool is not None and spool_ids:
                 self._spool.record_part_sent(spool_ids, i + 1)
-
-        action_m = "send_group_msg" if kind == "group" else "send_private_msg"
-        param_key_m = "group_id" if kind == "group" else "user_id"
-        for m in media or ():
-            mkind = str(m.get("kind") or "")
-            img_b64 = str(m.get("image_base64") or "").strip()
-            aud_b64 = str(m.get("audio_base64") or "").strip()
-            if mkind in ("image", "sticker") and img_b64:
-                self._call_detailed(
-                    action_m,
-                    {param_key_m: int(target), "message": [{"type": "image", "data": {"file": f"base64://{img_b64}"}}]},
-                )
-            elif mkind == "audio" and aud_b64:
-                self._call_detailed(
-                    action_m,
-                    {param_key_m: int(target), "message": [{"type": "record", "data": {"file": f"base64://{aud_b64}"}}]},
-                )
 
         if self._spool is not None and spool_ids:
             self._spool.ack(spool_ids, state="done")

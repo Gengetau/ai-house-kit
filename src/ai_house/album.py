@@ -128,7 +128,11 @@ class AlbumStore:
             rel_dir = self.runtime_dir / "media" / "album" / eff_scope
             rel_dir.mkdir(parents=True, exist_ok=True)
             target_path = rel_dir / f"{aid}.{ext}"
-            target_path.write_bytes(raw_bytes)
+            try:
+                target_path.write_bytes(raw_bytes)
+            except BaseException:
+                target_path.unlink(missing_ok=True)
+                raise
             media_rel = f"media/album/{eff_scope}/{target_path.name}"
             eff_mime = str(mime or mime_for_path(target_path, "image/png"))
             clean_title = str(title or "").strip()[:120]
@@ -136,42 +140,46 @@ class AlbumStore:
             clean_day = str(diary_day or "").strip()
             eff_now = float(now or 0.0)
 
-            with c:
-                c.execute(
-                    "INSERT INTO album_items(album_id, scope, actor, channel, kind, title, caption, media_rel, mime, diary_day, sha256, created_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        aid,
-                        eff_scope,
-                        clean_actor,
-                        clean_channel,
-                        eff_kind,
-                        clean_title,
-                        clean_caption,
-                        media_rel,
-                        eff_mime,
-                        clean_day,
-                        digest,
-                        eff_now,
-                    ),
-                )
-                if eff_kind == "chat_image":
-                    overflow = c.execute(
-                        "SELECT album_id, media_rel FROM album_items "
-                        "WHERE scope=? AND channel=? AND kind='chat_image' "
-                        "ORDER BY created_at DESC, album_id DESC LIMIT -1 OFFSET ?",
-                        (eff_scope, clean_channel, MAX_CHAT_IMAGES_PER_CHANNEL),
-                    ).fetchall()
-                    for ov in overflow:
-                        c.execute("DELETE FROM album_items WHERE album_id=?", (ov["album_id"],))
-                        still = c.execute(
-                            "SELECT COUNT(*) FROM album_items WHERE media_rel=?", (ov["media_rel"],)
-                        ).fetchone()[0]
-                        if int(still) == 0:
-                            try:
-                                resolve_runtime_media_path(self.runtime_dir, str(ov["media_rel"])).unlink(missing_ok=True)
-                            except ValueError:
-                                pass
+            try:
+                with c:
+                    c.execute(
+                        "INSERT INTO album_items(album_id, scope, actor, channel, kind, title, caption, media_rel, mime, diary_day, sha256, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            aid,
+                            eff_scope,
+                            clean_actor,
+                            clean_channel,
+                            eff_kind,
+                            clean_title,
+                            clean_caption,
+                            media_rel,
+                            eff_mime,
+                            clean_day,
+                            digest,
+                            eff_now,
+                        ),
+                    )
+                    if eff_kind == "chat_image":
+                        overflow = c.execute(
+                            "SELECT album_id, media_rel FROM album_items "
+                            "WHERE scope=? AND channel=? AND kind='chat_image' "
+                            "ORDER BY created_at DESC, album_id DESC LIMIT -1 OFFSET ?",
+                            (eff_scope, clean_channel, MAX_CHAT_IMAGES_PER_CHANNEL),
+                        ).fetchall()
+                        for ov in overflow:
+                            c.execute("DELETE FROM album_items WHERE album_id=?", (ov["album_id"],))
+                            still = c.execute(
+                                "SELECT COUNT(*) FROM album_items WHERE media_rel=?", (ov["media_rel"],)
+                            ).fetchone()[0]
+                            if int(still) == 0:
+                                try:
+                                    resolve_runtime_media_path(self.runtime_dir, str(ov["media_rel"])).unlink(missing_ok=True)
+                                except ValueError:
+                                    pass
+            except BaseException:
+                target_path.unlink(missing_ok=True)  # the row never landed: do not leave an orphan file behind
+                raise
 
         res_doc: Dict[str, Any] = {
             "album_id": aid,

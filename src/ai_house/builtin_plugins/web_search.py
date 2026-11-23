@@ -19,6 +19,7 @@ from ..plugin_api import (
     PluginManifest,
     PluginRequestContext,
     PluginRoute,
+    quota_speaker_key,
     ToolContext,
     ToolRegistration,
 )
@@ -244,7 +245,7 @@ def _tool_web_search(*, query: str = "", ctx: Optional[ToolContext] = None) -> D
     daemon = ctx.daemon if ctx is not None else None
     actor = ctx.actor if ctx is not None else ""
     sp = ctx.speaker if ctx is not None else None
-    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    sp_id = quota_speaker_key(sp, str(getattr(ctx, "channel", "") or ""))
     is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     return run_web_search(query, actor=actor, cfg=cfg, daemon=daemon, speaker_id=sp_id, is_owner=is_owner)
 

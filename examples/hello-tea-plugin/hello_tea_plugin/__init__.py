@@ -5,9 +5,19 @@ Demonstrates how an external Python package registers:
 - a `GET /status` HTTP route mounted under `/api/plugins/hello_tea/status`,
 - a periodic `PluginTask` executed during post-step cycles, and
 - a context-aware chat tool (`recommend_tea`) receiving `ToolContext`.
+
+Third-party plugins never get the real daemon: `ctx.daemon` is a `PluginHostProxy`. This example uses only its
+documented, narrow surface: `ctx.daemon.plugin_dir` (a private per-plugin directory where the brew counter is
+persisted) and, in a real channel plugin, `resolve_speaker` / `converse` / `authorize_send` (see `PluginHostProxy`).
+A channel authorizes a reply first, sends it, and calls `record_sent(delivery_id, key)` only once it really went
+out; that is what fills the gate's hourly / daily caps (`authorize_send` alone never counts anything).
+Secrets are not reachable through it: `env` is a whitelist (only variables this manifest declares via `env_var`,
+plus harmless basics), and settings come via `plugin_config`. Private-room data is for channel plugins only.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Dict
 
 from ai_house.plugin_api import (
@@ -33,6 +43,10 @@ def reset_example_state() -> None:
 def _brew_tick(ctx: PluginTaskContext) -> None:
     _BREW_STATE["brew_count"] = int(_BREW_STATE["brew_count"]) + 1
     _BREW_STATE["last_brew_at"] = float(ctx.now)
+    # persist into this plugin's own directory (`PluginHostProxy.plugin_dir`); skipped for hosts without one
+    plugin_dir = getattr(ctx.daemon, "plugin_dir", None)
+    if plugin_dir is not None:
+        (Path(plugin_dir) / "brew.json").write_text(json.dumps(_BREW_STATE), encoding="utf-8")
 
 
 def _get_status(ctx: PluginRequestContext) -> Dict[str, Any]:

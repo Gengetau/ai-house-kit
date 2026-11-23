@@ -471,20 +471,78 @@ def _extract_sensitive_clues(text: str) -> Tuple[List[str], List[Tuple[str, str]
 
 
 _CONFLICT_NEG_STRIP_RE = re.compile(
-    r"不太?[喜偏]?欢|不爱吃|不能吃|不吃|不喝|别[放吃买喝]|讨厌|厌恶|受不了|忌口|过敏|禁食|拒绝"
+    r"不(?:太|怎么|大|是很|是特别)?[喜偏]?欢|不(?:太|怎么|大)?爱(?:吃|喝)?|不能吃|不吃|不喝|别[放吃买喝]|"
+    r"讨厌|厌恶|受不了|忌口|过敏|禁食|拒绝"
 )
-_CONFLICT_NEG_CUES = ("过敏", "忌口", "不能吃", "不吃", "不喜欢", "不太喜欢", "不爱吃", "讨厌", "厌恶", "受不了", "别放", "别买", "不喝")
-_CONFLICT_POS_CUES = ("最喜欢", "很喜欢", "超喜欢", "喜欢", "最爱", "爱吃", "能吃", "可以吃", "常吃", "爱喝")
+_CONFLICT_NEG_CUES = (
+    "过敏", "忌口", "不能吃", "不吃", "不喜欢", "不太喜欢", "不爱吃", "不爱喝", "讨厌", "厌恶", "受不了", "别放", "别买", "不喝",
+)
+_CONFLICT_POS_CUES = (
+    "最喜欢", "很喜欢", "超喜欢", "喜欢", "最爱", "爱吃", "能吃", "可以吃", "常吃", "爱喝", "随便吃", "都能吃",
+)
+# Denials of a negative cue ("对花生不过敏", "没有过敏", "不忌口", "不讨厌") read as positive statements.
+_CONFLICT_DENY_RE = re.compile(
+    r"(?:并?不|没有?|无)(?:会|太|是|算)?(?:对[^，。,；;]{0,8}?)?(?:过敏|忌口)|不(?:用|必)忌口|不(?:怎么|太)?(?:讨厌|厌恶|排斥)"
+)
 _DIET_ALLERGY_TOKENS = ("海鲜", "花生", "芒果", "牛奶", "乳糖", "鸡蛋", "小麦", "牛肉", "猪肉", "鱼", "蟹", "虾")
 _CONFLICT_DISH_TOKENS = (
     "寿喜锅", "麻辣火锅", "火锅", "咖喱", "乌冬", "拉面", "意面", "炒面",
     "蛋包饭", "味噌汤", "炒饭", "松饼", "司康", "饺子", "烤肉", "寿司",
 )
 _CONFLICT_WEEKDAY_RE = re.compile(r"(?:周|星期|礼拜)[一二三四五六日天]|\d{1,2}月\d{1,2}日")
+_SUBJECT_WRAP_RE = re.compile(
+    r"^(?:群里有人|群友|有人|大家|网友|听人|听说|据说)(?:说|称|表示|讲|觉得|认为|提到)?[，,：:]?"
+)
+_SUBJECT_END_RE = re.compile(
+    r"对|不|没|很|最|超|特别|其实|也|都|爱|喜欢|讨厌|厌恶|受不了|过敏|能|可以|常|只|从不|每|周|星期|礼拜|"
+    r"明|今|后|下|要|会|将|准备|打算|想|在|去|是|有|的|\d|月"
+)
+_SUBJECT_PRONOUNS = ("他", "她", "它", "我", "你", "自己", "大家", "这", "那", "有人", "群友")
+
+
+def _polarity(text: str) -> Tuple[bool, bool]:
+    """Return `(negative, positive)` cues; denials such as "不过敏" count as positive, not as allergy."""
+    deny = bool(_CONFLICT_DENY_RE.search(text))
+    body = _CONFLICT_DENY_RE.sub(" ", text)
+    neg = any(w in body for w in _CONFLICT_NEG_CUES) or bool(_CONFLICT_NEG_STRIP_RE.search(body))
+    pos = deny or any(w in _CONFLICT_NEG_STRIP_RE.sub(" ", body) for w in _CONFLICT_POS_CUES)
+    return neg, pos
+
+
+def _subject_of(text: str) -> str:
+    """Leading subject of a statement ("群友说苍空不喜欢咖喱" -> "苍空"); empty when unknown or a pronoun."""
+    t = str(text or "").strip()
+    m = _SUBJECT_WRAP_RE.match(t)
+    if m:
+        t = t[m.end():]
+    m = _SUBJECT_END_RE.search(t)
+    if not m or m.start() <= 0:
+        return ""
+    subj = t[: m.start()].strip()
+    if not subj or len(subj) > 6 or subj.startswith(_SUBJECT_PRONOUNS):
+        return ""
+    return subj
+
+
+def _related_subjects(a: str, b: str) -> bool:
+    return a == b or (min(len(a), len(b)) >= 2 and (a in b or b in a))
+
+
+def _same_subject(c_text: str, c_about: set, v_text: str, v_about: set) -> bool:
+    """False only when both statements demonstrably talk about different people."""
+    c_subj, v_subj = _subject_of(c_text), _subject_of(v_text)
+    if c_subj and v_subj:
+        return _related_subjects(c_subj, v_subj)
+    if c_about and v_about:
+        return any(_related_subjects(x, y) for x in c_about for y in v_about)
+    return True
 
 
 def _conflicts_with_verified(claim_row: Mapping[str, Any], verified_rows: Sequence[Mapping[str, Any]]) -> bool:
-    """Return True when an unverified `group_stated`/`hearsay`/`claim` contradicts an active `verified` memory."""
+    """Return True when an unverified `group_stated`/`hearsay`/`claim` contradicts an active `verified` memory.
+
+    Only statements about the same person can conflict ("苍空不喜欢咖喱" never contradicts "凛音喜欢咖喱").
+    """
     trust = str(claim_row.get("trust") or "verified")
     kind = str(claim_row.get("kind") or "")
     if kind != "claim" and trust not in ("group_stated", "hearsay"):
@@ -494,23 +552,21 @@ def _conflicts_with_verified(claim_row: Mapping[str, Any], verified_rows: Sequen
         return False
     c_bg = {bg for bg in _char_bigrams(c_text) if bg not in _LOW_IDF_BIGRAMS and len(bg) >= 2}
     c_about = {x for x in str(claim_row.get("about") or "").split("|") if x}
-    c_neg = any(w in c_text for w in _CONFLICT_NEG_CUES)
-    c_pos_text = _CONFLICT_NEG_STRIP_RE.sub(" ", c_text)
-    c_pos = any(w in c_pos_text for w in _CONFLICT_POS_CUES)
+    c_neg, c_pos = _polarity(c_text)
     c_days = set(_CONFLICT_WEEKDAY_RE.findall(c_text))
     c_dishes = [d for d in _CONFLICT_DISH_TOKENS if d in c_text]
     for v in verified_rows:
         if v.get("id") == claim_row.get("id"):
             continue
         v_text = str(v.get("text") or "")
-        v_bg = {bg for bg in _char_bigrams(v_text) if bg not in _LOW_IDF_BIGRAMS and len(bg) >= 2}
         v_about = {x for x in str(v.get("about") or "").split("|") if x}
+        if not _same_subject(c_text, c_about, v_text, v_about):
+            continue
+        v_bg = {bg for bg in _char_bigrams(v_text) if bg not in _LOW_IDF_BIGRAMS and len(bg) >= 2}
         shared_bg = c_bg & v_bg
         shared_about = c_about & v_about
         shared_food = [tok for tok in _DIET_ALLERGY_TOKENS if tok in c_text and tok in v_text]
-        v_neg = any(w in v_text for w in _CONFLICT_NEG_CUES)
-        v_pos_text = _CONFLICT_NEG_STRIP_RE.sub(" ", v_text)
-        v_pos = any(w in v_pos_text for w in _CONFLICT_POS_CUES)
+        v_neg, v_pos = _polarity(v_text)
         opposite_polarity = (c_pos and v_neg) or (c_neg and v_pos)
         if opposite_polarity and (len(shared_bg) >= 1 or bool(shared_food) or bool(shared_about)):
             return True
@@ -521,6 +577,29 @@ def _conflicts_with_verified(claim_row: Mapping[str, Any], verified_rows: Sequen
             v_dishes = [d for d in _CONFLICT_DISH_TOKENS if d in v_text]
             if c_dishes and v_dishes and set(c_dishes).isdisjoint(set(v_dishes)):
                 return True
+    return False
+
+
+_RELAY_RE = re.compile(
+    r"(?:^|[，,。！!；;：:\s])(?:听(?:说|[\u4e00-\u9fff]{1,4}?说)|据(?:说|称)|有人说|大家都说|传闻|"
+    r"(?!我)[\u4e00-\u9fffA-Za-z]{1,6}?(?<![不别再先就只也还没])"
+    r"(?:说|讲|表示|称|提到|提过|讲过|说过|告诉(?:我|大家|房主)|跟我说|向我保证))"
+)
+
+
+_RELAY_FIRST_PERSON_RE = re.compile(r"^[\s，,：:、“\"'「『]*(?:我|咱|俺|本人)")
+
+
+def _is_relayed_line(line: str) -> bool:
+    """True when a line reports what somebody else said about a third party ("小林说他对花生过敏").
+
+    A report whose content is about the speaker themself ("医生说我对花生过敏", "老板告诉我我下周出差") is still the
+    speaker's own first-hand information and is not treated as relayed.
+    """
+    text = str(line or "")
+    for m in _RELAY_RE.finditer(text):
+        if not _RELAY_FIRST_PERSON_RE.match(text[m.end():]):
+            return True
     return False
 
 
@@ -780,12 +859,18 @@ class MemoryStore:
             already_v3 = c.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone() is not None
             if not already_v3:
                 # PR-B3: Demote legacy unverified group facts created before strict owner-evidence binding.
-                c.execute(
+                demoted = c.execute(
                     "UPDATE mem SET kind='claim', trust='group_stated' "
                     "WHERE scope='group' AND trust='verified' "
                     "AND kind IN ('fact', 'preference', 'person') "
                     "AND source NOT IN ('auto:owner_verified', 'owner_verified', 'diary')"
-                )
+                ).rowcount
+                if demoted and demoted > 0:
+                    log.warning(
+                        "memory migration v3: 已将 %d 条旧的群聊已核实记忆降级为未核实陈述（claim/group_stated），"
+                        "该降级不可逆；如其中有房主亲口确认的内容，请让房主重新确认。",
+                        demoted,
+                    )
 
             for ver in (1, SCHEMA_VERSION):
                 c.execute(
@@ -1042,6 +1127,9 @@ class MemoryStore:
                         if exp is not None and (r["expires_at"] is None or exp > float(r["expires_at"])):
                             c.execute("UPDATE mem SET expires_at=?, updated=? WHERE id=?", (exp, ts, r["id"]))
                         return int(r["id"]), "same"
+                    # A weaker-trust text never gets merged over (and so never rewrites) a stronger row.
+                    if TRUST_RANK.get(str(r["trust"] or "verified"), 3) > TRUST_RANK.get(norm_trust, 3):
+                        continue
                     cos = _cosine(vec, _unpack_vec(r["vec"]))
                     if cos is not None and cos >= DEFAULT_DEDUPE_COS and (best is None or cos > best[0]):
                         best = (cos, r)
@@ -1091,6 +1179,28 @@ class MemoryStore:
             ")",
             (mem_id, mem_id, MAX_VERSIONS_PER_MEM),
         )
+
+    def _peek_writable(
+        self,
+        actor: str,
+        scope: str,
+        channel: str,
+        mem_id: Any,
+        allow_shared: bool,
+    ) -> Optional[sqlite3.Row]:
+        """Fetch the row an `update` would touch (same ACL), or `None`."""
+        if isinstance(mem_id, bool):
+            return None
+        try:
+            mid = int(str(mem_id).lstrip("#"))
+        except ValueError:
+            return None
+        resolved_ch = self._resolve_channel(actor, scope, channel)
+        where, params = self._writable_sql(
+            actor, scope, resolved_ch, allow_shared=allow_shared, for_invalidate=False
+        )
+        with self._lock, self._connect() as c:
+            return c.execute(f"SELECT * FROM mem WHERE id=? AND {where}", [mid, *params]).fetchone()
 
     def update(
         self,
@@ -1615,6 +1725,7 @@ class MemoryStore:
         kind: str,
         text_val: str,
         is_update: bool = False,
+        info: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str]:
         non_self_all = [r for r in selected if str(r["speaker_role"] or "member").lower() != "self"]
         self_rows = [r for r in selected if str(r["speaker_role"] or "member").lower() == "self"]
@@ -1669,18 +1780,25 @@ class MemoryStore:
 
         if scope == "group":
             # PR-B1: Only explicit owner-cited statements with lexical alignment and no member-only import become verified.
-            owner_decl_lines: List[str] = []
-            if src_spec is not None and explicit_ev_rows:
-                owner_decl_lines = [
-                    _strip_speaker_prefix(r["line"])
-                    for r in explicit_ev_rows
-                    if str(r["speaker_role"] or "").lower() == "owner" and not _is_pure_question_line(r["line"])
-                ]
+            # A relayed statement ("小林说他对花生过敏") is hearsay even when the owner repeats it.
+            owner_rows = [
+                r for r in explicit_ev_rows
+                if src_spec is not None
+                and str(r["speaker_role"] or "").lower() == "owner" and not _is_pure_question_line(r["line"])
+            ]
+            owner_decl_lines = [
+                _strip_speaker_prefix(r["line"]) for r in owner_rows if not _is_relayed_line(_strip_speaker_prefix(r["line"]))
+            ]
+            relayed_lines = [
+                _strip_speaker_prefix(r["line"]) for r in owner_rows if _is_relayed_line(_strip_speaker_prefix(r["line"]))
+            ]
+            if relayed_lines and not owner_decl_lines and info is not None:
+                info["relayed"] = True
             owner_verified = False
-            if owner_decl_lines and not is_update:
+            if owner_decl_lines:
                 owner_text = "\n".join(owner_decl_lines)
                 if _keyword_overlap(_lexical_features(text_val), owner_text) > 0.0:
-                    other_decl_lines = [
+                    other_decl_lines = relayed_lines + [
                         _strip_speaker_prefix(r["line"])
                         for r in (non_self_all + self_rows)
                         if str(r["speaker_role"] or "").lower() != "owner"
@@ -1693,8 +1811,6 @@ class MemoryStore:
                     }
                     if not (other_only_bg & _char_bigrams(text_val)):
                         owner_verified = True
-            elif is_update and owner_decl_lines:
-                owner_verified = _keyword_overlap(_lexical_features(text_val), "\n".join(owner_decl_lines)) > 0.0
 
             if not owner_verified:
                 if eff_kind == "rule":
@@ -1804,6 +1920,7 @@ class MemoryStore:
                     )
                     exp_at = raw_op.get("expires_at")
                     raw_kind = str(raw_op.get("kind") or "fact")
+                    trust_info: Dict[str, Any] = {}
                     eff_kind, eff_trust = self._resolve_evidence_and_trust(
                         selected,
                         raw_op.get("src"),
@@ -1811,9 +1928,12 @@ class MemoryStore:
                         kind=raw_kind,
                         text_val=str(text_val or ""),
                         is_update=False,
+                        info=trust_info,
                     )
                     is_shared = bool(allow_shared and scope in ("group", "world") and raw_op.get("shared"))
                     eff_source = "auto:owner_verified" if (scope == "group" and eff_trust == "verified") else "auto"
+                    if scope == "group" and eff_trust != "verified" and trust_info.get("relayed"):
+                        eff_source = "auto:relayed"
                     # Scope is strictly clamped to the source `seen` bucket (`scope`, `channel`).
                     mid, how = self.add(
                         actor,
@@ -1833,14 +1953,41 @@ class MemoryStore:
                         stats["added" if how == "added" else "merged"] += 1
                     self._link_src(mid, raw_op.get("src"), seen_ids, now)
                 elif kind_op == "update":
-                    self._resolve_evidence_and_trust(
+                    trust_info = {}
+                    _, upd_trust = self._resolve_evidence_and_trust(
                         selected,
                         raw_op.get("src"),
                         scope=scope,
                         kind=str(raw_op.get("kind") or "promise"),
                         text_val=str(text_val or ""),
                         is_update=True,
+                        info=trust_info,
                     )
+                    target = self._peek_writable(actor, scope, channel, raw_op.get("id"), allow_shared)
+                    if (
+                        scope == "group"
+                        and target is not None
+                        and str(target["trust"] or "verified") == "verified"
+                        and str(target["kind"] or "") != "claim"
+                        and upd_trust != "verified"
+                    ):
+                        # Only the owner can rewrite a verified fact; anyone else's version is stored as a claim.
+                        mid, how = self.add(
+                            actor,
+                            scope,
+                            str(text_val or ""),
+                            channel=channel,
+                            about=raw_op.get("about") or str(target["about"] or ""),
+                            kind="claim",
+                            trust="group_stated",
+                            shared=bool(allow_shared and raw_op.get("shared")),
+                            source="auto:relayed" if trust_info.get("relayed") else "auto",
+                            now=now,
+                        )
+                        if how != "same":
+                            stats["added" if how == "added" else "merged"] += 1
+                        self._link_src(mid, raw_op.get("src"), seen_ids, now)
+                        continue
                     updated = self.update(
                         actor,
                         scope,

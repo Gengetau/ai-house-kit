@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..chat_identity import quote_untrusted
-from ..llm import LLMAPIError, _extract_http_error_detail, mask_secrets
+from ..llm import LLMAPIError, _extract_http_error_detail, clamp_timeout, mask_secrets
 from ..media_safety import (
     DEFAULT_MAX_MEDIA_BYTES,
     fetch_media_bytes,
@@ -32,6 +32,7 @@ from ..plugin_api import (
     PluginManifest,
     PluginRequestContext,
     PluginRoute,
+    quota_speaker_key,
     ToolContext,
     ToolRegistration,
 )
@@ -188,6 +189,17 @@ def transcribe_audio_source(
             channel=channel,
         )
     except Exception as exc:  # noqa: BLE001
+        if rec_call is not None:  # settle the quota slot reserved above (refunded daily, counted as an attempt)
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model="",
+                base_url="local://source",
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                ok=False,
+                error_code="invalid_source",
+            )
         return {
             "ok": False,
             "degraded": True,
@@ -215,7 +227,7 @@ def transcribe_audio_source(
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
+        with urllib.request.urlopen(req, timeout=clamp_timeout(20.0)) as resp:
             raw_resp = resp.read().decode("utf-8", errors="replace")
         try:
             doc = json.loads(raw_resp)
@@ -363,7 +375,7 @@ def synthesize_speech(
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
+        with urllib.request.urlopen(req, timeout=clamp_timeout(20.0)) as resp:
             raw_audio = resp.read(DEFAULT_MAX_MEDIA_BYTES + 1)
             if len(raw_audio) > DEFAULT_MAX_MEDIA_BYTES:
                 raise ValueError("合成音频体积超过上限")
@@ -482,7 +494,7 @@ def _process_attachments(actx: AttachmentContext) -> List[str]:
     if not recs:
         return []
     sp = actx.speaker
-    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    sp_id = quota_speaker_key(sp, str(getattr(actx, "channel", "") or ""))
     is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     return enrich_chat_records(
         list(recs),
@@ -508,7 +520,7 @@ def _tool_transcribe_audio(
     actor = ctx.actor if ctx is not None else ""
     channel = ctx.channel if ctx is not None else ""
     sp = ctx.speaker if ctx is not None else None
-    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    sp_id = quota_speaker_key(sp, str(getattr(ctx, "channel", "") or ""))
     is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     return transcribe_audio_source(
         source,
@@ -534,7 +546,7 @@ def _tool_synthesize_voice(
     scope = ctx.scope if ctx is not None else "group"
     actor = ctx.actor if ctx is not None else ""
     sp = ctx.speaker if ctx is not None else None
-    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    sp_id = quota_speaker_key(sp, str(getattr(ctx, "channel", "") or ""))
     is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     res = synthesize_speech(
         text,

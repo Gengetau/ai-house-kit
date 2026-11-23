@@ -92,7 +92,8 @@ class SettingsStore:
             next_entry["values"] = new_vals
 
             if next_entry.get("enabled") is True:
-                eff_vals = resolve_plugin_config(manifest, env=env, stored_values=new_vals)
+                # new_vals were just validated strictly above; a bad *environment* value must not block saving
+                eff_vals, _ = safe_resolve_plugin_config(manifest, env=env, stored_values=new_vals)
                 for fld in manifest.config_fields:
                     if fld.required and not eff_vals.get(fld.key):
                         raise ValueError(f"启用「{manifest.name}」前必须填写必填项：{fld.label}")

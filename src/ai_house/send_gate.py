@@ -16,6 +16,14 @@ JST = dt.timezone(dt.timedelta(hours=9))
 DEFAULT_QUIET_HOURS = "23:30-07:00"
 DEFAULT_HOURLY_CAP = 10
 DEFAULT_DAILY_CAP = 60
+DEFAULT_DIRECT_HOURLY_CAP = 60
+DEFAULT_DIRECT_DAILY_CAP = 300
+KIND_OUTBOX = "outbox"  # outbox deliveries: proactive talk, reminders, notices
+KIND_DIRECT = "direct"  # direct channel replies (OneBot answering a message); counted separately
+LOG_RETENTION_S = 3 * 86400.0  # send_gate_log rows older than this are deleted (only today's rows are ever counted)
+_LOG_PRUNE_EVERY_S = 600.0
+DAILY_COUNT_SQL = "SELECT COUNT(*) FROM send_gate_log WHERE kind=? AND day_jst=?"
+HOURLY_COUNT_SQL = "SELECT COUNT(*) FROM send_gate_log WHERE recip_key=? AND sent_at>?"
 
 _QUIET_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
 
@@ -85,7 +93,7 @@ class SendGate:
         self.daemon = daemon
         self._lock = threading.RLock()
         self._sent_hourly: Dict[str, Deque[float]] = {}
-        self._sent_daily: Deque[Tuple[str, float]] = deque()
+        self._sent_daily: Dict[str, Deque[Tuple[str, float]]] = {KIND_OUTBOX: deque(), KIND_DIRECT: deque()}
         self._webchat_refs: Dict[str, str] = {}
         self._stats: Dict[str, int] = {
             "sent": 0,
@@ -93,7 +101,10 @@ class SendGate:
             "deferred_quiet_hours": 0,
             "deferred_rate_limit": 0,
             "unknown": 0,
+            "direct_limited": 0,
         }
+        self._mem_ids: Dict[str, float] = {}
+        self._last_log_prune = 0.0
 
     def _world_conn(self) -> Optional[sqlite3.Connection]:
         wdb = getattr(self.daemon, "world_db", None)
@@ -108,15 +119,28 @@ class SendGate:
         c.execute(
             "CREATE TABLE IF NOT EXISTS send_gate_log ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id TEXT UNIQUE, "
-            "recip_key TEXT NOT NULL, day_jst TEXT NOT NULL, sent_at REAL NOT NULL)"
+            "recip_key TEXT NOT NULL, day_jst TEXT NOT NULL, sent_at REAL NOT NULL, "
+            f"kind TEXT NOT NULL DEFAULT '{KIND_OUTBOX}')"
         )
+        cols = {r[1] for r in c.execute("PRAGMA table_info(send_gate_log)").fetchall()}
+        if "kind" not in cols:  # table created before direct replies were counted separately
+            try:
+                with c:
+                    c.execute(f"ALTER TABLE send_gate_log ADD COLUMN kind TEXT NOT NULL DEFAULT '{KIND_OUTBOX}'")
+                    c.execute("UPDATE send_gate_log SET kind=? WHERE recip_key LIKE 'direct:%'", (KIND_DIRECT,))
+            except sqlite3.OperationalError:
+                pass  # another connection migrated it first
         c.execute("CREATE INDEX IF NOT EXISTS idx_send_gate_log_ts ON send_gate_log(sent_at, day_jst)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_send_gate_log_kind_day ON send_gate_log(kind, day_jst)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_send_gate_log_recip ON send_gate_log(recip_key, sent_at)")
         return c
 
     def reset(self) -> None:
         with self._lock:
             self._sent_hourly.clear()
-            self._sent_daily.clear()
+            for q in self._sent_daily.values():
+                q.clear()
+            self._mem_ids.clear()
             self._webchat_refs.clear()
             for k in self._stats:
                 self._stats[k] = 0
@@ -318,39 +342,72 @@ class SendGate:
                 out["user_id"] = eff_target
         return eff_scope, eff_target, out
 
-    def _rate_counts(self, recip_key: str, now: float, today_jst: str) -> Tuple[int, int]:
+    def _rate_counts(self, recip_key: str, now: float, today_jst: str, kind: str = KIND_OUTBOX) -> Tuple[int, int]:
+        """(sends to `recip_key` in the last hour, sends of this `kind` today). Outbox and direct never mix."""
         c = self._world_conn()
         if c is not None:
             with contextlib.closing(c):
-                h_row = c.execute(
-                    "SELECT COUNT(*) FROM send_gate_log WHERE recip_key=? AND sent_at>?",
-                    (recip_key, float(now) - 3600.0),
-                ).fetchone()
-                d_row = c.execute(
-                    "SELECT COUNT(*) FROM send_gate_log WHERE day_jst=?",
-                    (today_jst,),
-                ).fetchone()
+                h_row = c.execute(HOURLY_COUNT_SQL, (recip_key, float(now) - 3600.0)).fetchone()
+                d_row = c.execute(DAILY_COUNT_SQL, (kind, today_jst)).fetchone()
                 return int(h_row[0] or 0), int(d_row[0] or 0)
 
         q_hour = self._sent_hourly.setdefault(recip_key, deque())
         while q_hour and (now - q_hour[0]) >= 3600.0:
             q_hour.popleft()
-        while self._sent_daily and self._sent_daily[0][0] != today_jst:
-            self._sent_daily.popleft()
-        return len(q_hour), len(self._sent_daily)
+        q_day = self._sent_daily.setdefault(kind, deque())
+        while q_day and q_day[0][0] != today_jst:
+            q_day.popleft()
+        return len(q_hour), len(q_day)
 
-    def _record_sent(self, delivery_id: str, recip_key: str, done_day: str, done_now: float) -> None:
+    def _already_logged(self, delivery_id: str) -> bool:
+        if not delivery_id:
+            return False
+        if str(delivery_id) in self._mem_ids:
+            return True
+        c = self._world_conn()
+        if c is not None:
+            with contextlib.closing(c):
+                return c.execute("SELECT 1 FROM send_gate_log WHERE delivery_id=?", (str(delivery_id),)).fetchone() is not None
+        return False
+
+    def _record_sent(
+        self, delivery_id: str, recip_key: str, done_day: str, done_now: float, kind: str = KIND_OUTBOX
+    ) -> bool:
+        """Charge one send. A `delivery_id` that is already in the log is not charged again (returns False)."""
+        if self._already_logged(delivery_id):
+            return False
         self._sent_hourly.setdefault(recip_key, deque()).append(done_now)
-        self._sent_daily.append((done_day, done_now))
+        self._sent_daily.setdefault(kind, deque()).append((done_day, done_now))
+        self._mem_ids[str(delivery_id)] = done_now
+        if len(self._mem_ids) > 4096:
+            for k in sorted(self._mem_ids, key=self._mem_ids.get)[:1024]:  # type: ignore[arg-type]
+                self._mem_ids.pop(k, None)
         self._stats["sent"] += 1
         c = self._world_conn()
         if c is not None:
             with contextlib.closing(c):
                 with c:
                     c.execute(
-                        "INSERT OR IGNORE INTO send_gate_log(delivery_id, recip_key, day_jst, sent_at) VALUES(?, ?, ?, ?)",
-                        (str(delivery_id), recip_key, done_day, float(done_now)),
+                        "INSERT OR IGNORE INTO send_gate_log(delivery_id, recip_key, day_jst, sent_at, kind) "
+                        "VALUES(?, ?, ?, ?, ?)",
+                        (str(delivery_id), recip_key, done_day, float(done_now), kind),
                     )
+                    if abs(done_now - self._last_log_prune) >= _LOG_PRUNE_EVERY_S:
+                        self._last_log_prune = done_now
+                        c.execute("DELETE FROM send_gate_log WHERE sent_at < ?", (float(done_now) - LOG_RETENTION_S,))
+        return True
+
+    def prune_log(self, now: Optional[float] = None) -> int:
+        """Delete send-log rows older than the retention period; returns how many went."""
+        ts = float(now) if now is not None else float(self.daemon.clock.now())
+        with self._lock:
+            c = self._world_conn()
+            if c is None:
+                return 0
+            with contextlib.closing(c):
+                with c:
+                    cur = c.execute("DELETE FROM send_gate_log WHERE sent_at < ?", (ts - LOG_RETENTION_S,))
+                    return int(cur.rowcount or 0)
 
     def deliver_gated(
         self,
@@ -406,7 +463,7 @@ class SendGate:
             daily_cap = _safe_int(d.env.get("AI_HOUSE_OUTBOX_DAILY_CAP"), DEFAULT_DAILY_CAP)
             recip_key = to_identity or f"{channel_id}:{eff_target or eff_scope}"
             today_jst = dt.datetime.fromtimestamp(now, JST).date().isoformat()
-            h_count, d_count = self._rate_counts(recip_key, now, today_jst)
+            h_count, d_count = self._rate_counts(recip_key, now, today_jst, KIND_OUTBOX)
             if h_count >= hourly_cap:
                 self._stats["deferred_rate_limit"] += 1
                 raise NotSent("hourly_cap")
@@ -437,8 +494,21 @@ class SendGate:
         with self._lock:
             done_now = float(d.clock.now())
             done_day = dt.datetime.fromtimestamp(done_now, JST).date().isoformat()
-            self._record_sent(delivery_id, recip_key, done_day, done_now)
+            self._record_sent(delivery_id, recip_key, done_day, done_now, KIND_OUTBOX)
         return ref
+
+    def _direct_hourly_cap(self, plugin: Any) -> int:
+        env = self.daemon.env
+        raw = env.get("AI_HOUSE_DIRECT_HOURLY_CAP")
+        if raw:
+            return _safe_int(raw, DEFAULT_DIRECT_HOURLY_CAP)
+        cfg = getattr(plugin, "cfg", None)
+        per_hour = getattr(cfg, "max_per_hour", None) if cfg is not None else None
+        if not per_hour:
+            per_hour = env.get("ONEBOT_MAX_PER_HOUR")
+        # The channel enforces ONEBOT_MAX_PER_HOUR per chat itself; the gate is the safety net above it, so a larger
+        # configured value raises this cap instead of being clipped to the default.
+        return max(DEFAULT_DIRECT_HOURLY_CAP, _safe_int(per_hour, DEFAULT_DIRECT_HOURLY_CAP))
 
     def authorize_direct_send(
         self,
@@ -452,11 +522,18 @@ class SendGate:
         delivery_id: str = "",
         urgent: bool = True,
         enforce_rate_cap: bool = True,
+        media_count: int = 0,
     ) -> str:
-        """Gate direct channel replies (e.g. OneBot WS) through destination, guard, leak & cap checks."""
+        """Gate a direct channel reply (e.g. OneBot WS) through destination, guard, leak & cap checks.
+
+        Nothing is charged here: the caller must call `record_direct_sent(delivery_id, <returned key>)` once the
+        reply really went out, so a failed send costs no quota. A reply whose `delivery_id` is already in the log
+        (resumed or authorised again) is not stopped by the caps and is not charged twice. Direct replies have their
+        own hourly (per target) and daily counters, independent of outbox traffic. `media_count` lets a reply that
+        is nothing but pictures/voice (empty `text`) through."""
         d = self.daemon
         body = str(text or "").strip()
-        if not body:
+        if not body and int(media_count or 0) <= 0:
             with self._lock:
                 self._stats["blocked"] += 1
             raise BlockedDelivery("empty_text")
@@ -474,29 +551,35 @@ class SendGate:
 
             now = float(d.clock.now())
             check_ch = f"private:{actor}" if eff_scope == "private" else f"qq-group:{eff_target}" if channel_id == "onebot_v11" and eff_scope == "group" else channel_id
-            if getattr(d, "guard", None) is not None:
+            if body and getattr(d, "guard", None) is not None:
                 why = d.guard.check(check_ch, body)
                 if why:
                     self._stats["blocked"] += 1
                     raise BlockedDelivery(f"guard:{why}")
-            if eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
+            if body and eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
                 if d.memory.check_outbound_leak(actor, "group", body, now=now):
                     self._stats["blocked"] += 1
                     raise BlockedDelivery("memory_leak:private_to_public")
 
             recip_key = f"direct:{channel_id}:{eff_target or eff_scope}"
             today_jst = dt.datetime.fromtimestamp(now, JST).date().isoformat()
-            if enforce_rate_cap:
-                hourly_cap = _safe_int(d.env.get("AI_HOUSE_DIRECT_HOURLY_CAP") or d.env.get("AI_HOUSE_OUTBOX_HOURLY_CAP"), 60)
-                daily_cap = _safe_int(d.env.get("AI_HOUSE_DIRECT_DAILY_CAP") or d.env.get("AI_HOUSE_OUTBOX_DAILY_CAP"), 300)
-                h_count, d_count = self._rate_counts(recip_key, now, today_jst)
+            if enforce_rate_cap and not self._already_logged(delivery_id):
+                hourly_cap = self._direct_hourly_cap(plugin)
+                daily_cap = _safe_int(d.env.get("AI_HOUSE_DIRECT_DAILY_CAP"), DEFAULT_DIRECT_DAILY_CAP)
+                h_count, d_count = self._rate_counts(recip_key, now, today_jst, KIND_DIRECT)
                 if h_count >= hourly_cap:
                     self._stats["deferred_rate_limit"] += 1
+                    self._stats["direct_limited"] += 1
                     raise NotSent("hourly_cap")
                 if d_count >= daily_cap:
                     self._stats["deferred_rate_limit"] += 1
+                    self._stats["direct_limited"] += 1
                     raise NotSent("daily_cap")
-
-            did = delivery_id or f"direct-{channel_id}-{now:.6f}-{len(self._sent_daily)}"
-            self._record_sent(did, recip_key, today_jst, now)
             return recip_key
+
+    def record_direct_sent(self, delivery_id: str, recip_key: str) -> bool:
+        """Charge one direct reply after it has really been sent. Recording the same `delivery_id` twice is a no-op."""
+        with self._lock:
+            now = float(self.daemon.clock.now())
+            day = dt.datetime.fromtimestamp(now, JST).date().isoformat()
+            return self._record_sent(str(delivery_id), str(recip_key), day, now, KIND_DIRECT)

@@ -178,7 +178,12 @@ class Life:
         self.submit(a, "move", {"to": to}, tag)
         return False
 
-    def think(self, a, kind, gap=THINK_GAP_S):
+    def unonce(self, key):
+        """Take back a `once` claim whose decision was never asked (the model was not reached)."""
+        with self.s.tx() as c:
+            c.execute("DELETE FROM life_runtime WHERE key=?", (key,))
+
+    def think(self, a, kind, gap=THINK_GAP_S, once_key=None):
         if not self.city_visits.home_allowed(a):
             return "degraded"
         if self.model is None:
@@ -189,7 +194,12 @@ class Life:
             return None
         self.put(f"think:{a}", now)
         self._kind[a] = kind
-        return self.cog.begin(a, kind)
+        got = self.cog.begin(a, kind)
+        if got == "not_called":  # the model was never asked: this was not a decision, so no gap to wait out and
+            self.put(f"think:{a}", last)  # no once-a-day claim spent; the next step asks again
+            if once_key:
+                self.unonce(once_key)
+        return got
 
     def bedtime_window(self, a, now=None):
         """(cue, cap) as timestamps for tonight, from her schedule's bedtime."""
@@ -259,7 +269,8 @@ class Life:
             if iid not in self._inv_asked:
                 self._inv_asked.add(iid)
                 if self.once(f"asked:{iid}"):
-                    self.think(a, f"invitation:{iid}", gap=0)
+                    if self.think(a, f"invitation:{iid}", gap=0, once_key=f"asked:{iid}") == "not_called":
+                        self._inv_asked.discard(iid)
                     return
             # a yes the world refused (already booked, rain, money) is hers to answer once more, knowing
             # why; left alone it only expired and the host never heard. Once more only.
@@ -267,7 +278,8 @@ class Life:
             if why:
                 self._inv_settled.add(iid)
                 if why not in CANNOT_ANSWER and self.once(f"asked_again:{iid}"):
-                    self.think(a, f"invitation:{iid}", gap=0)
+                    if self.think(a, f"invitation:{iid}", gap=0, once_key=f"asked_again:{iid}") == "not_called":
+                        self._inv_settled.discard(iid)
                     return
 
     def yes_refused(self, a, inv_id):
@@ -333,7 +345,7 @@ class Life:
             return
         # 9) free time: once a day she may plan something with others (her decision)
         if 10 * 60 <= self.minute(now) < 20 * 60 and self.once(f"free:{a}:{day}"):
-            if self.think(a, "free_time", gap=0) == "asked":
+            if self.think(a, "free_time", gap=0, once_key=f"free:{a}:{day}") == "asked":
                 return
         # 10) her own hobbies and chores, by preference
         self._pastime(a, day, now)
@@ -341,7 +353,7 @@ class Life:
     def _may_stay_up(self, a, day, now, cue):
         """True while she has chosen to stay up, "asked" when she was just asked (her answer is pending)."""
         if self.once(f"bedtime_asked:{a}:{day}"):
-            got = self.think(a, "bedtime", gap=0)
+            got = self.think(a, "bedtime", gap=0, once_key=f"bedtime_asked:{a}:{day}")
             if got == "asked":
                 self.put(f"stayup:{a}:{day}", now)
                 return "asked"
@@ -657,7 +669,7 @@ class Life:
             # asked only with something to cook (review P3-3: from 13:05 nothing for lunch is in time for the others,
             # and she was asked what to cook for everyone with an empty list)
             if self.cook_choices(a, slot, lag=DECIDE_LAG_S) and self.once(f"headcook_asked:{day}:{slot}"):
-                if self.think(a, f"head_cook:{slot}", gap=0) == "asked":
+                if self.think(a, f"head_cook:{slot}", gap=0, once_key=f"headcook_asked:{day}:{slot}") == "asked":
                     return True
             # someone has had this meal already or a dish is ready: the rest are waiting, so something quick (
             # 11-03 in the fake week: a 60-minute curry for the last two, who left for their 20:00 plan before it was ready)
@@ -706,7 +718,8 @@ class Life:
         # 09:00 the others were asked while a toast for one was on, and none of them made breakfast after it)
         if not (soon and not self.cook_choices(a, slot, for_others=False, lag=DECIDE_LAG_S)) and \
                 self.meals.claim_decision(a):
-            self.think(a, got["would_call"], gap=0)
+            if self.think(a, got["would_call"], gap=0) == "not_called":
+                self.meals.release_decision(a)  # not asked: the one decision of this meal is still hers
             return True
         if now < row["ends"]:  # hungry, waiting in the kitchen: till that pot is ready
             sec = int(max(60, min(600, min(soon) - now + 60))) if soon else 600

@@ -33,7 +33,7 @@ from worldkernel.store import VirtualClock, WallClock
 from . import __version__
 from .album import AlbumStore
 from .auth import AuthPolicy, check_bind, host_is_loopback, mcp_tier, origin_is_loopback, tier_for_channel
-from .backup import create_backup, list_backups
+from .backup import create_backup, is_pid_alive, list_backups
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_compatible_chat
 from .chat_guard import ReplyGuard
@@ -42,7 +42,7 @@ from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .intents import CommitmentStore
-from .llm import ModelRouter
+from .llm import ModelRouter, deadline_scope, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
 from .proactive import ProactiveEngine
@@ -150,6 +150,61 @@ class OffsetWallClock:
             pass
 
 
+class DaemonLockError(RuntimeError):
+    """Another live daemon process already owns this runtime directory."""
+
+
+def _acquire_runtime_lock(lock_file: Path) -> None:
+    """Create `.daemon.lock` for this process; refuse if a different live process holds it, take over a stale one."""
+    payload = json.dumps({"pid": os.getpid(), "started_at": time.time()}, ensure_ascii=False)
+    for _ in range(3):
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                holder = int(json.loads(lock_file.read_text(encoding="utf-8")).get("pid") or 0)
+            except (OSError, ValueError, TypeError, AttributeError):
+                holder = 0
+            if holder > 0 and holder != os.getpid() and is_pid_alive(holder):
+                raise DaemonLockError(
+                    f"运行目录 {lock_file.parent} 已有另一个 ai-house 正在使用（进程号 {holder}）。"
+                    "请先停止那个进程，或用 --data-dir 指定另一个目录。"
+                ) from None
+            try:  # stale (process gone), unreadable, or left by an earlier daemon in this same process
+                lock_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                break
+            continue
+        except OSError:
+            return  # read-only or unusual filesystem: keep the old best-effort behaviour
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        return
+    with contextlib.suppress(OSError):
+        lock_file.write_text(payload, encoding="utf-8")
+
+
+# `RoommateChatAgent.pick_group_responders` lets at most this many roommates answer one house-group message.
+_GROUP_MAX_RESPONDERS = 2
+
+
+def _env_float(raw: Any, default: float) -> float:
+    try:
+        v = float(raw)
+        return v if v == v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_budget(raw: Any, default: float) -> float:
+    """A seconds budget from the environment: 0, negative, empty or unparsable means "use the default"
+    (not "unlimited" and not the minimum clamp)."""
+    v = _env_float(raw, default)
+    return v if v > 0 else default
+
+
 class HouseDaemon:
     """Self-contained runtime wrapping Authority + Web Console API + SSE + MCP Server."""
 
@@ -172,14 +227,9 @@ class HouseDaemon:
         self.runtime_dir = Path(runtime_dir)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._lock_file = self.runtime_dir / ".daemon.lock"
-        try:
-            self._lock_file.write_text(
-                json.dumps({"pid": os.getpid(), "started_at": time.time()}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+        _acquire_runtime_lock(self._lock_file)
         self._world_epoch = 0
+        self._reset_epoch = 0  # bumped only by reset_house: a mere remount (add/update resident) keeps in-flight replies
         self.life_db = str(self.runtime_dir / "life1.db")
         self.world_db = str(self.runtime_dir / "world.db")
         self.step_interval_s = float(step_interval_s)
@@ -216,6 +266,9 @@ class HouseDaemon:
         self._managed_plugin_extensions: List[Any] = []
         self._managed_plugin_ext_map: Dict[str, Any] = {}
         self._plugin_task_last_run: Dict[tuple[str, str], float] = {}
+        self._cfg_warned: set[tuple[str, str]] = set()
+        self._post_reply_lock = threading.Lock()
+        self._post_reply_threads: set[threading.Thread] = set()
         self._active_channel_ids: set[str] = set()
         self._active_tools = self.registry.active_tools(self.env, stored_plugins=stored_plugins)
         self.providers = [inst for _, inst in self.registry.active_providers(self.env, stored_plugins=stored_plugins)]
@@ -245,7 +298,7 @@ class HouseDaemon:
                     inst = ch_factory()
                     if inst is not None:
                         ch_defn = self.registry.definitions.get(ch_pid)
-                        ch_host: Any = PluginHostProxy(self) if (ch_defn is not None and ch_defn.source != "builtin") else self
+                        ch_host: Any = PluginHostProxy(self, ch_pid) if (ch_defn is not None and ch_defn.source != "builtin") else self
                         inst.start(ch_host)
                         self.channels.append(inst)
                         self._active_channel_ids.add(ch_pid)
@@ -298,6 +351,46 @@ class HouseDaemon:
             if self.authority.city_bridge is not None and hasattr(self.authority.city_bridge, "chat"):
                 self.authority.city_bridge.chat = life_chat
                 self.authority.city_bridge.selves = self.vocab.SELVES
+
+    def _schedule_post_reply(self, turn_epoch: int, job: Any) -> None:
+        """Run `job` in the background under the same lock as the periodic post-step jobs (never inside a turn)."""
+
+        def _runner() -> None:
+            try:
+                with self._async_job_lock:
+                    if self._stop.is_set() or self._reset_epoch != turn_epoch:
+                        return  # the house was reset or closed meanwhile: never write into the new world
+                    job()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"post-reply job failed: {type(exc).__name__}: {mask_secrets(str(exc))}")
+            finally:
+                with self._post_reply_lock:
+                    self._post_reply_threads.discard(threading.current_thread())
+
+        t = threading.Thread(target=_runner, name="ai-house-post-reply", daemon=True)
+        with self._post_reply_lock:
+            self._post_reply_threads.add(t)
+        t.start()
+
+    def drain_post_reply_jobs(self, timeout: float = 10.0) -> bool:
+        """Wait for background after-reply jobs (chat photo archiving); True when none is left running."""
+        end = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._post_reply_lock:
+                pending = [t for t in self._post_reply_threads if t.is_alive()]
+            if not pending:
+                return True
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            pending[0].join(timeout=min(left, 0.2))
+
+    def _turn_world_ok(self, turn_epoch: int, *, need_intents: bool = False) -> bool:
+        """False once `reset_house` ran since the turn began. Takes the lock so a concurrent remount is waited out."""
+        with self._lock:
+            if self._reset_epoch != turn_epoch or self.memory is None:
+                return False
+            return not (need_intents and self.intents is None)
 
     def _teardown_world(self) -> None:
         self._world_epoch = getattr(self, "_world_epoch", 0) + 1
@@ -453,6 +546,21 @@ class HouseDaemon:
     def log(self, msg: str) -> None:
         print(f"[ai-house] {msg}", flush=True)
 
+    def plugin_config(self, plugin_id: str, stored_plugins: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Runtime plugin config: an invalid env/stored value falls back to the default (one warning per problem).
+
+        Only the settings-save path (`SettingsStore.update_plugin`) validates strictly and reports to the user.
+        """
+        if stored_plugins is None:
+            stored_plugins = self.settings_store.get_plugins_map()
+        cfg, warns = self.registry.safe_resolve_config(plugin_id, env=self.env, stored_plugins=stored_plugins)
+        for w in warns:
+            msg = mask_secrets(w)
+            if (plugin_id, msg) not in self._cfg_warned:
+                self._cfg_warned.add((plugin_id, msg))
+                self.log(f"plugin {plugin_id} config warning: {msg}")
+        return cfg
+
     def start_background_loop(self) -> threading.Thread:
         def _loop() -> None:
             while not self._stop.wait(self.step_interval_s):
@@ -468,6 +576,8 @@ class HouseDaemon:
     def close(self) -> None:
         if hasattr(self, "_stop"):
             self._stop.set()
+        if hasattr(self, "_post_reply_lock"):
+            self.drain_post_reply_jobs(2.0)
         for ch in getattr(self, "channels", ()):
             try:
                 ch.stop()
@@ -507,7 +617,7 @@ class HouseDaemon:
                     active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_pl)}
                     album_enabled = "album_diary_art" in active_pids
                     album_cfg = (
-                        self.registry.resolve_config("album_diary_art", env=self.env, stored_plugins=stored_pl)
+                        self.plugin_config("album_diary_art", stored_pl)
                         if album_enabled
                         else {}
                     )
@@ -544,17 +654,13 @@ class HouseDaemon:
                 continue
             self._plugin_task_last_run[key] = now
             try:
-                cfg, cfg_warns = self.registry.safe_resolve_config(
-                    defn.plugin_id, env=self.env, stored_plugins=stored_plugins
-                )
-                for w in cfg_warns:
-                    self.log(f"plugin {defn.plugin_id} config warning: {mask_secrets(w)}")
+                cfg = self.plugin_config(defn.plugin_id, stored_plugins)
                 tctx = PluginTaskContext(
                     plugin_id=defn.plugin_id,
                     task_id=task.task_id,
                     now=now,
                     plugin_config=cfg,
-                    daemon=PluginHostProxy(self) if defn.source != "builtin" else self,
+                    daemon=PluginHostProxy(self, defn.plugin_id) if defn.source != "builtin" else self,
                 )
                 if task.run_outside_lock:
                     task.handler(tctx)
@@ -581,7 +687,7 @@ class HouseDaemon:
                 try:
                     p_pid = str(getattr(p, "provider_id", "") or "")
                     p_defn = self.registry.definitions.get(p_pid)
-                    p_host: Any = PluginHostProxy(self) if (p_defn is not None and p_defn.source != "builtin") else self
+                    p_host: Any = PluginHostProxy(self, p_pid) if (p_defn is not None and p_defn.source != "builtin") else self
                     p.step(p_host)
                 except Exception as exc:  # noqa: BLE001
                     pid = str(getattr(p, "provider_id", type(p).__name__))
@@ -789,7 +895,12 @@ class HouseDaemon:
             out.append(d)
         return out
 
-    def list_diaries_view(self, actor: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    def list_diaries_view(
+        self, actor: Optional[str] = None, limit: int = 20, *, inline_images: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Diaries, newest first. An illustrated diary carries `image_media_rel` / `image_media_url`; the picture
+        itself is fetched separately. `inline_images=True` also embeds it as `image_data_uri` (one base64 image per
+        diary, so a long list gets large)."""
         if self.needs_onboarding or self.diary is None:
             return []
         rows = self.diary.list_diaries(actor=actor, limit=limit)
@@ -797,10 +908,13 @@ class HouseDaemon:
             for item in rows:
                 alb_id = str(item.get("image_album_id") or "").strip()
                 if alb_id:
-                    art = self.album.get_item(alb_id, expected_scope="world", include_data_uri=True)
-                    if art and art.get("data_uri"):
-                        item["image_data_uri"] = art["data_uri"]
+                    art = self.album.get_item(alb_id, expected_scope="world", include_data_uri=inline_images)
+                    if art and art.get("media_rel"):
+                        item["image_media_rel"] = art["media_rel"]
+                        item["image_media_url"] = art.get("media_url") or ""
                         item["image_title"] = art.get("title") or ""
+                        if inline_images and art.get("data_uri"):
+                            item["image_data_uri"] = art["data_uri"]
         return rows
 
     def list_album_view(
@@ -809,7 +923,7 @@ class HouseDaemon:
         scope: str = "world",
         actor: Optional[str] = None,
         limit: int = 24,
-        include_data_uri: bool = True,
+        include_data_uri: bool = False,
     ) -> Dict[str, Any]:
         stored_pl = self.settings_store.get_plugins_map()
         active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_pl)}
@@ -1065,7 +1179,7 @@ class HouseDaemon:
     def get_group_behavior_view(self) -> Dict[str, Any]:
         stored = self.settings_store.get_plugins_map()
         enabled = "group_behavior" in {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored)}
-        cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored)
+        cfg = self.plugin_config("group_behavior", stored)
         return {"ok": True, "enabled": enabled, "config": cfg, **self.group_behavior.status_view(now=self.clock.now())}
 
     def list_backup_snapshots(self) -> Dict[str, Any]:
@@ -1092,7 +1206,7 @@ class HouseDaemon:
         now = self.clock.now()
         if op == "mute":
             stored = self.settings_store.get_plugins_map()
-            cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored)
+            cfg = self.plugin_config("group_behavior", stored)
             mins = int(data.get("minutes") or cfg.get("mute_minutes") or 30)
             self.group_behavior.mute(ch, minutes=mins, now=now)
         elif op == "unmute":
@@ -1103,7 +1217,37 @@ class HouseDaemon:
             raise ValueError(f"不支持的群聊行为操作：{op or '(空)'}")
         return self.get_group_behavior_view()
 
+    def _life_step_budget(self) -> float:
+        router = getattr(self, "model_router", None)
+        return router.resolve_total_budget("life") if router is not None else 45.0
+
     def converse(
+        self,
+        channel: str,
+        text: str,
+        speaker: Speaker,
+        *,
+        actor: Optional[str] = None,
+        attachments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
+
+        Each reply (its retries, fallbacks and tool rounds) is bounded by the chat budget
+        (`AI_HOUSE_LLM_TOTAL_BUDGET_S`, default 45s). Generating the replies (attachment analysis + every reply) is
+        bounded by a ceiling of one chat budget per possible responder: the house `group` room may have up to two
+        roommates answer, every other room has one. The world step that follows does not inherit what is left of
+        that ceiling: it gets a fresh life-purpose budget (`_life_step_budget`). `AI_HOUSE_CONVERSE_BUDGET_S` overrides the ceiling
+        (0 or empty = default). A hanging endpoint therefore cannot stretch one turn
+        to minutes, while a healthy but slow model still gets to finish a two-roommate group turn.
+        """
+        router = getattr(self, "model_router", None)
+        budget = router.resolve_total_budget("chat") if router is not None else 45.0
+        responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
+        ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
+        with deadline_scope(max(1.0, min(ceiling, 600.0))):
+            return self._converse(channel, text, speaker, actor=actor, attachments=attachments)
+
+    def _converse(
         self,
         channel: str,
         text: str,
@@ -1129,13 +1273,14 @@ class HouseDaemon:
                 "channel": channel,
                 "replies": [],
                 "ignored": "bot_speaker",
-                "messages": self.list_chat(channel, limit=40),
+                # a bot is never shown a private room's history
+                "messages": [] if str(channel or "").strip().lower().startswith("private:") else self.list_chat(channel, limit=40),
             }
         if not speaker.is_owner:
             text = one_line(text)  # a member's message stays one line of its own in every later prompt
         with self._lock:
             self._require_world()
-            turn_epoch = self._world_epoch
+            turn_epoch = self._reset_epoch
             now = self.clock.now()
             state = self.get_state()
             residents = state["residents"]
@@ -1167,7 +1312,7 @@ class HouseDaemon:
             stored_plugins = self.settings_store.get_plugins_map()
             active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_plugins)}
             gb_enabled = (not is_private) and ("group_behavior" in active_pids)
-            gb_cfg = self.registry.resolve_config("group_behavior", env=self.env, stored_plugins=stored_plugins) if gb_enabled else {}
+            gb_cfg = self.plugin_config("group_behavior", stored_plugins) if gb_enabled else {}
             if gb_enabled:
                 gb_reason, gb_detail = self.group_behavior.check_group_turn(
                     channel, speaker, text, enabled=True, cfg=gb_cfg, now=now,
@@ -1217,45 +1362,62 @@ class HouseDaemon:
         speaker_role = "owner" if speaker.is_owner else "member"
         extra_tools = [t["spec"] for t in self._active_tools.values()]
         media_notes: List[str] = []
+        single_target = targets[0] if len(targets) == 1 else ""
+
+        def _run_att_procs(specs: List[Any], deadline_s: float) -> List[str]:
+            # `deadline_s` is one shared LLM/HTTP deadline for the whole pipeline: every processor's HTTP timeouts
+            # (vision 15s, transcription 20s, ...) are clamped to what is left of it.
+            notes: List[str] = []
+            with deadline_scope(deadline_s):
+                for proc_defn, proc in specs:
+                    if (remaining_budget() or 0.0) <= 0.05:
+                        self.log(
+                            f"attachment pipeline timed out after {deadline_s:g}s "
+                            f"before {proc_defn.plugin_id}.{proc.processor_id}"
+                        )
+                        break
+                    try:
+                        p_cfg = self.plugin_config(proc_defn.plugin_id, stored_plugins)
+                        proc_daemon: Any = (
+                            PluginHostProxy(self, proc_defn.plugin_id) if proc_defn.source != "builtin" else self
+                        )
+                        proc_actor = (
+                            single_target if proc_defn.plugin_id == "album_diary_art" else (targets[0] if targets else "")
+                        )
+                        actx = AttachmentContext(
+                            scope=scope,
+                            channel=channel,
+                            actor=proc_actor,
+                            speaker=speaker,
+                            now=now,
+                            attachments=attachments,
+                            plugin_config=p_cfg,
+                            daemon=proc_daemon,
+                        )
+                        out_notes = proc.handler(actx)
+                        if out_notes:
+                            for note in out_notes:
+                                clean_note = str(note or "").strip()
+                                if clean_note:
+                                    notes.append(clean_note)
+                    except Exception as exc:  # noqa: BLE001
+                        err_txt = mask_secrets(f"{type(exc).__name__}: {exc}")
+                        for sec in self.model_router.collect_secrets():
+                            err_txt = mask_secrets(err_txt, api_key=sec)
+                        self.log(f"attachment {proc_defn.plugin_id}.{proc.processor_id} skipped: {err_txt}")
+            return notes
+
+        post_reply_specs: List[Any] = []
         if isinstance(attachments, Mapping) and attachments and proc_specs:
-            att_deadline = time.monotonic() + 10.0
-            single_target = targets[0] if len(targets) == 1 else ""
-            for proc_defn, proc in proc_specs:
-                if time.monotonic() >= att_deadline:
-                    self.log(f"attachment pipeline timed out after 10s before {proc_defn.plugin_id}.{proc.processor_id}")
-                    break
-                try:
-                    p_cfg, p_warns = self.registry.safe_resolve_config(
-                        proc_defn.plugin_id, env=self.env, stored_plugins=stored_plugins
-                    )
-                    for w in p_warns:
-                        self.log(f"plugin {proc_defn.plugin_id} config warning: {mask_secrets(w)}")
-                    proc_daemon: Any = PluginHostProxy(self) if proc_defn.source != "builtin" else self
-                    proc_actor = single_target if proc_defn.plugin_id == "album_diary_art" else (targets[0] if targets else "")
-                    actx = AttachmentContext(
-                        scope=scope,
-                        channel=channel,
-                        actor=proc_actor,
-                        speaker=speaker,
-                        now=now,
-                        attachments=attachments,
-                        plugin_config=p_cfg,
-                        daemon=proc_daemon,
-                    )
-                    out_notes = proc.handler(actx)
-                    if out_notes:
-                        for note in out_notes:
-                            clean_note = str(note or "").strip()
-                            if clean_note:
-                                media_notes.append(clean_note)
-                except Exception as exc:  # noqa: BLE001
-                    err_txt = mask_secrets(f"{type(exc).__name__}: {exc}")
-                    for sec in self.model_router.collect_secrets():
-                        err_txt = mask_secrets(err_txt, api_key=sec)
-                    self.log(f"attachment {proc_defn.plugin_id}.{proc.processor_id} skipped: {err_txt}")
+            # Total budget for the pre-reply attachment pipeline (default 10s).
+            att_budget = max(0.5, min(_env_budget(self.env.get("AI_HOUSE_ATTACHMENT_BUDGET_S"), 10.0), 120.0))
+            post_reply_specs = [x for x in proc_specs if getattr(x[1], "after_reply", False)]
+            media_notes.extend(
+                _run_att_procs([x for x in proc_specs if not getattr(x[1], "after_reply", False)], att_budget)
+            )
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
-            if self._world_epoch != turn_epoch or self.memory is None:
+            if not self._turn_world_ok(turn_epoch):
                 break
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
             turn_media: List[Dict[str, Any]] = []
@@ -1267,7 +1429,7 @@ class HouseDaemon:
                 _aid: str = aid,
                 _turn_media: List[Dict[str, Any]] = turn_media,
             ) -> Dict[str, Any]:
-                if self._world_epoch != turn_epoch or self.memory is None or self.intents is None:
+                if not self._turn_world_ok(turn_epoch, need_intents=True):
                     return {"error": "world_reset_during_turn"}
                 if tname == "inspect_house":
                     return {
@@ -1342,12 +1504,12 @@ class HouseDaemon:
                         try:
                             stored_plugins = self.settings_store.get_plugins_map()
                             plug_cfg = (
-                                self.registry.resolve_config(pid, env=self.env, stored_plugins=stored_plugins)
+                                self.plugin_config(pid, stored_plugins)
                                 if pid in self.registry.definitions
                                 else {}
                             )
                             t_defn = self.registry.definitions.get(pid)
-                            t_daemon: Any = PluginHostProxy(self) if (t_defn is not None and t_defn.source != "builtin") else self
+                            t_daemon: Any = PluginHostProxy(self, pid) if (t_defn is not None and t_defn.source != "builtin") else self
                             tctx = ToolContext(
                                 actor=_aid,
                                 scope=scope,
@@ -1357,6 +1519,7 @@ class HouseDaemon:
                                 plugin_config=plug_cfg,
                                 daemon=t_daemon,
                                 pending_media=_turn_media,
+                                attachments=attachments if isinstance(attachments, Mapping) else None,
                             )
                             return invoke_tool_handler(reg, targs, tctx)
                         except Exception as exc:  # noqa: BLE001
@@ -1386,7 +1549,7 @@ class HouseDaemon:
             if rep["mode"] != "sleeping":
                 why = self.guard.check(channel, rep["text"])
                 if not why and not is_private:
-                    if self._world_epoch != turn_epoch or self.memory is None:
+                    if not self._turn_world_ok(turn_epoch):
                         break
                     if self.memory.check_outbound_leak(aid, scope, rep["text"], now=now):
                         why = "memory_leak:private_to_public"
@@ -1400,7 +1563,7 @@ class HouseDaemon:
 
         replies: List[Dict[str, Any]] = []
         with self._lock:
-            if self._world_epoch != turn_epoch or self.needs_onboarding or self.authority is None or self.intents is None or self.memory is None:
+            if self._reset_epoch != turn_epoch or self.needs_onboarding or self.authority is None or self.intents is None or self.memory is None:
                 return {
                     "ok": False,
                     "channel": channel,
@@ -1462,10 +1625,17 @@ class HouseDaemon:
                 )
                 replies.append(rep)
 
-            self.authority.step()
+            # The reply may have used up this turn's deadline; the world step is not part of "generate the reply", so
+            # it gets its own fresh life-purpose budget instead of inheriting the spent one.
+            with renewed_deadline_scope(self._life_step_budget()):
+                self.authority.step()
             if gb_enabled:
                 delivered_cnt = len([r for r in replies if r.get("mode") not in ("blocked", "sleeping")])
                 self.group_behavior.note_group_replies(channel, speaker, delivered_cnt, now=now)
+
+        if post_reply_specs:
+            # archiving (e.g. chat photos -> album) never changes the reply, so it runs after the reply is stored
+            self._schedule_post_reply(turn_epoch, lambda: _run_att_procs(post_reply_specs, 30.0))
 
         # the event stream is read-tier: it announces that something was said, not in which private room or QQ group
         self._broadcast("chat", {"channel": "group" if channel == "group" else "private", "replies": len(replies)})
@@ -1880,7 +2050,7 @@ class HouseDaemon:
         for ch_pid, inst in cand_channels:
             try:
                 ch_defn = self.registry.definitions.get(ch_pid)
-                ch_host: Any = PluginHostProxy(self) if (ch_defn is not None and ch_defn.source != "builtin") else self
+                ch_host: Any = PluginHostProxy(self, ch_pid) if (ch_defn is not None and ch_defn.source != "builtin") else self
                 inst.start(ch_host)
                 started_channels.append(inst)
                 started_ids.add(ch_pid)
@@ -2134,18 +2304,12 @@ class HouseDaemon:
 
     def reset_house(self) -> Dict[str, Any]:
         with self._async_job_lock, self._lock:
+            self._reset_epoch += 1
             self._teardown_world()
             if getattr(self, "model_router", None) is not None:
                 self.model_router.close()
             if getattr(self, "identity_store", None) is not None:
                 self.identity_store.close()
-            for ch in getattr(self, "channels", ()):
-                sp = getattr(ch, "_spool", None)
-                if sp is not None and hasattr(sp, "close"):
-                    try:
-                        sp.close()
-                    except Exception:
-                        pass
             targets = [
                 Path(self.life_db),
                 Path(self.life_db + "-wal"),
@@ -2189,6 +2353,14 @@ class HouseDaemon:
                             raise
                         gc.collect()
                         wait_ev.wait(0.05)
+
+            for ch in getattr(self, "channels", ()):
+                hook = getattr(ch, "on_world_reset", None)
+                if callable(hook):
+                    try:
+                        hook()
+                    except Exception as exc:  # noqa: BLE001
+                        self.log(f"channel on_world_reset failed: {type(exc).__name__}")
 
             if hasattr(self.clock, "reset"):
                 self.clock.reset()
@@ -2237,7 +2409,7 @@ class HouseDaemon:
         body: Any,
     ) -> Dict[str, Any]:
         stored_plugins = self.settings_store.get_plugins_map()
-        cfg = self.registry.resolve_config(defn.plugin_id, env=self.env, stored_plugins=stored_plugins)
+        cfg = self.plugin_config(defn.plugin_id, stored_plugins)
         ctx = PluginRequestContext(
             plugin_id=defn.plugin_id,
             method=str(method or "GET").upper(),
@@ -2245,7 +2417,7 @@ class HouseDaemon:
             query=dict(query or {}),
             body=body,
             plugin_config=cfg,
-            daemon=PluginHostProxy(self) if defn.source != "builtin" else self,
+            daemon=PluginHostProxy(self, defn.plugin_id) if defn.source != "builtin" else self,
             now=self.clock.now(),
         )
         res = route.handler(ctx)
@@ -2362,6 +2534,18 @@ class HouseDaemon:
                 pass
 
 
+class _BadQuery(ValueError):
+    """A malformed query-string value: answered with HTTP 400 instead of dropping the connection."""
+
+
+def _qs_int(qs: Mapping[str, List[str]], key: str, default: int) -> int:
+    raw = (qs.get(key) or [str(default)])[0]
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise _BadQuery(f"查询参数 {key} 必须是整数") from None
+
+
 def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8780) -> ThreadingHTTPServer:
     check_bind(host, daemon.env)
     policy = AuthPolicy(daemon.env)
@@ -2440,6 +2624,12 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
             return True
 
         def do_GET(self) -> None:
+            try:
+                self._do_get()
+            except _BadQuery as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+        def _do_get(self) -> None:
             parsed = urlparse(self.path)
             if not self._pre(False):
                 return
@@ -2529,10 +2719,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 if not self._need(parsed, "owner"):
                     return
                 qs = parse_qs(parsed.query)
-                try:
-                    lim = int((qs.get("limit") or ["50"])[0])
-                except (TypeError, ValueError):
-                    lim = 50
+                lim = _qs_int(qs, "limit", 50)
                 self._send_json(daemon.get_outbox_view(limit=lim))
                 return
             if parsed.path == "/api/backups":
@@ -2549,14 +2736,8 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 if not self._need(parsed, "read"):
                     return
                 qs = parse_qs(parsed.query)
-                try:
-                    days = int((qs.get("days") or ["7"])[0])
-                except (TypeError, ValueError):
-                    days = 7
-                try:
-                    recent_limit = int((qs.get("recent_limit") or ["30"])[0])
-                except (TypeError, ValueError):
-                    recent_limit = 30
+                days = _qs_int(qs, "days", 7)
+                recent_limit = _qs_int(qs, "recent_limit", 30)
                 period = (qs.get("period") or [None])[0]
                 self._send_json(daemon.get_usage_summary(days=days, period=period, recent_limit=recent_limit))
                 return
@@ -2620,10 +2801,10 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 act = (qs.get("actor") or [None])[0]
                 ch = (qs.get("channel") or [""])[0].strip()
                 kind = (qs.get("kind") or [None])[0]
-                lim = int((qs.get("limit") or ["50"])[0])
                 need_tier = "read" if (sc in ("world", "group") and ch.lower() in ("", "group")) else "private"
                 if not self._need(parsed, need_tier):
                     return
+                lim = _qs_int(qs, "limit", 50)
                 try:
                     items = daemon.list_memories(actor=act, scope=sc, channel=ch, kind=kind, limit=lim)
                     self._send_json({"ok": True, "scope": sc, "memories": items})
@@ -2638,18 +2819,19 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 qs = parse_qs(parsed.query)
                 act = (qs.get("actor") or [None])[0]
-                lim = int((qs.get("limit") or ["20"])[0])
-                self._send_json({"ok": True, "diaries": daemon.list_diaries_view(actor=act, limit=lim)})
+                lim = _qs_int(qs, "limit", 20)
+                inline = (qs.get("inline") or ["0"])[0].strip() == "1"  # off by default, same as /api/album
+                self._send_json({"ok": True, "diaries": daemon.list_diaries_view(actor=act, limit=lim, inline_images=inline)})
                 return
             if parsed.path == "/api/album":
                 qs = parse_qs(parsed.query)
                 sc = (qs.get("scope") or ["world"])[0].strip().lower()
                 act = (qs.get("actor") or [None])[0]
-                lim = int((qs.get("limit") or ["24"])[0])
-                inline = (qs.get("inline") or ["1"])[0].strip() != "0"
+                inline = (qs.get("inline") or ["0"])[0].strip() == "1"  # off by default: fetch images via media_url
                 need_tier = "read" if sc == "world" else "private"
                 if not self._need(parsed, need_tier):
                     return
+                lim = _qs_int(qs, "limit", 24)
                 if daemon.needs_onboarding:
                     self._send_json({"ok": True, "enabled": False, "scope": sc, "items": []})
                     return
@@ -2707,7 +2889,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     return
                 qs = parse_qs(parsed.query)
                 act = (qs.get("actor") or [None])[0]
-                lim = int((qs.get("limit") or ["30"])[0])
+                lim = _qs_int(qs, "limit", 30)
                 st_filter = (qs.get("state") or [None])[0]
                 self._send_json({"ok": True, "intents": daemon.intents.list_intents(actor=act, limit=lim, state=st_filter)})
                 return

@@ -27,6 +27,27 @@ hello_tea = "hello_tea_plugin:PLUGIN_DEF"
   - 可额外声明 `PluginRoute`（挂载 `/api/plugins/<plugin_id>/<subpath>`）与 `PluginTask`（周期任务）；
   - 实现 `ChannelPlugin.deliver(delivery_id, payload)` 与 `lookup_delivery(delivery_id)` 即可接入 `outbox.Dispatcher` 与 `SendGate`：发前失败抛 `worldkernel.outbox.NotSent`，发送后超时或断线抛 `TimeoutError`（保持 `unknown` 待对账，不盲目重发）。
 
+### 第三方插件拿到的宿主句柄（`PluginHostProxy`）
+
+第三方（非内置）插件在 `ctx.daemon`、附件处理器、通道与 Provider 的 `host` 上拿到的是 `PluginHostProxy`，不是真实守护进程。它是 API 边界而不是沙箱（插件代码与宿主同进程），只保证公开接口不越权：
+
+- **环境变量是白名单**：`proxy.env` 只含本插件在 `ConfigField.env_var` 里声明过的变量、`TZ` / `LANG` 等语言时区变量，以及名称和取值都不像凭据的 `AI_HOUSE_*` 设置。要读哪个环境变量就先在清单里声明；宿主自己的 `AI_HOUSE_*` 密钥即使被声明也不会给。本插件自己的配置（含密钥字段）用 `proxy.config()` 读取。
+- **工厂函数和配置解析用同一份白名单**：第三方插件的 `channel_factory(env)` / `provider_factory(env=...)` / 扩展工厂收到的 `env`，以及从环境变量解析出来的配置值，都只来自上面这份白名单。清单里把 `env_var` 写成宿主的 `AI_HOUSE_API_KEY` 之类并不能拿到它。第三方插件自己的密钥请用自己的前缀命名（如 `MYPLUGIN_API_KEY`），不要放进 `AI_HOUSE_*` 命名空间；在设置页里填写的值不受这条限制。
+- **私聊范围只给通道插件**：`list_chat("private:*")`、`scope="private"` 的 `list_memories` / `list_album_view` / `album.list_items` 只对注册了 `channel_factory` 的插件开放，其它插件会收到 `PermissionError`。`converse("private:<室友>")` 要求说话人经身份库确认为房主，其它角色（含 BOT）一律拒绝。
+- **配额只用自己的**：`check_plugin_quota` / `record_plugin_call` 一律作用于代理自己的 `plugin_id`，指名别的插件会被拒绝；没有插件 id 的代理不能使用配额。`daily_limit` 不传表示默认 60，传 0 表示今日不允许调用（设置页最小值为 1）。
+- **通道发送要先判定再记账**：`authorize_send(...)` 只判定，不计数；消息真正发出后必须调用 `record_sent(delivery_id, key)`（`key` 为 `authorize_send` 的返回值，只能记到自己通道名下），每小时与每日上限才会累计，否则永远不会触发限流：
+
+```python
+from worldkernel.outbox import BlockedDelivery, NotSent
+
+try:
+    key = self.host.authorize_send(self, kind="private", target=uid, actor=actor, text=reply, delivery_id=did)
+except (BlockedDelivery, NotSent):
+    return                      # 被发送门拦下，不发
+self._send_over_the_wire(uid, reply)     # 你自己的实际发送
+self.host.record_sent(did, key)          # 发送成功后记账；发送失败则不记
+```
+
 ## 2. 访问控制
 
 宿主默认只监听 `127.0.0.1`。监听其他地址必须设置至少 16 位的 `AI_HOUSE_OWNER_TOKEN`，否则拒绝启动。网页、REST 与 `/mcp` 都验令牌，分三档：

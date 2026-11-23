@@ -18,10 +18,15 @@ import inspect
 import math
 import os
 import re
+import uuid
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from .chat_identity import Speaker, member_speaker
 
 MAX_CONFIG_FIELDS = 8
 VALID_FIELD_TYPES = ("string", "int", "float", "bool", "select", "list")
@@ -213,6 +218,7 @@ class ToolContext:
     plugin_config: Mapping[str, Any] = field(default_factory=dict)
     daemon: Any = None
     pending_media: Optional[List[Dict[str, Any]]] = None
+    attachments: Optional[Mapping[str, Any]] = None  # the current message's attachments (e.g. {"images": [...]})
 
 
 @dataclass(frozen=True)
@@ -287,66 +293,399 @@ class AttachmentProcessor:
     processor_id: str
     handler: Callable[[AttachmentContext], Sequence[str]]
     priority: int = 50
+    after_reply: bool = False  # True: run in a background job once the reply is stored (its notes are not used)
+
+
+# ---- environment view ------------------------------------------------------------------------------------------
+# A third-party plugin sees a *whitelist* of the environment: the variables its own manifest declares (`ConfigField
+# .env_var`), a few harmless locale/time ones, and `AI_HOUSE_*` settings that do not look like credentials. Everything
+# else (`HTTPS_PROXY`, cloud tokens, other plugins' settings, ...) stays hidden, so a credential with an unusual name
+# cannot slip through a deny-list. The deny-list below only decides which `AI_HOUSE_*` names / values are safe.
+_ENV_NAME_SPLIT_RE = re.compile(r"[^A-Z0-9]+")
+# a word anywhere in the (separator-free) name
+_SECRET_NAME_SUBSTRINGS = (
+    "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "PRIVATE", "COOKIE", "SIGNING", "BEARER",
+    "APIKEY", "ACCESSKEY", "PRIVKEY", "AUTHORIZ", "AUTHENTIC",
+)
+# a whole `_`-separated word (so `MAX_TOKENS`, `AUTHOR`, `PASSTHROUGH`, `KEYBOARD` are not caught)
+_SECRET_NAME_WORDS = frozenset({
+    "KEY", "KEYS", "TOKEN", "PAT", "DSN", "PASS", "PWD", "JWT", "AUTH", "OAUTH", "SESSION", "SESSIONS", "CERT", "SIG",
+    "SIGNATURE", "SID", "COOKIES", "CREDS", "CRED",
+})
+# a word ending in one of these (`GITHUBTOKEN`, `BASICAUTH`, `MONKEY` too: over-hiding is the safe direction)
+_SECRET_NAME_SUFFIXES = ("KEY", "TOKEN", "AUTH", "SECRET")
+_URL_USERINFO_RE = re.compile(r"://[^/\s?#]*@", re.I)
+_QUERY_PARAM_RE = re.compile(r"[?&;#]([^=&;#\s]+)=", re.I)
+_SECRET_VALUE_RE = re.compile(
+    r"^(?:gh[pousr]_\w{16,}|github_pat_\w{16,}|sk-[\w-]{16,}|xox[abprs]-[\w-]{10,}|AKIA[0-9A-Z]{16}"
+    r"|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]*)$"
+)
+_HARMLESS_ENV_NAMES = frozenset({"TZ", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES"})
+
+
+def _name_looks_secret(name: str) -> bool:
+    up = str(name or "").upper()
+    flat = _ENV_NAME_SPLIT_RE.sub("", up)
+    if any(w in flat for w in _SECRET_NAME_SUBSTRINGS):
+        return True
+    for word in (w for w in _ENV_NAME_SPLIT_RE.split(up) if w):
+        if word in _SECRET_NAME_WORDS or word.endswith(_SECRET_NAME_SUFFIXES):
+            return True
+    return False
+
+
+def _value_looks_secret(value: str) -> bool:
+    v = str(value or "")
+    if "-----BEGIN" in v or _URL_USERINFO_RE.search(v) or _SECRET_VALUE_RE.match(v.strip()):
+        return True
+    return any(_name_looks_secret(m.group(1)) for m in _QUERY_PARAM_RE.finditer(v))
+
+
+def env_looks_secret(name: str, value: str = "") -> bool:
+    """True when `name` / `value` look like a credential (rules above)."""
+    return _name_looks_secret(name) or _value_looks_secret(value)
+
+
+def public_env_view(env: Mapping[str, str], declared: Iterable[str] = ()) -> Mapping[str, str]:
+    """Read-only whitelist view of `env` for a third-party plugin (never the real mapping).
+
+    Visible: the names in `declared` (the plugin's own manifest `env_var`s; a declared name inside the host's
+    `AI_HOUSE_*` namespace still has to look harmless, so a manifest cannot claim the host's API key), a few
+    locale/time variables, and `AI_HOUSE_*` variables whose name and value do not look like credentials.
+    """
+    own = {str(n) for n in declared if str(n)}
+    clean: Dict[str, str] = {}
+    for k, v in (env or {}).items():
+        name, val = str(k), str(v)
+        if name.upper().startswith("AI_HOUSE_"):
+            if not env_looks_secret(name, val):
+                clean[name] = val
+        elif name in own or name in _HARMLESS_ENV_NAMES:
+            clean[name] = val
+    return MappingProxyType(clean)
+
+
+def quota_speaker_key(speaker: Any, channel: str = "") -> str:
+    """Stable per-person key for paid-plugin quotas; never the (self-chosen) display name.
+
+    Preference: the identity-store id (`visitor:<platform>:<account>`, `user:owner`, ...); else `<channel kind>:<external
+    account id>`; else the one shared `anonymous` bucket, so changing a nickname never opens a fresh budget.
+    """
+    iid = str(getattr(speaker, "identity_id", "") or "").strip()
+    if iid:
+        return iid
+    uid = str(getattr(speaker, "uid", "") or "").strip()
+    if uid:
+        kind = str(channel or "").split(":", 1)[0].strip() or "unknown"
+        return f"{kind}:{uid}"
+    return "anonymous"
+
+
+class _ClockView:
+    """Read-only window onto the daemon clock (a virtual clock must not be advanced by plugins)."""
+
+    __slots__ = ("now",)
+
+    def __init__(self, clock: Any) -> None:
+        self.now = lambda: float(clock.now())  # type: ignore[assignment]
+
+
+class _GuardView:
+    """Only `check()` of the reply guard; the guard object itself keeps every configured secret in plain attributes."""
+
+    __slots__ = ("check",)
+
+    def __init__(self, guard: Any) -> None:
+        self.check = lambda channel, text: guard.check(channel, text)  # type: ignore[assignment]
+
+
+class _AlbumReadView:
+    """Read-only album access: list / fetch items. Nothing that writes, resets or reveals file paths.
+
+    Private-scope items are only visible when `allow_private` (the plugin registered a channel)."""
+
+    __slots__ = ("list_items", "get_item", "get_by_media_rel")
+
+    def __init__(self, album: Any, allow_private: bool = False) -> None:
+        def _visible(item: Any) -> Any:
+            if item is not None and not allow_private and str((item or {}).get("scope") or "").lower() == "private":
+                return None
+            return item
+
+        def list_items(**kw: Any) -> Any:
+            if not allow_private and str(kw.get("scope") or "world").strip().lower() == "private":
+                raise PermissionError("私聊相册只有注册了通道的插件可以经宿主代理读取")
+            return album.list_items(**kw)
+
+        self.list_items = list_items  # type: ignore[assignment]
+        self.get_item = lambda album_id, **kw: _visible(album.get_item(album_id, **kw))  # type: ignore[assignment]
+        self.get_by_media_rel = lambda media_rel, **kw: _visible(album.get_by_media_rel(media_rel, **kw))  # type: ignore[assignment]
+
+
+def _is_private_room(channel: Any) -> bool:
+    return str(channel or "").strip().lower().startswith("private:")
+
+
+_PROXY_STATE: "weakref.WeakKeyDictionary[Any, Tuple[Any, str]]" = weakref.WeakKeyDictionary()
+
+
+def _dm(proxy: Any) -> Any:
+    return _PROXY_STATE[proxy][0]
+
+
+def _pidm(proxy: Any) -> str:
+    return _PROXY_STATE[proxy][1]
 
 
 class PluginHostProxy:
-    """Read-safe daemon façade exposed to third-party plugins so single-writer kernel DBs stay protected."""
+    """Narrow, explicit daemon façade handed to non-builtin (third-party) plugins.
 
-    def __init__(self, daemon: Any) -> None:
-        self._daemon = daemon
+    Everything a plugin can do is a method or property defined below; there is no attribute forwarding.
+
+    * Read-only world access: `get_state`, `list_memories`, `list_chat`, `list_album_view`, `album`, `clock`, `vocab`.
+      Private-room data (`private:*` chat, `private`-scope memories and album items) is only readable by a plugin
+      that registered a channel (it carries those rooms anyway); any other plugin gets `PermissionError`.
+    * Own configuration only: `config()` resolves just the fields declared in this plugin's manifest;
+      `env` is a whitelist view: the variables this plugin declares via `ConfigField.env_var`, locale/time basics
+      and non-secret `AI_HOUSE_*` settings (see `public_env_view`). Declare what you need; nothing else is visible.
+    * Own files only: `plugin_dir` is a private directory under the runtime dir (inbound caches, cursors, ...).
+    * Channels: `resolve_speaker`, `converse` (private rooms: owner only), `authorize_send` (judge only) followed by
+      `record_sent` once the message is really out (that is what fills the hourly / daily caps).
+    * Paid-plugin quota: `check_plugin_quota`, `record_plugin_call`; always this plugin's own bucket.
+
+    Honest limits: this is an API boundary, not a sandbox. Third-party code runs inside the daemon process and
+    can still reach the real daemon through the interpreter (frames, `gc`, this module's private state table,
+    closures). No attribute of a proxy instance refers to the real daemon (it lives in a private weak table of
+    this module), and secret-bearing objects (the reply guard, the album store, the environment) are only handed
+    out as filtered views, to keep honest plugins honest and accidents out. Only install plugins you trust.
+    """
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, daemon: Any, plugin_id: str = "") -> None:
+        _PROXY_STATE[self] = (daemon, str(plugin_id or "").strip())
+
+    # ---- identity / files / config ---------------------------------------------------------------------------
+    @property
+    def plugin_id(self) -> str:
+        return _pidm(self)
 
     @property
     def runtime_dir(self) -> Path:
-        return Path(self._daemon.runtime_dir)
+        return Path(_dm(self).runtime_dir)
+
+    @property
+    def plugin_dir(self) -> Path:
+        """Private per-plugin directory (`<runtime>/plugins/<plugin_id>`), created on first use."""
+        if not _pidm(self):
+            raise RuntimeError("plugin_dir needs a proxy that knows its plugin id")
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _pidm(self)).strip(".") or "plugin"
+        path = Path(_dm(self).runtime_dir) / "plugins" / safe
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _declared_env_vars(self) -> List[str]:
+        reg = getattr(_dm(self), "registry", None)
+        defn = getattr(reg, "definitions", {}).get(_pidm(self)) if (reg is not None and _pidm(self)) else None
+        if defn is None:
+            return []
+        return [f.env_var for f in defn.manifest.config_fields if f.env_var]
+
+    def _carries_channel(self) -> bool:
+        """True for a plugin that registered a chat channel: it already carries the private rooms it serves."""
+        reg = getattr(_dm(self), "registry", None)
+        defn = getattr(reg, "definitions", {}).get(_pidm(self)) if (reg is not None and _pidm(self)) else None
+        return defn is not None and defn.channel_factory is not None
+
+    def _require_private_access(self, what: str) -> None:
+        if not self._carries_channel():
+            raise PermissionError(f"{what}属于私聊范围，只有注册了通道的插件可以经宿主代理读取")
 
     @property
     def env(self) -> Mapping[str, str]:
-        return dict(getattr(self._daemon, "env", {}) or {})
+        """Whitelist view: this plugin's declared `env_var`s, locale/time basics and non-secret `AI_HOUSE_*`."""
+        return public_env_view(getattr(_dm(self), "env", {}) or {}, declared=self._declared_env_vars())
 
+    def config(self) -> Mapping[str, Any]:
+        """This plugin's own resolved settings (only manifest-declared fields), read-only."""
+        d = _dm(self)
+        if not _pidm(self) or getattr(d, "registry", None) is None:
+            return MappingProxyType({})
+        store = getattr(d, "settings_store", None)
+        stored = store.get_plugins_map() if store is not None else {}
+        cfg, _warnings = d.registry.safe_resolve_config(_pidm(self), env=d.env, stored_plugins=stored)
+        return MappingProxyType(dict(cfg))
+
+    # ---- read-only views --------------------------------------------------------------------------------------
     @property
     def clock(self) -> Any:
-        return getattr(self._daemon, "clock", None)
+        c = getattr(_dm(self), "clock", None)
+        return _ClockView(c) if c is not None else None
 
     @property
     def vocab(self) -> Any:
-        return getattr(self._daemon, "vocab", None)
+        return getattr(_dm(self), "vocab", None)
 
     @property
     def guard(self) -> Any:
-        return getattr(self._daemon, "guard", None)
+        g = getattr(_dm(self), "guard", None)
+        return _GuardView(g) if g is not None else None
 
     @property
     def album(self) -> Any:
-        return getattr(self._daemon, "album", None)
+        a = getattr(_dm(self), "album", None)
+        return _AlbumReadView(a, allow_private=self._carries_channel()) if a is not None else None
 
     def log(self, msg: str) -> None:
-        self._daemon.log(msg)
+        _dm(self).log(msg)
 
     def get_state(self) -> Dict[str, Any]:
-        return self._daemon.get_state()
+        return _dm(self).get_state()
 
     def list_memories(self, **kwargs: Any) -> List[Dict[str, Any]]:
-        return self._daemon.list_memories(**kwargs)
+        scope = str(kwargs.get("scope") or "world").strip().lower()
+        if scope == "private" or str(kwargs.get("channel") or "").strip().lower().startswith("private:"):
+            self._require_private_access("私聊记忆")
+        return _dm(self).list_memories(**kwargs)
 
     def list_chat(self, channel: str = "group", limit: int = 50) -> List[Dict[str, Any]]:
-        return self._daemon.list_chat(channel, limit=limit)
+        if _is_private_room(channel):
+            self._require_private_access("私聊记录")
+        return _dm(self).list_chat(channel, limit=limit)
 
     def list_album_view(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._daemon.list_album_view(**kwargs)
+        if str(kwargs.get("scope") or "world").strip().lower() == "private":
+            self._require_private_access("私聊相册")
+        return _dm(self).list_album_view(**kwargs)
 
     def get_usage_summary(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._daemon.get_usage_summary(**kwargs)
+        return _dm(self).get_usage_summary(**kwargs)
 
-    def check_plugin_quota(self, plugin_id: str, **kwargs: Any) -> Optional[str]:
-        router = getattr(self._daemon, "model_router", None)
+    # ---- channel surface (what the built-in OneBot channel needs from its host) -------------------------------
+    def resolve_speaker(self, external_id: str, *, fallback_name: str = "") -> Speaker:
+        """Who is `external_id` on this channel's own platform (the plugin id)?
+
+        The platform is fixed to this plugin's id and a channel cannot declare anyone an owner: the house owner
+        links an account to the owner identity themselves (identity `bind`, platform = plugin id).
+        Unknown accounts become `visitor:<plugin id>:<external id>` members.
+        """
+        if not _pidm(self):
+            raise RuntimeError("resolve_speaker needs a proxy that knows its plugin id")
+        store = getattr(_dm(self), "identity_store", None)
+        ext = str(external_id or "").strip()
+        if store is None:
+            return member_speaker(fallback_name or "群友", uid=ext)
+        return store.resolve_speaker(_pidm(self), ext, fallback_name=fallback_name, default_owner=False)
+
+    def _vetted_speaker(self, speaker: Speaker) -> Speaker:
+        """Re-derive the role from the identity store: a channel can only lower, never raise, a speaker's trust."""
+        if speaker.is_bot:
+            return speaker
+        uid = str(getattr(speaker, "uid", "") or "").strip()
+        store = getattr(_dm(self), "identity_store", None)
+        if store is None or not _pidm(self) or not uid:
+            return member_speaker(speaker.name, uid=uid)
+        return store.resolve_speaker(_pidm(self), uid, fallback_name=speaker.name, default_owner=False)
+
+    def converse(
+        self,
+        channel: str,
+        text: str,
+        speaker: Speaker,
+        *,
+        actor: Optional[str] = None,
+        attachments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Deliver one inbound message and get the roommates' replies (`HouseDaemon.converse`).
+
+        The speaker is re-vetted (see `_vetted_speaker`); `private:<actor>` rooms are owner-only: any other role,
+        bots included, is refused (the daemon hands the room's history back to an ignored bot speaker).
+        """
+        vetted = self._vetted_speaker(speaker)
+        if _is_private_room(channel) and not vetted.is_owner:
+            raise PermissionError("私聊仅限房主身份")
+        return _dm(self).converse(channel, text, vetted, actor=actor, attachments=attachments)
+
+    def authorize_send(
+        self,
+        channel_plugin: Any,
+        *,
+        kind: str,
+        target: str,
+        actor: str,
+        text: str,
+        delivery_id: str = "",
+    ) -> str:
+        """Ask the daemon's SendGate for permission to send `text` out on this channel.
+
+        Raises `worldkernel.outbox.BlockedDelivery` / `NotSent` when the gate refuses (guard, leak check, caps).
+        Call it right before the wire send; the channel id is always this plugin's id. It only *judges*: nothing is
+        charged until the message really went out and you call `record_sent` with the key returned here, otherwise
+        the hourly / daily caps never fill up.
+        """
+        gate = getattr(_dm(self), "send_gate", None)
+        if gate is None:
+            raise RuntimeError("send gate unavailable")
+        return gate.authorize_direct_send(
+            self._channel_id(channel_plugin),
+            channel_plugin,
+            kind=kind,
+            target=str(target),
+            actor=actor,
+            text=text,
+            delivery_id=delivery_id,
+        )
+
+    def _channel_id(self, channel_plugin: Any = None) -> str:
+        return _pidm(self) or str(getattr(channel_plugin, "channel_id", "") or "")
+
+    def record_sent(self, delivery_id: str, charge_key: str) -> bool:
+        """Charge one reply against the send caps, after `authorize_send` allowed it and the wire send succeeded.
+
+        `charge_key` is the string `authorize_send` returned; it must belong to this plugin's own channel (a plugin
+        cannot spend another channel's budget). Recording the same non-empty `delivery_id` twice is a no-op (returns
+        False); an empty `delivery_id` is replaced by a fresh one, so every call counts as one send.
+        """
+        gate = getattr(_dm(self), "send_gate", None)
+        if gate is None:
+            raise RuntimeError("send gate unavailable")
+        cid = _pidm(self)
+        key = str(charge_key or "")
+        if not cid or not key.startswith(f"direct:{cid}:"):
+            raise PermissionError("record_sent 只能给本插件自己的通道记账")
+        did = str(delivery_id or "").strip() or f"{cid}-sent-{uuid.uuid4().hex}"
+        return bool(gate.record_direct_sent(did, key))
+
+    # ---- paid-plugin quota (always this plugin's own bucket) ---------------------------------------------------
+    def _own_quota_id(self, plugin_id: str) -> str:
+        own = _pidm(self)
+        if not own:
+            raise PermissionError("没有插件身份的宿主代理不能使用配额")
+        wanted = str(plugin_id or "").strip()
+        if wanted and wanted != own:
+            raise PermissionError("插件只能使用自己的配额")
+        return own
+
+    def check_plugin_quota(self, plugin_id: str = "", **kwargs: Any) -> Optional[str]:
+        """Reserve one slot of THIS plugin's quota (see `ModelRouter.check_plugin_quota`).
+
+        `plugin_id` may be omitted; naming another plugin is refused with a reason string (so callers treat it as
+        "quota exceeded") and never touches that plugin's counters."""
+        try:
+            own = self._own_quota_id(plugin_id)
+        except PermissionError as exc:
+            return str(exc)
+        router = getattr(_dm(self), "model_router", None)
         if router is not None and hasattr(router, "check_plugin_quota"):
-            return router.check_plugin_quota(plugin_id, **kwargs)
+            return router.check_plugin_quota(own, **kwargs)
         return None
 
-    def record_plugin_call(self, plugin_id: str, **kwargs: Any) -> None:
-        router = getattr(self._daemon, "model_router", None)
+    def record_plugin_call(self, plugin_id: str = "", **kwargs: Any) -> None:
+        """Settle the slot reserved by `check_plugin_quota`; only for this plugin's own id (else `PermissionError`)."""
+        own = self._own_quota_id(plugin_id)
+        router = getattr(_dm(self), "model_router", None)
         if router is not None and hasattr(router, "record_plugin_call"):
-            router.record_plugin_call(plugin_id, **kwargs)
+            router.record_plugin_call(own, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -578,6 +917,18 @@ def merged_plugin_env(
         else:
             eff[fld.env_var] = str(raw)
     return eff
+
+
+def plugin_visible_env(defn: PluginDefinition, env: Mapping[str, str]) -> Mapping[str, str]:
+    """The environment a plugin's own code and config resolution may see.
+
+    Built-in plugins see everything. A third-party plugin sees the same whitelist as `PluginHostProxy.env`
+    (`public_env_view`): otherwise its factory would be handed the host's API keys directly, and a manifest could
+    alias a host secret into its own config with `ConfigField(env_var="AI_HOUSE_API_KEY")`.
+    """
+    if defn.source == "builtin":
+        return env
+    return public_env_view(env, declared=[f.env_var for f in defn.manifest.config_fields if f.env_var])
 
 
 def is_plugin_enabled(
@@ -876,7 +1227,8 @@ class PluginRegistry:
             if isinstance(stored_plugins, Mapping) and isinstance(stored_plugins.get(plugin_id), Mapping)
             else None
         )
-        return resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
+        eff = os.environ if env is None else env
+        return resolve_plugin_config(defn.manifest, env=plugin_visible_env(defn, eff), stored_values=stored_vals)
 
     def safe_resolve_config(
         self,
@@ -892,7 +1244,8 @@ class PluginRegistry:
             if isinstance(stored_plugins, Mapping) and isinstance(stored_plugins.get(plugin_id), Mapping)
             else None
         )
-        return safe_resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
+        eff = os.environ if env is None else env
+        return safe_resolve_plugin_config(defn.manifest, env=plugin_visible_env(defn, eff), stored_values=stored_vals)
 
     def active_extension_specs(
         self,
@@ -908,7 +1261,7 @@ class PluginRegistry:
             if not is_plugin_enabled(defn, env=eff, stored_plugins=stored_plugins):
                 continue
             seen.add(defn.plugin_id)
-            plugin_env = merged_plugin_env(defn, eff, stored_plugins)
+            plugin_env = dict(plugin_visible_env(defn, merged_plugin_env(defn, eff, stored_plugins)))
             factory = defn.extension_factory
             out.append((
                 defn.plugin_id,
@@ -979,7 +1332,7 @@ class PluginRegistry:
                 continue
             if not is_plugin_enabled(defn, env=eff, stored_plugins=stored_plugins):
                 continue
-            plugin_env = merged_plugin_env(defn, eff, stored_plugins)
+            plugin_env = dict(plugin_visible_env(defn, merged_plugin_env(defn, eff, stored_plugins)))
             factory = defn.channel_factory
             out.append((
                 defn.plugin_id,
@@ -999,7 +1352,7 @@ class PluginRegistry:
                 continue
             if not is_plugin_enabled(defn, env=eff, stored_plugins=stored_plugins):
                 continue
-            plugin_env = merged_plugin_env(defn, eff, stored_plugins)
+            plugin_env = dict(plugin_visible_env(defn, merged_plugin_env(defn, eff, stored_plugins)))
             try:
                 inst = defn.provider_factory(env=plugin_env) if _accepts_env(defn.provider_factory) else defn.provider_factory()
                 if inst is not None:

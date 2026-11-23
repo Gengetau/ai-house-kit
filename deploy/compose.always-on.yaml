@@ -1,0 +1,10 @@
+# 后台常驻：宿主机或 Docker 重启后自动拉起小屋；只有你手动 `docker compose stop` 才会一直停着。
+#
+#   docker compose -f compose.yaml -f deploy/compose.always-on.yaml up -d
+#
+# 默认的 compose.yaml 用的是 on-failure:5（配置写错时不会无限重启）。先用默认方式确认能正常启动，再叠加这个文件。
+services:
+  ai-house:
+    restart: unless-stopped
+    # `docker compose stop` 发 SIGTERM；给小屋留出保存状态的时间
+    stop_grace_period: 30s

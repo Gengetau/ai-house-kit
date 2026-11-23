@@ -249,6 +249,9 @@ export async function render(view){
       fieldNodes.length ? el('div', {class: 'stack'}, fieldNodes) : el('p', {class: 'tiny muted'}, '该插件无需额外配置项。'),
       plug.missing_packages?.length ? el('p', {class: 'tiny', style: 'color:var(--honey-ink)'}, `缺少可选依赖包：${plug.missing_packages.join(', ')}`) : null,
       plug.error ? el('div', {class: 'err'}, icon('alert'), ' 最近错误：' + plug.error) : null,
+      plug.config_warnings?.length ? el('div', {class: 'small', role: 'status', style: 'color:var(--honey-ink)'},
+        icon('alert'), ' 配置提示：',
+        el('ul', {style: 'margin:4px 0 0 18px'}, plug.config_warnings.map(w => el('li', {}, String(w))))) : null,
       el('div', {class: 'row between wrap', style: 'gap:8px;align-items:center'}, statusLive, saveBtn));
     validator = wireFormValidation(form);
 

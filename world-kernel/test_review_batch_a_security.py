@@ -176,6 +176,7 @@ class ReviewBatchASecurityTests(unittest.TestCase):
         priv_mem_id, _ = d.memory.add("sora", "private", "秘密暗门在书柜后面", kind="fact", source="chat", now=t0)
         d.send_chat("private:sora", "苍空看下私聊照片", attachments={"images": [TINY_DATA_URI]})
         d.send_chat("private:rin", "凛音私聊照片", attachments={"images": [TINY_DATA_URI]})
+        self.assertTrue(d.drain_post_reply_jobs(5.0))  # chat photos are archived after the reply
         sora_priv = d.album.list_items(scope="private", actor="sora")[0]
         rin_priv = d.album.list_items(scope="private", actor="rin")[0]
         priv_gen = generate_image_asset("私密插画", scope="private", actor="sora", cfg={"engine": "openai", "base_url": mock_srv.base_url, "api_key": "sk-imggen-key-0001"}, daemon=d)

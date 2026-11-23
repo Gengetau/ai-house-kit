@@ -1,0 +1,51 @@
+# AI House Kit 后台常驻（systemd 系统服务）。用法见 docs/DEPLOY.md。
+#
+# 约定：
+#   - 程序装在 /opt/ai-house-kit/.venv（不要装在 /home 下，下面的 ProtectHome 会挡住）
+#   - 所有会变的东西都在 /var/lib/ai-house：.env、runtime/（数据库与媒体）、packs/（自定义世界包）
+#   - 以专用的无登录用户 aihouse 运行
+#
+# 路径或用户名不一样时，改 User / WorkingDirectory / ExecStart 三处即可。
+
+[Unit]
+Description=AI House Kit
+Documentation=https://github.com/Gengetau/ai-house-kit
+After=network-online.target
+Wants=network-online.target
+# 5 分钟内连续失败 5 次就停下来，不无限重启
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aihouse
+Group=aihouse
+# 由 systemd 创建并归 aihouse 所有的 /var/lib/ai-house（0700）
+StateDirectory=ai-house
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/ai-house
+ExecStart=/opt/ai-house-kit/.venv/bin/ai-house up --env-file /var/lib/ai-house/.env --data-dir /var/lib/ai-house/runtime --packs-root /var/lib/ai-house/packs
+# 收到 SIGTERM 会保存状态、关闭通道并释放运行锁后退出
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+# 退出码 2 = 配置有问题（令牌、端口、QQ 接入配置、已有实例在运行）：重启也没用，等人来改
+RestartPreventExitStatus=2
+UMask=0077
+
+# 收紧权限：只有 /var/lib/ai-house 可写
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

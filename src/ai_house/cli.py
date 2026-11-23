@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import sqlite3
 import sys
 from pathlib import Path
@@ -17,10 +18,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from worldkernel import vocab_life1
 
 from .auth import BindRefused, check_bind
-from .backup import create_backup, restore_backup, verify_backup
+from .backup import BackupVersionError, DaemonRunningError, create_backup, restore_backup, verify_backup
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, mask_secrets, openai_compatible_chat
-from .daemon import HouseDaemon, make_http_server
+from .daemon import DaemonLockError, HouseDaemon, make_http_server
 from .plugin_api import PluginRegistry
 
 
@@ -89,6 +90,9 @@ def cmd_up(args: argparse.Namespace) -> int:
     except ChannelConfigError as exc:
         print(f"[ai-house] QQ 接入配置有问题，没有启动：{exc}", file=sys.stderr, flush=True)
         return 2
+    except DaemonLockError as exc:
+        print(f"[ai-house] 没有启动：{exc}", file=sys.stderr, flush=True)
+        return 2
     try:
         srv = make_http_server(daemon, host=host, port=port)
     except OSError as exc:
@@ -126,6 +130,15 @@ def cmd_up(args: argparse.Namespace) -> int:
         f"   • 模型模式: {mode_label}\n",
         flush=True,
     )
+    # `systemctl stop` / `docker stop` send SIGTERM: leave through the same path as Ctrl+C so the channels are
+    # closed, the databases are checkpointed and the runtime lock is released.
+    def _on_sigterm(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):  # not the main thread (tests embedding cmd_up), or unsupported
+        pass
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -301,6 +314,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         })
 
     ws_url = eff_env.get("ONEBOT_WS_URL", "").strip()
+    onebot_ping = bool(getattr(args, "onebot_ping", False))
     if ws_url:
         ob_errs = []
         from urllib.parse import urlparse
@@ -324,8 +338,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks.append({
             "name": "onebot_ws",
             "ok": len(ob_errs) == 0,
-            "detail": "; ".join(ob_errs) if ob_errs else "OneBot v11 WebSocket 配置与依赖就绪",
+            "detail": "; ".join(ob_errs) if ob_errs else (
+                "OneBot v11 WebSocket 配置与依赖就绪" + ("" if onebot_ping else "（加 --onebot-ping 可实际连一次协议端）")
+            ),
         })
+        if onebot_ping and not ob_errs:
+            from .onebot_probe import probe_onebot
+
+            res = probe_onebot(ws_url, eff_env.get("ONEBOT_ACCESS_TOKEN", ""), owner_ids=owner_parts)
+            checks.append({"name": "onebot_live_ping", "ok": bool(res["ok"]), "detail": res["detail"]})
+    elif onebot_ping:
+        checks.append({"name": "onebot_live_ping", "ok": False, "detail": "指定了 --onebot-ping 但未配置 ONEBOT_WS_URL"})
 
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -429,6 +452,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
                 out_dir=args.out_dir,
                 keep_count=args.keep_count,
                 keep_days=args.keep_days,
+                size_warn_bytes=(int(args.warn_size_mb * 1048576) if args.warn_size_mb is not None else None),
             )
     except Exception as exc:  # noqa: BLE001
         if args.json:
@@ -442,6 +466,10 @@ def cmd_backup(args: argparse.Namespace) -> int:
         print(f"✅ 备份校验通过：{res['archive']}（{res['verified_files']} 个文件，{len(res['dbs'])} 个 SQLite 库）")
     else:
         print(f"✅ 在线备份完成：{res['archive']}（{res['files']} 个文件，大小 {res['size']} 字节）")
+        if res.get("secrets_redacted"):
+            print("   提示：归档内 JSON 中的密钥/令牌/口令/Webhook 等字段已脱敏（置空），恢复后需按提示重新填写；.env 不在备份内。")
+        for w in res.get("warnings") or []:
+            print(f"   注意：{w}")
     return 0
 
 
@@ -449,7 +477,25 @@ def cmd_restore(args: argparse.Namespace) -> int:
     _load_dotenv(args.env_file)
     data_dir = args.data_dir or os.environ.get("AI_HOUSE_DATA_DIR") or "./runtime"
     try:
-        res = restore_backup(args.archive, data_dir, overwrite=bool(args.overwrite))
+        res = restore_backup(args.archive, data_dir, overwrite=bool(args.overwrite), force=bool(args.force))
+    except DaemonRunningError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(
+                f"[ai-house] 恢复已拒绝：{exc}。\n"
+                "  请先停止守护进程（前台运行按 Ctrl+C；容器 `docker stop`；systemd `systemctl stop`），"
+                "确认进程退出后重试。本次未做任何改动。",
+                file=sys.stderr,
+                flush=True,
+            )
+        return 2
+    except BackupVersionError as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"[ai-house] 恢复已拒绝：{exc}。本次未做任何改动。", file=sys.stderr, flush=True)
+        return 2
     except Exception as exc:  # noqa: BLE001
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
@@ -460,6 +506,16 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(json.dumps(res, ensure_ascii=False, indent=2))
     else:
         print(f"✅ 备份恢复完成：{res['target_dir']}（已恢复 {res['restored_files']} 个文件，{len(res['dbs'])} 个数据库）")
+        for w in res.get("warnings") or []:
+            print(f"   注意：{w}")
+        missing = res.get("secrets_missing") or []
+        if missing:
+            print("⚠️ 以下密钥需要重新填写（备份不含密钥明文，目标目录也没有现有值）：")
+            for item in missing:
+                print(f"   - {item}")
+            print("   可在工作台「设置」中填写，或编辑对应 JSON 文件；.env 不在备份内，如目标目录没有 .env 也请重新配置。")
+        elif res.get("secrets_redacted"):
+            print("   已保留目标目录中现有的密钥；无需重新填写。")
     return 0
 
 
@@ -498,6 +554,10 @@ def main(argv: list[str] | None = None) -> int:
     p_doc.add_argument("--pack", default=None, help="指定待校验的 WorldPack 名称或路径")
     p_doc.add_argument("--json", action="store_true", help="以 JSON 格式输出完整自检报告")
     p_doc.add_argument("--live-ping", action="store_true", help="向当前配置的 OpenAI 兼容接口发起真实连通性测试")
+    p_doc.add_argument(
+        "--onebot-ping", action="store_true",
+        help="实际连一次 ONEBOT_WS_URL 指向的 OneBot 协议端，检查令牌和登录状态（不发任何消息）",
+    )
     p_doc.set_defaults(func=cmd_doctor)
 
     p_pl = sub.add_parser("plugins", help="列出已发现的四轴插件与世界内容包")
@@ -508,21 +568,41 @@ def main(argv: list[str] | None = None) -> int:
     p_pk.add_argument("pack", help="WorldPack 目录路径或内置名称（如 life1、indie-studio-3）")
     p_pk.set_defaults(func=cmd_pack_check)
 
-    p_bk = sub.add_parser("backup", help="对运行时 SQLite 与状态配置执行在线热备或 SHA-256 校验")
+    p_bk = sub.add_parser(
+        "backup",
+        help="对运行时 SQLite 与状态配置执行在线热备或 SHA-256 校验",
+        description=(
+            "对运行时 SQLite 与状态配置执行在线热备（或用 --verify 校验已有归档）。"
+            "归档内所有 JSON 文件会按键名脱敏：键名含 key/token/secret/password/auth/cookie/webhook 的值，"
+            "以及 URL 中的 user:pass@ 与 ?token=/?key= 参数都会被置空，因此归档不含密钥明文；.env 不会被备份。"
+            "恢复后这些字段需要重新填写（若目标目录已有值则会保留）。"
+        ),
+    )
     p_bk.add_argument("--env-file", default=".env", help="启动配置 .env 路径（用于读取 AI_HOUSE_DATA_DIR）")
     p_bk.add_argument("--data-dir", default=None, help="运行时数据目录（默认读取 AI_HOUSE_DATA_DIR 或 ./runtime）")
     p_bk.add_argument("--out-dir", default=None, help="备份输出目录（默认为 <data-dir>/backups）")
     p_bk.add_argument("--keep-count", type=int, default=10, help="最多保留备份份数（默认 10）")
     p_bk.add_argument("--keep-days", type=int, default=14, help="最多保留备份天数（默认 14）")
+    p_bk.add_argument("--warn-size-mb", type=float, default=None, help="归档超过该体积(MiB)时给出体积提示，不拒绝备份（默认 512，或环境变量 AI_HOUSE_BACKUP_WARN_MB）")
     p_bk.add_argument("--verify", default=None, help="校验指定备份归档 (.tar.gz) 而不创建新备份")
     p_bk.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
     p_bk.set_defaults(func=cmd_backup)
 
-    p_rs = sub.add_parser("restore", help="在停止守护进程后，校验并原子恢复备份归档到运行目录")
+    p_rs = sub.add_parser(
+        "restore",
+        help="在停止守护进程后，校验并原子恢复备份归档到运行目录",
+        description=(
+            "校验并原子恢复备份归档到运行目录；守护进程仍在运行时会拒绝执行（请先停止服务），失败会自动回滚。"
+            "备份归档中的密钥已脱敏：恢复时，目标目录现有文件里已有值的密钥字段会被保留（按字段合并），"
+            "没有现有值的会在结束时列出“以下密钥需要重新填写”（只列字段路径，不显示任何密钥值）。"
+            "由更新版本创建的归档会被拒绝，需升级程序（或显式 --force）；没有 version 的旧归档可恢复但会给出提示。"
+        ),
+    )
     p_rs.add_argument("archive", help="待恢复的备份归档路径 (.tar.gz)")
     p_rs.add_argument("--env-file", default=".env", help="启动配置 .env 路径（用于读取 AI_HOUSE_DATA_DIR）")
     p_rs.add_argument("--data-dir", default=None, help="目标运行时数据目录（默认读取 AI_HOUSE_DATA_DIR 或 ./runtime）")
     p_rs.add_argument("--overwrite", action="store_true", help="覆盖目标运行目录中已有的数据库与状态文件")
+    p_rs.add_argument("--force", action="store_true", help="即使归档由更新版本创建也强制恢复（可能不兼容，不推荐）")
     p_rs.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
     p_rs.set_defaults(func=cmd_restore)
 

@@ -28,6 +28,12 @@ STALE = ("stale_generation", "stale_version", "resource_unavailable", "resource_
 PLAN_TTL_S = 24 * 3600
 
 
+def _never_sent(exc):
+    """True when the model layer says no request left the process (`request_sent` is exactly False, as on a
+    LLMDeadlineError raised before anything was sent). Any other failure may have been billed."""
+    return getattr(exc, "request_sent", None) is False
+
+
 class FakeModel:
     """script(context) -> {"steps": [...], "latency": seconds, "tokens": n} or raises."""
 
@@ -169,7 +175,9 @@ class Cognition:
 
     # ------------------------------------------------------------------ decide
     def begin(self, actor_id, kind, retries=0):
-        """Start one decision. Returns "asked" or "degraded" (no budget: the caller falls back to L0)."""
+        """Start one decision. Returns "asked", "degraded" (no budget: the caller falls back to L0),
+        "failed" (the model answered badly or failed after being asked: the call stays counted) or "not_called"
+        (the model was never reached: the unit is released and the next step simply asks again)."""
         with self.s.tx() as db:
             if not self.k.city_visits.home_allowed(actor_id):
                 return "degraded"
@@ -193,7 +201,13 @@ class Cognition:
         try:  # outside any transaction
             ans = self._answer(self.model(ctx))
             job["answer"], job["due"] = ans, self.s.clock.now() + float(ans.get("latency", 0))
-        except Exception as e:  # unknown cost: keep counting it
+        except Exception as e:
+            if _never_sent(e):  # the endpoint was never asked (e.g. a spent deadline): not a bad answer, not billed
+                self.budget.release(rid)
+                self._request(rid, actor_id, 'decide', 'released', job)
+                self._point(actor_id, kind, f"model_not_called:{type(e).__name__}", "not_called")
+                return "not_called"
+            # unknown cost: keep counting it
             self.budget.unknown(rid, type(e).__name__)
             self._request(rid, actor_id, 'decide', 'unknown', job)
             self._point(actor_id, kind, f"model_error:{type(e).__name__}", "failed")
@@ -390,6 +404,11 @@ class Cognition:
         try:
             ans = self.model(dict(ctx, purpose="express", to=to, about=about))
         except Exception as e:
+            if _never_sent(e):  # not asked: release the unit and let a later attempt write the line
+                self.budget.release(rid)
+                with self.s.tx() as db:
+                    db.execute('DELETE FROM cognition_requests WHERE request_id=?', (key,))
+                return {"refused": f"model_not_called:{type(e).__name__}"}
             self.budget.unknown(rid, type(e).__name__)
             self._request(key, actor, 'express', 'unknown', {'reservation': rid})
             return {"refused": f"model_error:{type(e).__name__}"}

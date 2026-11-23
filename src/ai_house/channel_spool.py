@@ -35,106 +35,198 @@ CREATE TABLE IF NOT EXISTS inbound_spool (
     attempts INTEGER NOT NULL DEFAULT 0,
     reply_bubbles_json TEXT NOT NULL DEFAULT '[]',
     sent_parts INTEGER NOT NULL DEFAULT 0,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_spool_state ON inbound_spool(state, kind, spool_id);
 """
 
-_PARA_SPLIT_RE = re.compile(r"\s*<sep>\s*|\n\s*\n+")
+# `<sep>`, `<sep/>`, `<sep />`, `</sep>` (any case, optional inner spaces) all end a bubble.
+_PARA_SPLIT_RE = re.compile(r"\s*<\s*/?\s*sep\s*/?\s*>\s*|\n\s*\n+", re.IGNORECASE)
 _BREAK_CHARS = "。！？!?；;\n，, "
 _FENCE_RE = re.compile(r"```[\s\S]*?```")
 _URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
 _TERMINAL_STATES = frozenset({"done", "skipped", "expired", "blocked", "dropped", "failed_wire"})
 
+HARD_PART_FACTOR = 2  # no bubble may be longer than max(max_part_chars * this, HARD_PART_MIN) (code / URLs included)
+HARD_PART_MIN = 800
+MAX_TOTAL_PARTS = 12  # absolute ceiling on bubbles per reply, whatever max_parts says
+TRUNCATION_NOTICE = "\n……（内容太长，后面的省略了）"
 
-def _split_long_piece(chunk: str, max_len: int, span_tokens: Sequence[str] = ()) -> List[str]:
-    pieces: List[str] = []
-    rest = chunk.strip()
-    while rest:
-        if len(rest) <= max_len:
-            pieces.append(rest)
-            break
-        # Protect atomic spans (code blocks / URLs): if the chunk starts with one longer than max_len, emit it whole.
-        leading_tok = next((t for t in span_tokens if rest.startswith(t)), None)
-        if leading_tok and len(leading_tok) > max_len:
-            pieces.append(leading_tok)
-            rest = rest[len(leading_tok) :].strip()
-            continue
 
-        win = rest[:max_len]
-        cut = -1
-        # Search for a natural sentence/clause break in the second half so bubbles don't chop right at the start.
-        lo = max(1, max_len // 2)
-        for ch in _BREAK_CHARS:
-            pos = win.rfind(ch, lo)
-            if pos > cut:
-                cut = pos + 1
-        if cut <= 0:
-            cut = max_len
-        # Ensure `cut` never bisects any placeholder token (`prefix_idx@@`).
-        for tok in span_tokens:
-            start = rest.find(tok)
-            while start != -1 and start < cut:
-                end = start + len(tok)
-                if start < cut < end:
-                    cut = start if start > 0 else end
-                    break
-                start = rest.find(tok, end)
-        head = rest[:cut].strip()
-        tail = rest[cut:].strip()
-        if not head:
-            head = rest[:max_len].strip()
-            tail = rest[max_len:].strip()
-        if head:
-            pieces.append(head)
-        rest = tail
-    return pieces
+class _Splitter:
+    """Length-aware splitter: code blocks / URLs are masked as tokens but always measured at their real length."""
+
+    def __init__(self, limit: int, hard: int, prefix: str) -> None:
+        self.limit = limit
+        self.hard = hard
+        self.prefix = prefix
+        self.spans: List[str] = []
+        self.tok_re = re.compile(re.escape(prefix) + r"_(\d+)@@")
+
+    def new_token(self, value: str) -> str:
+        self.spans.append(value)
+        return f"{self.prefix}_{len(self.spans) - 1}@@"
+
+    def sub(self, m: "re.Match[str]") -> str:
+        return self.new_token(m.group(0))
+
+    def rlen(self, s: str) -> int:
+        n = len(s)
+        for m in self.tok_re.finditer(s):
+            n += len(self.spans[int(m.group(1))]) - len(m.group(0))
+        return n
+
+    def unmask(self, s: str) -> str:
+        return self.tok_re.sub(lambda m: self.spans[int(m.group(1))], s)
+
+    def _window_end(self, rest: str, limit: int) -> int:
+        i = 0
+        cum = 0
+        while i < len(rest):
+            m = self.tok_re.match(rest, i)
+            if m:
+                tl, step = len(self.spans[int(m.group(1))]), m.end() - i
+            else:
+                tl, step = 1, 1
+            if cum + tl > limit:
+                break
+            cum += tl
+            i += step
+        return i
+
+    def _split_span(self, span: str) -> List[str]:
+        """An atomic span longer than the hard limit has to be cut after all; code stays fenced chunk by chunk."""
+        hard = self.hard
+        if span.startswith("```"):
+            body = span[3:-3] if (span.endswith("```") and len(span) >= 6) else span[3:]
+            nl = body.find("\n")
+            lang, content = (body[:nl], body[nl + 1 :]) if nl >= 0 else ("", body)
+            if len(lang) > 24 or not re.fullmatch(r"[\w.+#-]*", lang.strip()):
+                # Not a language tag (a very long or free-text first line): it is part of the code, otherwise
+                # repeating it on every chunk would push each chunk over the hard limit.
+                lang, content = "", body
+            lang = lang.strip()
+            room = max(20, hard - len(lang) - 8)
+            chunks: List[str] = []
+            cur = ""
+            for line in content.split("\n"):
+                while len(line) > room:
+                    if cur:
+                        chunks.append(cur)
+                        cur = ""
+                    chunks.append(line[:room])
+                    line = line[room:]
+                if cur and len(cur) + 1 + len(line) > room:
+                    chunks.append(cur)
+                    cur = line
+                else:
+                    cur = f"{cur}\n{line}" if cur else line
+            if cur:
+                chunks.append(cur)
+            return [f"```{lang}\n{c}\n```" for c in chunks]
+        return [span[i : i + hard] for i in range(0, len(span), hard)]
+
+    def split_piece(self, chunk: str) -> List[str]:
+        pieces: List[str] = []
+        rest = chunk.strip()
+        while rest:
+            if self.rlen(rest) <= self.limit:
+                pieces.append(rest)
+                break
+            end = self._window_end(rest, self.limit)
+            if end <= 0:
+                m = self.tok_re.match(rest)
+                if m is None:  # cannot happen (limit >= 20); never loop forever
+                    pieces.append(rest[: self.limit])
+                    rest = rest[self.limit :].strip()
+                    continue
+                span = self.spans[int(m.group(1))]
+                if len(span) <= self.hard:
+                    pieces.append(m.group(0))
+                else:
+                    pieces.extend(self.new_token(x) for x in self._split_span(span))
+                rest = rest[m.end() :].strip()
+                continue
+            win = rest[:end]
+            cut = -1
+            lo = max(1, end // 2)
+            for ch in _BREAK_CHARS:
+                pos = win.rfind(ch, lo)
+                if pos > cut:
+                    cut = pos + 1
+            if cut <= 0:
+                cut = end
+            head = rest[:cut].strip()
+            tail = rest[cut:].strip()
+            if not head:
+                head, tail = rest[:end].strip(), rest[end:].strip()
+            if head:
+                pieces.append(head)
+            rest = tail
+        return pieces
 
 
 def split_bubbles(text: str, *, max_part_chars: int = 400, max_parts: int = 3) -> List[str]:
-    """Split a reply into natural chat bubbles (`<sep>` / `\\n\\n` first), preserving code blocks, URLs & overflow."""
+    """Split a reply into natural chat bubbles (`<sep>` variants / blank lines first).
+
+    Code blocks and URLs are never cut unless one alone is longer than the hard limit. No bubble is longer than
+    `max(max_part_chars * HARD_PART_FACTOR, HARD_PART_MIN)`. Beyond `max_parts` the remainder is packed into further bubbles (at most
+    `MAX_TOTAL_PARTS` / three times `max_parts` in all); whatever still does not fit is cut off with a visible notice
+    instead of being dropped silently."""
     raw = str(text or "").strip()
     if not raw:
         return []
     limit = max(20, int(max_part_chars or 400))
     cap = max(1, int(max_parts or 3))
-
-    # Mask fenced code blocks and URLs with collision-free tokens so splits never break inside them.
-    spans: List[str] = []
+    hard = max(limit * HARD_PART_FACTOR, HARD_PART_MIN)
     prefix = "@@AHKSPAN"
     while prefix in raw:
         prefix += "X"
+    sp = _Splitter(limit, hard, prefix)
 
-    def _sub(m: re.Match[str]) -> str:
-        idx = len(spans)
-        spans.append(m.group(0))
-        return f"{prefix}_{idx}@@"
+    masked = _FENCE_RE.sub(sp.sub, raw)
+    masked = _URL_RE.sub(sp.sub, masked)
 
-    masked = _FENCE_RE.sub(_sub, raw)
-    masked = _URL_RE.sub(_sub, masked)
-    span_tokens = [f"{prefix}_{i}@@" for i in range(len(spans))]
-
-    all_pieces: List[str] = []
+    pieces: List[str] = []
     for para in _PARA_SPLIT_RE.split(masked):
         cleaned = para.strip()
-        if not cleaned:
-            continue
-        all_pieces.extend(_split_long_piece(cleaned, limit, span_tokens))
-
-    if not all_pieces:
+        if cleaned:
+            pieces.extend(sp.split_piece(cleaned))
+    if not pieces:
         return []
-    if len(all_pieces) > cap:
-        # PR-C6: Never drop trailing content beyond `max_parts` — fold remaining pieces into the final bubble.
-        merged_tail = "\n".join(all_pieces[cap - 1 :])
-        all_pieces = all_pieces[: cap - 1] + [merged_tail]
 
-    def _unmask(s: str) -> str:
-        for tok, val in zip(span_tokens, spans):
-            if tok in s:
-                s = s.replace(tok, val)
-        return s
+    if len(pieces) > cap:
+        # Fold the overflow into as few further bubbles as the hard limit allows (never one giant tail bubble).
+        head, tail = pieces[: cap - 1], pieces[cap - 1 :]
+        packed: List[str] = []
+        cur = ""
+        for p in tail:
+            if cur and sp.rlen(cur) + 1 + sp.rlen(p) <= hard:
+                cur = f"{cur}\n{p}"
+            else:
+                if cur:
+                    packed.append(cur)
+                cur = p
+        if cur:
+            packed.append(cur)
+        pieces = head + packed
 
-    return [_unmask(p) for p in all_pieces]
+    out = [sp.unmask(p) for p in pieces]
+    total_cap = max(cap, min(cap * 3, MAX_TOTAL_PARTS))
+    if len(out) > total_cap:
+        out = out[:total_cap]
+        last = out[-1]
+        room = hard - len(TRUNCATION_NOTICE) - 5
+        if len(last) > room:
+            last = last[:room]
+            pos = max(last.rfind(ch) for ch in _BREAK_CHARS)
+            if pos >= room // 2:
+                last = last[: pos + 1]
+            if last.count("```") % 2:
+                last = last.rstrip() + "\n```"
+        out[-1] = last.rstrip() + TRUNCATION_NOTICE
+    return out
 
 
 class ChannelSpool:
@@ -189,6 +281,10 @@ class ChannelSpool:
                     c.execute("DROP TABLE inbound_dedup")
                     c.execute("ALTER TABLE inbound_dedup_v2 RENAME TO inbound_dedup")
             c.executescript(SPOOL_SCHEMA)
+            spool_cols = {r[1] for r in c.execute("PRAGMA table_info(inbound_spool)").fetchall()}
+            if "reason" not in spool_cols:  # spools created before the reason column existed
+                c.execute("ALTER TABLE inbound_spool ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_inbound_spool_updated ON inbound_spool(updated_at)")
 
     def close(self) -> None:
         if not self.db_path.exists():
@@ -198,6 +294,16 @@ class ChannelSpool:
                 c.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except sqlite3.Error:
             pass
+
+    def reset(self) -> None:
+        """Drop every cached inbound row and dedup mark, leaving a fresh, usable (empty) spool database."""
+        with self._lock:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    Path(str(self.db_path) + suffix).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.migrate()
 
     def _now(self, now: Optional[float] = None) -> float:
         return float(now) if now is not None else float(self._clock())
@@ -309,13 +415,18 @@ class ChannelSpool:
         target: str = "",
         kind: str = "",
         at: str = "",
+        media: Sequence[Mapping[str, Any]] = (),
         now: Optional[float] = None,
     ) -> None:
+        """Persist what is about to be sent. `sent_parts` later counts bubbles first, then `media` items."""
         ids = [int(i) for i in spool_ids if i]
         if not ids:
             return
         ts = self._now(now)
-        plan = json.dumps({"bubbles": list(bubbles), "target": target, "kind": kind, "at": at}, ensure_ascii=False)
+        plan_doc: Dict[str, Any] = {"bubbles": list(bubbles), "target": target, "kind": kind, "at": at}
+        if media:
+            plan_doc["media"] = [dict(m) for m in media]
+        plan = json.dumps(plan_doc, ensure_ascii=False)
         primary_id = ids[-1]
         merged_ids = ids[:-1]
         with self._lock, self._connect() as c:
@@ -344,37 +455,45 @@ class ChannelSpool:
                 [int(sent_parts), ts, primary_id],
             )
 
-    def ack(self, spool_ids: Sequence[int], *, state: str = "done", now: Optional[float] = None) -> None:
+    def ack(
+        self,
+        spool_ids: Sequence[int],
+        *,
+        state: str = "done",
+        reason: str = "",
+        now: Optional[float] = None,
+    ) -> None:
         ids = [int(i) for i in spool_ids if i]
         if not ids:
             return
         ts = self._now(now)
         eff_state = str(state or "done")
+        why = str(reason or "")[:200]
         marks = ",".join("?" for _ in ids)
         with self._lock, self._connect() as c:
             if eff_state in _TERMINAL_STATES:
+                # the raw event and the saved reply (which may carry base64 media) are no longer needed
                 c.execute(
-                    f"UPDATE inbound_spool SET state=?, raw_event_json='{{}}', updated_at=? WHERE spool_id IN ({marks})",
-                    [eff_state, ts, *ids],
+                    f"UPDATE inbound_spool SET state=?, raw_event_json='{{}}', reply_bubbles_json='[]', reason=?, "
+                    f"updated_at=? WHERE spool_id IN ({marks})",
+                    [eff_state, why, ts, *ids],
                 )
             else:
                 c.execute(
-                    f"UPDATE inbound_spool SET state=?, updated_at=? WHERE spool_id IN ({marks})",
-                    [eff_state, ts, *ids],
+                    f"UPDATE inbound_spool SET state=?, reason=?, updated_at=? WHERE spool_id IN ({marks})",
+                    [eff_state, why, ts, *ids],
                 )
 
     def prune(self, *, keep_done_s: float = 86400.0, now: Optional[float] = None) -> int:
-        """Delete terminal spool rows and expired dedup records older than `keep_done_s`."""
+        """Delete spool rows and expired dedup records untouched for `keep_done_s`.
+
+        Terminal rows go after that time; so do rows stuck in `queued` / `processing` / `reply_ready` (a crash or a
+        killed worker left them behind and nothing resumes a row that old)."""
         ts = self._now(now)
         cutoff = ts - max(60.0, float(keep_done_s))
-        term = tuple(sorted(_TERMINAL_STATES))
-        marks = ",".join("?" for _ in term)
         with self._lock, self._connect() as c:
             c.execute("DELETE FROM inbound_dedup WHERE seen_at < ?", (ts - self.dedup_ttl_s,))
-            cur = c.execute(
-                f"DELETE FROM inbound_spool WHERE state IN ({marks}) AND updated_at < ?",
-                [*term, cutoff],
-            )
+            cur = c.execute("DELETE FROM inbound_spool WHERE updated_at < ?", [cutoff])
             return int(cur.rowcount or 0)
 
     def recover_unfinished(
@@ -435,7 +554,7 @@ class ChannelSpool:
         with self._lock, self._connect() as c:
             rows = c.execute(
                 "SELECT spool_id, platform, message_id, session_key, kind, target, uid, state, attempts, sent_parts, "
-                "received_at, updated_at FROM inbound_spool ORDER BY spool_id DESC LIMIT ?",
+                "reason, received_at, updated_at FROM inbound_spool ORDER BY spool_id DESC LIMIT ?",
                 (max(1, min(int(limit), 200)),),
             ).fetchall()
         return [dict(r) for r in rows]

@@ -11,11 +11,10 @@ import hashlib
 import json
 import os
 import re
-import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .chat_identity import Speaker, one_line, owner_speaker, quote_untrusted
-from .llm import LLMAPIError, ModelRouter, mask_secrets, openai_compatible_chat, post_openai_chat_json
+from .llm import LLMAPIError, ModelRouter, deadline_scope, mask_secrets, openai_compatible_chat, post_openai_chat_json
 
 JST = dt.timezone(dt.timedelta(hours=9))
 
@@ -162,58 +161,52 @@ class RoommateChatAgent:
             {"role": "user", "content": user},
         ]
         total_tokens = 0
-        deadline = time.monotonic() + 45.0
-        for _round in range(3):
-            rem = deadline - time.monotonic()
-            if rem <= 0.5:
-                raise TimeoutError("tool loop exceeded 45s budget")
-            res = self.router.complete_messages(
+        # One deadline for the whole loop (rounds + final call, including every retry/fallback inside the router);
+        # the router clamps each HTTP request to the remaining budget and raises LLMDeadlineError when it is gone.
+        with deadline_scope(self.router.resolve_total_budget("chat")):
+            for _round in range(3):
+                res = self.router.complete_messages(
+                    messages,
+                    purpose="chat",
+                    actor=actor_id,
+                    tools=tool_specs if self.tools_enabled else None,
+                    retry_without_tools_on_400=bool(self.tools_enabled),
+                )
+                msg = res.message
+                total_tokens += res.total_tokens
+                tcalls = msg.get("tool_calls") or []
+                if not tcalls:
+                    return str(msg.get("content") or "").strip(), total_tokens
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": tcalls,
+                })
+                for tc in tcalls[:4]:
+                    fn_obj = tc.get("function") or {}
+                    tname = str(fn_obj.get("name") or "")
+                    try:
+                        targs = json.loads(fn_obj.get("arguments") or "{}")
+                        if not isinstance(targs, dict):
+                            targs = {}
+                    except ValueError:
+                        targs = {}
+                    result = tool_runner(tname, targs)
+                    if tname == "record_promise" and isinstance(result, dict) and result.get("recorded") and result.get("intent"):
+                        recorded_intents.append(result["intent"])
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": str(tc.get("id") or tname),
+                        "content": json.dumps(result, ensure_ascii=False),
+                    })
+            # Final plain call after max tool rounds so we always get a spoken reply
+            final_res = self.router.complete_messages(
                 messages,
                 purpose="chat",
                 actor=actor_id,
-                tools=tool_specs if self.tools_enabled else None,
-                retry_without_tools_on_400=bool(self.tools_enabled),
-                timeout_s=min(25.0, max(1.5, rem)),
+                tools=None,
             )
-            msg = res.message
-            total_tokens += res.total_tokens
-            tcalls = msg.get("tool_calls") or []
-            if not tcalls:
-                return str(msg.get("content") or "").strip(), total_tokens
-            messages.append({
-                "role": "assistant",
-                "content": msg.get("content") or "",
-                "tool_calls": tcalls,
-            })
-            for tc in tcalls[:4]:
-                fn_obj = tc.get("function") or {}
-                tname = str(fn_obj.get("name") or "")
-                try:
-                    targs = json.loads(fn_obj.get("arguments") or "{}")
-                    if not isinstance(targs, dict):
-                        targs = {}
-                except ValueError:
-                    targs = {}
-                result = tool_runner(tname, targs)
-                if tname == "record_promise" and isinstance(result, dict) and result.get("recorded") and result.get("intent"):
-                    recorded_intents.append(result["intent"])
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": str(tc.get("id") or tname),
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-        # Final plain call after max tool rounds so we always get a spoken reply
-        rem = deadline - time.monotonic()
-        if rem <= 0.5:
-            raise TimeoutError("tool loop exceeded 45s budget")
-        final_res = self.router.complete_messages(
-            messages,
-            purpose="chat",
-            actor=actor_id,
-            tools=None,
-            timeout_s=min(25.0, max(1.5, rem)),
-        )
-        return str(final_res.content or "").strip(), total_tokens + final_res.total_tokens
+            return str(final_res.content or "").strip(), total_tokens + final_res.total_tokens
 
     def build_actor_context(
         self,
@@ -334,6 +327,11 @@ class RoommateChatAgent:
                         )
                     else:
                         raw_text, _ = self.router.complete_text(system, user, purpose="chat", actor=actor_id)
+                elif self._llm_fn is None:
+                    # this resident/task has an override that cannot be served (e.g. base_url without its own api_key):
+                    # fail visibly instead of quietly answering with the primary model
+                    issue = self.router.config_issue(purpose="chat", actor=actor_id)
+                    raise LLMAPIError(0, "配置错误：" + str((issue or {}).get("reason") or "没有可用的接口"))
                 else:
                     fn = self.kernel_chat_fn()
                     assert fn is not None
@@ -348,6 +346,8 @@ class RoommateChatAgent:
                         "mode": "live_api",
                         "tool_intents": recorded_intents,
                     }
+                # an empty live reply is a failure the user must see, never a silent switch to the demo persona
+                fallback_note = "（接口暂不可用 模型返回了空回复，已自动切换本地演示回复）"
             except Exception as exc:  # noqa: BLE001
                 err_msg = str(exc)
                 for sec in [self.api_key, self.fallback_api_key, *self.router.collect_secrets()]:
@@ -357,10 +357,12 @@ class RoommateChatAgent:
                     err_msg = err_msg[:137] + "..."
                 detail_str = err_msg if isinstance(exc, LLMAPIError) else f"{type(exc).__name__}: {err_msg}"
                 fallback_note = f"（接口暂不可用 {detail_str}，已自动切换本地演示回复）"
-            else:
-                fallback_note = ""
         else:
             fallback_note = ""
+            issue = None if self._llm_fn is not None else self.router.config_issue(purpose="chat", actor=actor_id)
+            if issue is not None:
+                # e.g. a resident base_url without its own api_key: say so instead of quietly playing the demo persona
+                fallback_note = f"（接口暂不可用 配置错误：{issue['reason']}，已自动切换本地演示回复）"
 
         demo_text = self._demo_persona_reply(actor_id, name, owner_text, ctx)
         if fallback_note:
