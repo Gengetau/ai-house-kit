@@ -245,7 +245,7 @@ class HouseDaemon:
                     inst = ch_factory()
                     if inst is not None:
                         ch_defn = self.registry.definitions.get(ch_pid)
-                        ch_host: Any = PluginHostProxy(self) if (ch_defn is not None and ch_defn.source != "builtin") else self
+                        ch_host: Any = PluginHostProxy(self, ch_pid) if (ch_defn is not None and ch_defn.source != "builtin") else self
                         inst.start(ch_host)
                         self.channels.append(inst)
                         self._active_channel_ids.add(ch_pid)
@@ -554,7 +554,7 @@ class HouseDaemon:
                     task_id=task.task_id,
                     now=now,
                     plugin_config=cfg,
-                    daemon=PluginHostProxy(self) if defn.source != "builtin" else self,
+                    daemon=PluginHostProxy(self, defn.plugin_id) if defn.source != "builtin" else self,
                 )
                 if task.run_outside_lock:
                     task.handler(tctx)
@@ -581,7 +581,7 @@ class HouseDaemon:
                 try:
                     p_pid = str(getattr(p, "provider_id", "") or "")
                     p_defn = self.registry.definitions.get(p_pid)
-                    p_host: Any = PluginHostProxy(self) if (p_defn is not None and p_defn.source != "builtin") else self
+                    p_host: Any = PluginHostProxy(self, p_pid) if (p_defn is not None and p_defn.source != "builtin") else self
                     p.step(p_host)
                 except Exception as exc:  # noqa: BLE001
                     pid = str(getattr(p, "provider_id", type(p).__name__))
@@ -1230,7 +1230,7 @@ class HouseDaemon:
                     )
                     for w in p_warns:
                         self.log(f"plugin {proc_defn.plugin_id} config warning: {mask_secrets(w)}")
-                    proc_daemon: Any = PluginHostProxy(self) if proc_defn.source != "builtin" else self
+                    proc_daemon: Any = PluginHostProxy(self, proc_defn.plugin_id) if proc_defn.source != "builtin" else self
                     proc_actor = single_target if proc_defn.plugin_id == "album_diary_art" else (targets[0] if targets else "")
                     actx = AttachmentContext(
                         scope=scope,
@@ -1347,7 +1347,7 @@ class HouseDaemon:
                                 else {}
                             )
                             t_defn = self.registry.definitions.get(pid)
-                            t_daemon: Any = PluginHostProxy(self) if (t_defn is not None and t_defn.source != "builtin") else self
+                            t_daemon: Any = PluginHostProxy(self, pid) if (t_defn is not None and t_defn.source != "builtin") else self
                             tctx = ToolContext(
                                 actor=_aid,
                                 scope=scope,
@@ -1880,7 +1880,7 @@ class HouseDaemon:
         for ch_pid, inst in cand_channels:
             try:
                 ch_defn = self.registry.definitions.get(ch_pid)
-                ch_host: Any = PluginHostProxy(self) if (ch_defn is not None and ch_defn.source != "builtin") else self
+                ch_host: Any = PluginHostProxy(self, ch_pid) if (ch_defn is not None and ch_defn.source != "builtin") else self
                 inst.start(ch_host)
                 started_channels.append(inst)
                 started_ids.add(ch_pid)
@@ -2245,7 +2245,7 @@ class HouseDaemon:
             query=dict(query or {}),
             body=body,
             plugin_config=cfg,
-            daemon=PluginHostProxy(self) if defn.source != "builtin" else self,
+            daemon=PluginHostProxy(self, defn.plugin_id) if defn.source != "builtin" else self,
             now=self.clock.now(),
         )
         res = route.handler(ctx)

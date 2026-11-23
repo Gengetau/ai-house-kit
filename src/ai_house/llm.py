@@ -820,6 +820,62 @@ class ModelRouter:
             "recent": recent,
         }
 
+    # ---- paid-plugin quota: atomic reserve -> settle -------------------------------------------------------------
+    # `check_plugin_quota` *reserves* one slot (insert a `held` row inside one IMMEDIATE transaction, under the
+    # router lock), `record_plugin_call` settles it: ok -> `ok` (counts toward the daily limit), failure ->
+    # `failed` (slot refunded for the daily limit, but still an attempt for the visitor hourly limit).
+    # A reservation that is never settled expires after PLUGIN_QUOTA_HOLD_TTL_S and is then refunded as well.
+    PLUGIN_QUOTA_HOLD_TTL_S = 300.0
+    PLUGIN_OWNER_RESERVE_DEFAULT = 0.3
+    PLUGIN_QUOTA_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS plugin_quota (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        day_jst TEXT NOT NULL,
+        plugin_id TEXT NOT NULL,
+        visitor_key TEXT NOT NULL,
+        is_owner INTEGER NOT NULL,
+        state TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_plugin_quota_day ON plugin_quota(plugin_id, day_jst, state);
+    CREATE INDEX IF NOT EXISTS idx_plugin_quota_visitor ON plugin_quota(plugin_id, visitor_key, ts);
+    """
+
+    @contextlib.contextmanager
+    def _quota_conn(self):
+        """Autocommit connection holding `plugin_quota` (+ `llm_usage`); in-memory when the router has no runtime dir."""
+        if self._usage_db is None:
+            mem = getattr(self, "_quota_mem", None)
+            if mem is None:
+                mem = sqlite3.connect(":memory:", check_same_thread=False, isolation_level=None)
+                mem.executescript(USAGE_SCHEMA + self.PLUGIN_QUOTA_SCHEMA)
+                self._quota_mem = mem
+            yield mem
+            return
+        self._usage_db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._usage_db, timeout=5, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executescript(USAGE_SCHEMA + self.PLUGIN_QUOTA_SCHEMA)
+            yield conn
+        finally:
+            conn.close()
+
+    def _owner_reserve_ratio(self, override: Optional[float]) -> float:
+        raw: Any = override if override is not None else self.env.get("AI_HOUSE_PLUGIN_OWNER_RESERVE")
+        try:
+            ratio = float(raw) if raw not in (None, "") else self.PLUGIN_OWNER_RESERVE_DEFAULT
+        except (TypeError, ValueError):
+            ratio = self.PLUGIN_OWNER_RESERVE_DEFAULT
+        if ratio != ratio:  # NaN
+            ratio = self.PLUGIN_OWNER_RESERVE_DEFAULT
+        return min(1.0, max(0.0, ratio))
+
+    @staticmethod
+    def _quota_key(speaker_id: str) -> str:
+        """Bucket key for a speaker; callers pass a stable identity (see `plugin_api.quota_speaker_key`)."""
+        return str(speaker_id or "").strip()[:128] or "anonymous"
+
     def check_plugin_quota(
         self,
         plugin_id: str,
@@ -828,32 +884,74 @@ class ModelRouter:
         is_owner: bool = True,
         daily_limit: int = 60,
         visitor_hourly_limit: int = 20,
+        owner_reserve_ratio: Optional[float] = None,
     ) -> Optional[str]:
-        """Enforce per-plugin daily ledger limit and non-owner hourly burst cap; returns reason or None."""
+        """Atomically check AND reserve one call slot; returns the refusal reason, or None when a slot is now held.
+
+        Every `None` result must be followed by exactly one `record_plugin_call` (ok or failed) for the same
+        plugin / speaker / owner flag. Limits: `daily_limit` for everybody together; visitors (non-owners) together
+        may use at most `daily_limit - ceil(daily_limit * owner_reserve_ratio)` of it (default ratio 0.3, env
+        `AI_HOUSE_PLUGIN_OWNER_RESERVE`), so the owner always keeps a floor; each visitor key gets
+        `visitor_hourly_limit` attempts (successful or not) per rolling hour.
+        """
         pid = str(plugin_id or "").strip() or "unknown"
         eff_daily = max(1, min(int(daily_limit or 60), 5000))
+        eff_hourly = max(1, int(visitor_hourly_limit or 20))
+        ratio = self._owner_reserve_ratio(owner_reserve_ratio)
         now_ts = self._now()
         day_jst = dt.datetime.fromtimestamp(now_ts, JST).date().isoformat()
+        vkey = self._quota_key(speaker_id)
         purpose = f"plugin:{pid}"
-        with self._lock:
-            if self._usage_db is not None and self._usage_db.exists():
-                with contextlib.closing(sqlite3.connect(self._usage_db, timeout=5)) as c:
-                    used_today = int(
-                        c.execute(
-                            "SELECT COUNT(*) FROM llm_usage WHERE day_jst=? AND purpose=? AND ok=1",
-                            (day_jst, purpose),
-                        ).fetchone()[0]
-                    )
+        with self._lock, self._quota_conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute("DELETE FROM plugin_quota WHERE ts < ?", (now_ts - 3 * 86400.0,))
+                c.execute(
+                    "UPDATE plugin_quota SET state='expired' WHERE state='held' AND ts < ?",
+                    (now_ts - self.PLUGIN_QUOTA_HOLD_TTL_S,),
+                )
+                ledger_ok = int(c.execute(
+                    "SELECT COUNT(*) FROM llm_usage WHERE day_jst=? AND purpose=? AND ok=1", (day_jst, purpose)
+                ).fetchone()[0])
+                q_ok, q_held = c.execute(
+                    "SELECT COALESCE(SUM(state='ok'), 0), COALESCE(SUM(state='held'), 0) "
+                    "FROM plugin_quota WHERE plugin_id=? AND day_jst=?",
+                    (pid, day_jst),
+                ).fetchone()
+                used_today = max(ledger_ok, int(q_ok)) + int(q_held)
                 if used_today >= eff_daily:
+                    c.execute("ROLLBACK")
                     return f"插件 {pid} 已达到今日调用上限 ({used_today}/{eff_daily})"
-            if not is_owner:
-                eff_hourly = max(1, int(visitor_hourly_limit or 20))
-                vkey = (pid, str(speaker_id or "visitor").strip() or "visitor")
-                cutoff = now_ts - 3600.0
-                recent = [t for t in self._plugin_visitor_calls.get(vkey, ()) if t >= cutoff]
-                self._plugin_visitor_calls[vkey] = recent
-                if len(recent) >= eff_hourly:
-                    return f"插件 {pid} 非房主每小时调用已达上限 ({len(recent)}/{eff_hourly})"
+                if not is_owner:
+                    reserve = int(eff_daily * ratio)
+                    if reserve < eff_daily * ratio - 1e-9:
+                        reserve += 1
+                    visitor_cap = max(0, eff_daily - reserve)
+                    visitor_used = int(c.execute(
+                        "SELECT COUNT(*) FROM plugin_quota WHERE plugin_id=? AND day_jst=? AND is_owner=0 "
+                        "AND state IN ('ok', 'held')",
+                        (pid, day_jst),
+                    ).fetchone()[0])
+                    if visitor_used >= visitor_cap:
+                        c.execute("ROLLBACK")
+                        return f"插件 {pid} 访客今日合计调用已达上限 ({visitor_used}/{visitor_cap})，其余额度留给房主"
+                    attempts = int(c.execute(
+                        "SELECT COUNT(*) FROM plugin_quota WHERE plugin_id=? AND visitor_key=? AND is_owner=0 AND ts>=?",
+                        (pid, vkey, now_ts - 3600.0),
+                    ).fetchone()[0])
+                    if attempts >= eff_hourly:
+                        c.execute("ROLLBACK")
+                        return f"插件 {pid} 非房主每小时调用已达上限 ({attempts}/{eff_hourly})"
+                c.execute(
+                    "INSERT INTO plugin_quota(ts, day_jst, plugin_id, visitor_key, is_owner, state) "
+                    "VALUES(?, ?, ?, ?, ?, 'held')",
+                    (now_ts, day_jst, pid, vkey, 1 if is_owner else 0),
+                )
+                c.execute("COMMIT")
+            except BaseException:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
         return None
 
     def record_plugin_call(
@@ -870,16 +968,34 @@ class ModelRouter:
         error_code: str = "",
         total_tokens: int = 0,
     ) -> None:
-        """Record a third-party/optional plugin billable call into `usage.db` under `plugin:<id>`."""
+        """Settle the slot reserved by `check_plugin_quota` and record the call in `usage.db` under `plugin:<id>`."""
         pid = str(plugin_id or "").strip() or "unknown"
         now_ts = self._now()
-        with self._lock:
-            if not is_owner and ok:
-                vkey = (pid, str(speaker_id or "visitor").strip() or "visitor")
-                cutoff = now_ts - 3600.0
-                recent = [t for t in self._plugin_visitor_calls.get(vkey, ()) if t >= cutoff]
-                recent.append(now_ts)
-                self._plugin_visitor_calls[vkey] = recent
+        day_jst = dt.datetime.fromtimestamp(now_ts, JST).date().isoformat()
+        vkey = self._quota_key(speaker_id)
+        owner_flag = 1 if is_owner else 0
+        new_state = "ok" if ok else "failed"
+        with self._lock, self._quota_conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute(
+                    "SELECT id FROM plugin_quota WHERE plugin_id=? AND visitor_key=? AND is_owner=? AND state='held' "
+                    "AND ts>=? ORDER BY id LIMIT 1",
+                    (pid, vkey, owner_flag, now_ts - self.PLUGIN_QUOTA_HOLD_TTL_S),
+                ).fetchone()
+                if row is not None:
+                    c.execute("UPDATE plugin_quota SET state=? WHERE id=?", (new_state, int(row[0])))
+                else:  # recorded without a prior reservation (legacy caller): still account for it
+                    c.execute(
+                        "INSERT INTO plugin_quota(ts, day_jst, plugin_id, visitor_key, is_owner, state) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        (now_ts, day_jst, pid, vkey, owner_flag, new_state),
+                    )
+                c.execute("COMMIT")
+            except BaseException:
+                if c.in_transaction:
+                    c.execute("ROLLBACK")
+                raise
         ep = ModelEndpoint(
             base_url=str(base_url or "plugin://local"),
             api_key="",

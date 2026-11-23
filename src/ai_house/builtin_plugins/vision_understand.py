@@ -22,6 +22,7 @@ from ..plugin_api import (
     PluginManifest,
     PluginRequestContext,
     PluginRoute,
+    quota_speaker_key,
     ToolContext,
     ToolRegistration,
 )
@@ -162,6 +163,17 @@ def describe_image_source(
             channel=channel,
         )
     except Exception as exc:  # noqa: BLE001
+        if rec_call is not None:  # settle the quota slot reserved above (refunded daily, counted as an attempt)
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model="",
+                base_url="local://source",
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                ok=False,
+                error_code="invalid_source",
+            )
         return {
             "ok": False,
             "degraded": True,
@@ -306,7 +318,7 @@ def _process_attachments(actx: AttachmentContext) -> List[str]:
     if not imgs:
         return []
     sp = actx.speaker
-    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    sp_id = quota_speaker_key(sp, str(getattr(actx, "channel", "") or ""))
     is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     return enrich_chat_images(
         list(imgs),
@@ -332,7 +344,7 @@ def _tool_inspect_image(
     scope = ctx.scope if ctx is not None else "group"
     channel = ctx.channel if ctx is not None else ""
     sp = ctx.speaker if ctx is not None else None
-    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    sp_id = quota_speaker_key(sp, str(getattr(ctx, "channel", "") or ""))
     is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
     return describe_image_source(
         source,

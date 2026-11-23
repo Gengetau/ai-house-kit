@@ -18,10 +18,14 @@ import inspect
 import math
 import os
 import re
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from .chat_identity import Speaker, member_speaker
 
 MAX_CONFIG_FIELDS = 8
 VALID_FIELD_TYPES = ("string", "int", "float", "bool", "select", "list")
@@ -289,62 +293,256 @@ class AttachmentProcessor:
     priority: int = 50
 
 
-class PluginHostProxy:
-    """Read-safe daemon façade exposed to third-party plugins so single-writer kernel DBs stay protected."""
+_SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|AUTH|COOKIE", re.I)
+_CRED_VALUE_RE = re.compile(r"://[^/\s]*:[^/\s]*@|[?&](?:access_)?(?:token|key|secret|password|auth)=", re.I)
 
-    def __init__(self, daemon: Any) -> None:
-        self._daemon = daemon
+
+def public_env_view(env: Mapping[str, str]) -> Mapping[str, str]:
+    """Read-only copy of `env` without anything that looks like a credential.
+
+    A variable is withheld when its *name* contains KEY / TOKEN / SECRET / PASSWORD / AUTH / COOKIE (any case), or
+    when its *value* is a URL carrying `user:pass@` or `?token=`-style credentials.
+    """
+    clean = {
+        str(k): str(v)
+        for k, v in (env or {}).items()
+        if not _SECRET_NAME_RE.search(str(k)) and not _CRED_VALUE_RE.search(str(v))
+    }
+    return MappingProxyType(clean)
+
+
+def quota_speaker_key(speaker: Any, channel: str = "") -> str:
+    """Stable per-person key for paid-plugin quotas; never the (self-chosen) display name.
+
+    Preference: the identity-store id (`visitor:<platform>:<account>`, `user:owner`, ...); else `<channel kind>:<external
+    account id>`; else the one shared `anonymous` bucket, so changing a nickname never opens a fresh budget.
+    """
+    iid = str(getattr(speaker, "identity_id", "") or "").strip()
+    if iid:
+        return iid
+    uid = str(getattr(speaker, "uid", "") or "").strip()
+    if uid:
+        kind = str(channel or "").split(":", 1)[0].strip() or "unknown"
+        return f"{kind}:{uid}"
+    return "anonymous"
+
+
+class _ClockView:
+    """Read-only window onto the daemon clock (a virtual clock must not be advanced by plugins)."""
+
+    __slots__ = ("now",)
+
+    def __init__(self, clock: Any) -> None:
+        self.now = lambda: float(clock.now())  # type: ignore[assignment]
+
+
+class _GuardView:
+    """Only `check()` of the reply guard; the guard object itself keeps every configured secret in plain attributes."""
+
+    __slots__ = ("check",)
+
+    def __init__(self, guard: Any) -> None:
+        self.check = lambda channel, text: guard.check(channel, text)  # type: ignore[assignment]
+
+
+class _AlbumReadView:
+    """Read-only album access: list / fetch items. Nothing that writes, resets or reveals file paths."""
+
+    __slots__ = ("list_items", "get_item", "get_by_media_rel")
+
+    def __init__(self, album: Any) -> None:
+        self.list_items = lambda **kw: album.list_items(**kw)  # type: ignore[assignment]
+        self.get_item = lambda album_id, **kw: album.get_item(album_id, **kw)  # type: ignore[assignment]
+        self.get_by_media_rel = lambda media_rel, **kw: album.get_by_media_rel(media_rel, **kw)  # type: ignore[assignment]
+
+
+_PROXY_STATE: "weakref.WeakKeyDictionary[Any, Tuple[Any, str]]" = weakref.WeakKeyDictionary()
+
+
+def _dm(proxy: Any) -> Any:
+    return _PROXY_STATE[proxy][0]
+
+
+def _pidm(proxy: Any) -> str:
+    return _PROXY_STATE[proxy][1]
+
+
+class PluginHostProxy:
+    """Narrow, explicit daemon façade handed to non-builtin (third-party) plugins.
+
+    Everything a plugin can do is a method or property defined below; there is no attribute forwarding.
+
+    * Read-only world access: `get_state`, `list_memories`, `list_chat`, `list_album_view`, `album`, `clock`, `vocab`.
+    * Own configuration only: `config()` resolves just the fields declared in this plugin's manifest;
+      `env` is a filtered view with every credential-looking variable removed (see `public_env_view`).
+    * Own files only: `plugin_dir` is a private directory under the runtime dir (inbound caches, cursors, ...).
+    * Channels: `resolve_speaker`, `converse`, `authorize_send`.
+    * Paid-plugin quota: `check_plugin_quota`, `record_plugin_call`.
+
+    Honest limits: this is an API boundary, not a sandbox. Third-party code runs inside the daemon process and
+    can still reach the real daemon through the interpreter (frames, `gc`, this module's private state table,
+    closures). No attribute of a proxy instance refers to the real daemon (it lives in a private weak table of
+    this module), and secret-bearing objects (the reply guard, the album store, the environment) are only handed
+    out as filtered views, to keep honest plugins honest and accidents out. Only install plugins you trust.
+    """
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, daemon: Any, plugin_id: str = "") -> None:
+        _PROXY_STATE[self] = (daemon, str(plugin_id or "").strip())
+
+    # ---- identity / files / config ---------------------------------------------------------------------------
+    @property
+    def plugin_id(self) -> str:
+        return _pidm(self)
 
     @property
     def runtime_dir(self) -> Path:
-        return Path(self._daemon.runtime_dir)
+        return Path(_dm(self).runtime_dir)
+
+    @property
+    def plugin_dir(self) -> Path:
+        """Private per-plugin directory (`<runtime>/plugins/<plugin_id>`), created on first use."""
+        if not _pidm(self):
+            raise RuntimeError("plugin_dir needs a proxy that knows its plugin id")
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _pidm(self)).strip(".") or "plugin"
+        path = Path(_dm(self).runtime_dir) / "plugins" / safe
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def env(self) -> Mapping[str, str]:
-        return dict(getattr(self._daemon, "env", {}) or {})
+        return public_env_view(getattr(_dm(self), "env", {}) or {})
 
+    def config(self) -> Mapping[str, Any]:
+        """This plugin's own resolved settings (only manifest-declared fields), read-only."""
+        d = _dm(self)
+        if not _pidm(self) or getattr(d, "registry", None) is None:
+            return MappingProxyType({})
+        store = getattr(d, "settings_store", None)
+        stored = store.get_plugins_map() if store is not None else {}
+        cfg, _warnings = d.registry.safe_resolve_config(_pidm(self), env=d.env, stored_plugins=stored)
+        return MappingProxyType(dict(cfg))
+
+    # ---- read-only views --------------------------------------------------------------------------------------
     @property
     def clock(self) -> Any:
-        return getattr(self._daemon, "clock", None)
+        c = getattr(_dm(self), "clock", None)
+        return _ClockView(c) if c is not None else None
 
     @property
     def vocab(self) -> Any:
-        return getattr(self._daemon, "vocab", None)
+        return getattr(_dm(self), "vocab", None)
 
     @property
     def guard(self) -> Any:
-        return getattr(self._daemon, "guard", None)
+        g = getattr(_dm(self), "guard", None)
+        return _GuardView(g) if g is not None else None
 
     @property
     def album(self) -> Any:
-        return getattr(self._daemon, "album", None)
+        a = getattr(_dm(self), "album", None)
+        return _AlbumReadView(a) if a is not None else None
 
     def log(self, msg: str) -> None:
-        self._daemon.log(msg)
+        _dm(self).log(msg)
 
     def get_state(self) -> Dict[str, Any]:
-        return self._daemon.get_state()
+        return _dm(self).get_state()
 
     def list_memories(self, **kwargs: Any) -> List[Dict[str, Any]]:
-        return self._daemon.list_memories(**kwargs)
+        return _dm(self).list_memories(**kwargs)
 
     def list_chat(self, channel: str = "group", limit: int = 50) -> List[Dict[str, Any]]:
-        return self._daemon.list_chat(channel, limit=limit)
+        return _dm(self).list_chat(channel, limit=limit)
 
     def list_album_view(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._daemon.list_album_view(**kwargs)
+        return _dm(self).list_album_view(**kwargs)
 
     def get_usage_summary(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._daemon.get_usage_summary(**kwargs)
+        return _dm(self).get_usage_summary(**kwargs)
 
+    # ---- channel surface (what the built-in OneBot channel needs from its host) -------------------------------
+    def resolve_speaker(self, external_id: str, *, fallback_name: str = "") -> Speaker:
+        """Who is `external_id` on this channel's own platform (the plugin id)?
+
+        The platform is fixed to this plugin's id and a channel cannot declare anyone an owner: the house owner
+        links an account to the owner identity themselves (identity `bind`, platform = plugin id).
+        Unknown accounts become `visitor:<plugin id>:<external id>` members.
+        """
+        if not _pidm(self):
+            raise RuntimeError("resolve_speaker needs a proxy that knows its plugin id")
+        store = getattr(_dm(self), "identity_store", None)
+        ext = str(external_id or "").strip()
+        if store is None:
+            return member_speaker(fallback_name or "群友", uid=ext)
+        return store.resolve_speaker(_pidm(self), ext, fallback_name=fallback_name, default_owner=False)
+
+    def _vetted_speaker(self, speaker: Speaker) -> Speaker:
+        """Re-derive the role from the identity store: a channel can only lower, never raise, a speaker's trust."""
+        if speaker.is_bot:
+            return speaker
+        uid = str(getattr(speaker, "uid", "") or "").strip()
+        store = getattr(_dm(self), "identity_store", None)
+        if store is None or not _pidm(self) or not uid:
+            return member_speaker(speaker.name, uid=uid)
+        return store.resolve_speaker(_pidm(self), uid, fallback_name=speaker.name, default_owner=False)
+
+    def converse(
+        self,
+        channel: str,
+        text: str,
+        speaker: Speaker,
+        *,
+        actor: Optional[str] = None,
+        attachments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Deliver one inbound message and get the roommates' replies (`HouseDaemon.converse`).
+
+        The speaker is re-vetted (see `_vetted_speaker`); `private:<actor>` rooms are owner-only.
+        """
+        vetted = self._vetted_speaker(speaker)
+        if str(channel or "").startswith("private:") and not (vetted.is_owner or vetted.is_bot):
+            raise PermissionError("私聊仅限房主身份")
+        return _dm(self).converse(channel, text, vetted, actor=actor, attachments=attachments)
+
+    def authorize_send(
+        self,
+        channel_plugin: Any,
+        *,
+        kind: str,
+        target: str,
+        actor: str,
+        text: str,
+        delivery_id: str = "",
+    ) -> str:
+        """Ask the daemon's SendGate for permission to send `text` out on this channel.
+
+        Raises `worldkernel.outbox.BlockedDelivery` / `NotSent` when the gate refuses (guard, leak check, caps).
+        Call it right before the wire send; the channel id is always this plugin's id.
+        """
+        gate = getattr(_dm(self), "send_gate", None)
+        if gate is None:
+            raise RuntimeError("send gate unavailable")
+        return gate.authorize_direct_send(
+            _pidm(self) or str(getattr(channel_plugin, "channel_id", "") or ""),
+            channel_plugin,
+            kind=kind,
+            target=str(target),
+            actor=actor,
+            text=text,
+            delivery_id=delivery_id,
+        )
+
+    # ---- paid-plugin quota --------------------------------------------------------------------------------------
     def check_plugin_quota(self, plugin_id: str, **kwargs: Any) -> Optional[str]:
-        router = getattr(self._daemon, "model_router", None)
+        router = getattr(_dm(self), "model_router", None)
         if router is not None and hasattr(router, "check_plugin_quota"):
             return router.check_plugin_quota(plugin_id, **kwargs)
         return None
 
     def record_plugin_call(self, plugin_id: str, **kwargs: Any) -> None:
-        router = getattr(self._daemon, "model_router", None)
+        router = getattr(_dm(self), "model_router", None)
         if router is not None and hasattr(router, "record_plugin_call"):
             router.record_plugin_call(plugin_id, **kwargs)
 
