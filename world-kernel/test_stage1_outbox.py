@@ -251,6 +251,134 @@ class Stage1OutboxAndSendGateTests(unittest.TestCase):
         self.assertEqual(res_re["reconciled"][did_to], "unknown")
         self.assertEqual(len(ws_srv.actions), before_actions + 1)
 
+    def test_send_gate_destination_scope_whitelist_quota_and_webchat_idempotency_across_restart(self) -> None:
+        import contextlib
+        import sqlite3
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rt = Path(tmp.name) / "rt"
+        day_ts = dt.datetime(2026, 11, 22, 14, 0, tzinfo=JST).timestamp()
+        env = {
+            "AI_HOUSE_QUIET_HOURS": "23:30-07:00",
+            "AI_HOUSE_OUTBOX_HOURLY_CAP": "10",
+            "AI_HOUSE_OUTBOX_DAILY_CAP": "1",
+        }
+        d1 = HouseDaemon(
+            rt,
+            pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
+            env=env,
+            start_ts=day_ts,
+            virtual_clock=True,
+            allow_onboarding=False,
+        )
+        ws_srv = _MockOneBotWSServer()
+        self.addCleanup(ws_srv.close)
+        ch1 = OneBotChannel(
+            OneBotConfig(url=ws_srv.url, owners=frozenset({"8001"}), groups=frozenset({"9001"}), actor="sora")
+        )
+        d1.channels = [ch1]
+        d1._active_channel_ids = {"onebot_v11"}
+        ch1.start(d1)
+        try:
+            self.assertTrue(ws_srv.connected.wait(timeout=3.0))
+
+            # Seed private secret phrase in sora's private memory
+            secret_note = "小仓鼠秘密储藏室"
+            d1.memory.add("sora", "private", f"房主的私密事项：{secret_note}", kind="fact", source="chat", now=day_ts)
+
+            # 1a) Spoofed payload with actor + target_channel='group' (omitting kind) must be checked as group & blocked
+            did_spoof1 = d1.enqueue_outbound(
+                channel="webchat",
+                payload={"actor": "sora", "target_channel": "group", "text": f"其实{secret_note}"},
+            )
+            # 1b) Conflicting explicit scope='private' + target_channel='group' must be rejected as inconsistent_scope
+            did_spoof2 = d1.enqueue_outbound(
+                channel="webchat",
+                payload={"actor": "sora", "kind": "private", "scope": "private", "target_channel": "group", "text": "正常提醒"},
+            )
+            # 1c) OneBot group outbound to un-whitelisted group 9999 must be blocked with zero frames sent
+            did_unwhitelisted = d1.enqueue_outbound(
+                channel="onebot_v11",
+                payload={"actor": "sora", "kind": "group", "target": "9999", "text": "未加白名单的群"},
+            )
+            # 1d) First real private delivery uses daily cap=1
+            did_first = d1.enqueue_outbound(
+                channel="webchat",
+                payload={"actor": "sora", "kind": "private", "to_identity": "user:owner", "text": "第一条占用日限"},
+            )
+            res1 = d1.flush_outbox()
+            self.assertEqual(res1["dispatched"][did_spoof1], "blocked")
+            self.assertEqual(res1["dispatched"][did_spoof2], "blocked")
+            self.assertEqual(res1["dispatched"][did_unwhitelisted], "blocked")
+            self.assertEqual(ws_srv.actions, [])
+            self.assertEqual(res1["dispatched"][did_first], "sent")
+
+            # Queue 2nd message hitting daily_cap=1, PLUS simulate mid-send crash on `did_crash`:
+            # `webchat` wrote chat_messages + webchat_deliveries while outbox row in life_db stayed `sending`.
+            did_second_cap = d1.enqueue_outbound(
+                channel="webchat",
+                payload={"actor": "sora", "kind": "private", "to_identity": "user:owner", "text": "第二条应跨重启受日限拦截"},
+            )
+            res2 = d1.flush_outbox()
+            self.assertEqual(res2["dispatched"][did_second_cap], "pending")
+
+            did_crash = d1.enqueue_outbound(
+                channel="webchat",
+                payload={"actor": "sora", "kind": "private", "to_identity": "user:owner", "text": "断点恢复不重复落库"},
+            )
+            crash_ref = d1._deliver_webchat_outbox(
+                did_crash,
+                {"actor": "sora", "kind": "private", "to_identity": "user:owner", "text": "断点恢复不重复落库"},
+            )
+            with d1.authority.store.tx() as ldb:
+                ldb.execute(
+                    "UPDATE outbox SET state='sending', attempts=1 WHERE delivery_id=?",
+                    (did_crash,),
+                )
+        finally:
+            ch1.stop()
+            d1.close()
+
+        # Restart HouseDaemon cleanly on the SAME runtime_dir & timestamp
+        d2 = HouseDaemon(
+            rt,
+            pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
+            env=env,
+            start_ts=day_ts,
+            virtual_clock=True,
+            allow_onboarding=False,
+        )
+        self.addCleanup(d2.close)
+        # SendGate quota persists across restart -> did_second_cap STILL stays pending;
+        # `did_crash` in state='sending' reconciles to 'sent' via webchat_deliveries without inserting a duplicate!
+        res_after = d2.flush_outbox(reconcile=True)
+        self.assertEqual(res_after["dispatched"][did_second_cap], "pending")
+        self.assertEqual(res_after["reconciled"][did_crash], "sent")
+        with contextlib.closing(sqlite3.connect(d2.world_db)) as wc, d2.authority.store.read() as lc:
+            cnt = wc.execute(
+                "SELECT COUNT(*) FROM chat_messages WHERE text='断点恢复不重复落库'"
+            ).fetchone()[0]
+            ob_state = lc.execute(
+                "SELECT state, external_ref FROM outbox WHERE delivery_id=?",
+                (did_crash,),
+            ).fetchone()
+        self.assertEqual(cnt, 1)
+        self.assertEqual(ob_state[0], "sent")
+        self.assertEqual(ob_state[1], crash_ref)
+
+        # Even if an old sending row without webchat_deliveries had been reverted to pending, re-sending is idempotent
+        again_ref = d2._deliver_webchat_outbox(
+            did_crash,
+            {"actor": "sora", "kind": "private", "to_identity": "user:owner", "text": "断点恢复不重复落库"},
+        )
+        self.assertEqual(again_ref, crash_ref)
+        with contextlib.closing(sqlite3.connect(d2.world_db)) as wc:
+            self.assertEqual(
+                wc.execute("SELECT COUNT(*) FROM chat_messages WHERE text='断点恢复不重复落库'").fetchone()[0],
+                1,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
