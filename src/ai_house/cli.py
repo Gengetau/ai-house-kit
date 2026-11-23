@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import sqlite3
 import sys
 from pathlib import Path
@@ -129,6 +130,15 @@ def cmd_up(args: argparse.Namespace) -> int:
         f"   • 模型模式: {mode_label}\n",
         flush=True,
     )
+    # `systemctl stop` / `docker stop` send SIGTERM: leave through the same path as Ctrl+C so the channels are
+    # closed, the databases are checkpointed and the runtime lock is released.
+    def _on_sigterm(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):  # not the main thread (tests embedding cmd_up), or unsupported
+        pass
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -304,6 +314,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         })
 
     ws_url = eff_env.get("ONEBOT_WS_URL", "").strip()
+    onebot_ping = bool(getattr(args, "onebot_ping", False))
     if ws_url:
         ob_errs = []
         from urllib.parse import urlparse
@@ -327,8 +338,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks.append({
             "name": "onebot_ws",
             "ok": len(ob_errs) == 0,
-            "detail": "; ".join(ob_errs) if ob_errs else "OneBot v11 WebSocket 配置与依赖就绪",
+            "detail": "; ".join(ob_errs) if ob_errs else (
+                "OneBot v11 WebSocket 配置与依赖就绪" + ("" if onebot_ping else "（加 --onebot-ping 可实际连一次协议端）")
+            ),
         })
+        if onebot_ping and not ob_errs:
+            from .onebot_probe import probe_onebot
+
+            res = probe_onebot(ws_url, eff_env.get("ONEBOT_ACCESS_TOKEN", ""), owner_ids=owner_parts)
+            checks.append({"name": "onebot_live_ping", "ok": bool(res["ok"]), "detail": res["detail"]})
+    elif onebot_ping:
+        checks.append({"name": "onebot_live_ping", "ok": False, "detail": "指定了 --onebot-ping 但未配置 ONEBOT_WS_URL"})
 
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -534,6 +554,10 @@ def main(argv: list[str] | None = None) -> int:
     p_doc.add_argument("--pack", default=None, help="指定待校验的 WorldPack 名称或路径")
     p_doc.add_argument("--json", action="store_true", help="以 JSON 格式输出完整自检报告")
     p_doc.add_argument("--live-ping", action="store_true", help="向当前配置的 OpenAI 兼容接口发起真实连通性测试")
+    p_doc.add_argument(
+        "--onebot-ping", action="store_true",
+        help="实际连一次 ONEBOT_WS_URL 指向的 OneBot 协议端，检查令牌和登录状态（不发任何消息）",
+    )
     p_doc.set_defaults(func=cmd_doctor)
 
     p_pl = sub.add_parser("plugins", help="列出已发现的四轴插件与世界内容包")

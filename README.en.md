@@ -2,7 +2,7 @@
 
 **Bring an AI sharehouse to life in one command — roommates with daily routines, cooking & outfits, audience-isolated long-term memory, personal evening diaries, and optional Qingkong City trips.**
 
-> 📖 **[中文 README](README.md)** · 🧩 **[Custom WorldPack & Plugin Tutorial](docs/CUSTOM-WORLD-TUTORIAL.md)** · 🏙️ **[Plugins & Qingkong City](docs/PLUGINS-AND-CITY.md)** · 💬 **[Chat & QQ Setup](docs/CHAT-AND-QQ.md)**
+> 📖 **[中文 README](README.md)** · 🧩 **[Custom WorldPack & Plugin Tutorial](docs/CUSTOM-WORLD-TUTORIAL.md)** · 🏙️ **[Plugins & Qingkong City](docs/PLUGINS-AND-CITY.md)** · 💬 **[Chat & QQ Setup](docs/CHAT-AND-QQ.md)** · 🚀 **[Always-on & side-by-side deployment](docs/DEPLOY.md)**
 
 ## Highlights
 

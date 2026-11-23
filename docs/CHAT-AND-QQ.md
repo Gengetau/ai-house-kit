@@ -29,6 +29,7 @@ ai-house up
 
 > **Docker 方式接 QQ 说明**：`Dockerfile` 已内置安装 `.[onebot]`，`compose.yaml` 也配置了 `host.docker.internal:host-gateway`。
 > 若 OneBot 端（如 SnowLuma / NapCat / Lagrange）跑在宿主机上，在 `.env` 里请把 `ONEBOT_WS_URL` 写成 `ws://host.docker.internal:3001`（不要写 `127.0.0.1`，容器里指向容器自身）。
+> 协议端也在 Docker 里、后台常驻（systemd / compose）以及 SnowLuma 侧要开哪些设置，见 [DEPLOY.md](DEPLOY.md)。
 
 在 `.env` 里写：
 
@@ -54,6 +55,12 @@ ONEBOT_STALE_S=120
 ```
 
 配置有问题（没写房主、室友名不存在、URL 不是 ws://、数字写错）时 `ai-house up` 会直接报错退出，不会半开着运行。
+
+配好之后可以先检查连通（只问登录状态，不发任何消息）：
+
+```sh
+ai-house doctor --onebot-ping
+```
 
 ### 它怎么表现
 
