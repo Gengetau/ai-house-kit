@@ -61,7 +61,9 @@ from .onboarding import (
     write_custom_pack,
 )
 from .plugin_api import (
+    AttachmentContext,
     PluginDefinition,
+    PluginHostProxy,
     PluginRegistry,
     PluginRequestContext,
     PluginRoute,
@@ -242,7 +244,9 @@ class HouseDaemon:
                 try:
                     inst = ch_factory()
                     if inst is not None:
-                        inst.start(self)
+                        ch_defn = self.registry.definitions.get(ch_pid)
+                        ch_host: Any = PluginHostProxy(self) if (ch_defn is not None and ch_defn.source != "builtin") else self
+                        inst.start(ch_host)
                         self.channels.append(inst)
                         self._active_channel_ids.add(ch_pid)
                 except ChannelConfigError:
@@ -550,7 +554,7 @@ class HouseDaemon:
                     task_id=task.task_id,
                     now=now,
                     plugin_config=cfg,
-                    daemon=self,
+                    daemon=PluginHostProxy(self) if defn.source != "builtin" else self,
                 )
                 if task.run_outside_lock:
                     task.handler(tctx)
@@ -575,7 +579,10 @@ class HouseDaemon:
             self.authority.step()
             for p in self.providers:
                 try:
-                    p.step(self)
+                    p_pid = str(getattr(p, "provider_id", "") or "")
+                    p_defn = self.registry.definitions.get(p_pid)
+                    p_host: Any = PluginHostProxy(self) if (p_defn is not None and p_defn.source != "builtin") else self
+                    p.step(p_host)
                 except Exception as exc:  # noqa: BLE001
                     pid = str(getattr(p, "provider_id", type(p).__name__))
                     err = {"plugin_id": pid, "group": "ai_house.providers", "error": f"{type(exc).__name__}: {exc}"}
@@ -802,6 +809,7 @@ class HouseDaemon:
         scope: str = "world",
         actor: Optional[str] = None,
         limit: int = 24,
+        include_data_uri: bool = True,
     ) -> Dict[str, Any]:
         stored_pl = self.settings_store.get_plugins_map()
         active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_pl)}
@@ -811,7 +819,7 @@ class HouseDaemon:
             raise ValueError(f"非法的相册作用域: {scope!r}")
         if not enabled or getattr(self, "album", None) is None:
             return {"ok": True, "enabled": enabled, "scope": sc, "items": []}
-        items = self.album.list_items(scope=sc, actor=actor, limit=limit, include_data_uri=True)
+        items = self.album.list_items(scope=sc, actor=actor, limit=limit, include_data_uri=include_data_uri)
         return {"ok": True, "enabled": True, "scope": sc, "items": items}
 
     def list_memories(
@@ -1201,77 +1209,50 @@ class HouseDaemon:
                         }
                     }
             nook = self._book_nook()
-            vision_enabled = "vision_understand" in active_pids
-            vision_cfg = (
-                self.registry.resolve_config("vision_understand", env=self.env, stored_plugins=stored_plugins)
-                if vision_enabled
-                else {}
-            )
-            voice_enabled = "voice_io" in active_pids
-            voice_cfg = (
-                self.registry.resolve_config("voice_io", env=self.env, stored_plugins=stored_plugins)
-                if voice_enabled
-                else {}
-            )
-            album_save_cfg = (
-                self.registry.resolve_config("album_diary_art", env=self.env, stored_plugins=stored_plugins)
-                if "album_diary_art" in active_pids
-                else None
-            )
+            proc_specs = self.registry.active_attachment_processors(self.env, stored_plugins=stored_plugins)
 
         # Release `self._lock` before attachment analysis, memory recall, and model HTTP calls.
         scope = "private" if is_private else "group"
         mem_ch = "" if is_private else channel
         speaker_role = "owner" if speaker.is_owner else "member"
         extra_tools = [t["spec"] for t in self._active_tools.values()]
-        model_user_text = text
-        if isinstance(attachments, Mapping):
-            media_notes: List[str] = []
-            if attachments.get("images") and album_save_cfg is not None:
+        media_notes: List[str] = []
+        if isinstance(attachments, Mapping) and attachments and proc_specs:
+            att_deadline = time.monotonic() + 10.0
+            single_target = targets[0] if len(targets) == 1 else ""
+            for proc_defn, proc in proc_specs:
+                if time.monotonic() >= att_deadline:
+                    self.log(f"attachment pipeline timed out after 10s before {proc_defn.plugin_id}.{proc.processor_id}")
+                    break
                 try:
-                    from .builtin_plugins.album_diary_art import archive_chat_images
-
-                    archive_chat_images(
-                        list(attachments.get("images") or ()),
-                        scope=scope,
-                        channel=channel,
-                        actor=targets[0] if len(targets) == 1 else "",
-                        daemon=self,
-                        now=now,
-                        cfg=album_save_cfg,
+                    p_cfg, p_warns = self.registry.safe_resolve_config(
+                        proc_defn.plugin_id, env=self.env, stored_plugins=stored_plugins
                     )
-                except Exception:  # noqa: BLE001
-                    pass
-            if attachments.get("images") and vision_enabled:
-                try:
-                    from .builtin_plugins.vision_understand import enrich_chat_images
-
-                    media_notes.extend(enrich_chat_images(
-                        list(attachments.get("images") or ()),
-                        daemon=self,
-                        actor=targets[0] if targets else "",
+                    for w in p_warns:
+                        self.log(f"plugin {proc_defn.plugin_id} config warning: {mask_secrets(w)}")
+                    proc_daemon: Any = PluginHostProxy(self) if proc_defn.source != "builtin" else self
+                    proc_actor = single_target if proc_defn.plugin_id == "album_diary_art" else (targets[0] if targets else "")
+                    actx = AttachmentContext(
                         scope=scope,
                         channel=channel,
-                        cfg=vision_cfg,
-                    ))
-                except Exception:  # noqa: BLE001
-                    pass
-            if attachments.get("records") and voice_enabled:
-                try:
-                    from .builtin_plugins.voice_io import enrich_chat_records
-
-                    media_notes.extend(enrich_chat_records(
-                        list(attachments.get("records") or ()),
-                        daemon=self,
-                        actor=targets[0] if targets else "",
-                        scope=scope,
-                        channel=channel,
-                        cfg=voice_cfg,
-                    ))
-                except Exception:  # noqa: BLE001
-                    pass
-            if media_notes:
-                model_user_text = f"{text}\n" + "\n".join(media_notes)
+                        actor=proc_actor,
+                        speaker=speaker,
+                        now=now,
+                        attachments=attachments,
+                        plugin_config=p_cfg,
+                        daemon=proc_daemon,
+                    )
+                    out_notes = proc.handler(actx)
+                    if out_notes:
+                        for note in out_notes:
+                            clean_note = str(note or "").strip()
+                            if clean_note:
+                                media_notes.append(clean_note)
+                except Exception as exc:  # noqa: BLE001
+                    err_txt = mask_secrets(f"{type(exc).__name__}: {exc}")
+                    for sec in self.model_router.collect_secrets():
+                        err_txt = mask_secrets(err_txt, api_key=sec)
+                    self.log(f"attachment {proc_defn.plugin_id}.{proc.processor_id} skipped: {err_txt}")
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
             if self._world_epoch != turn_epoch or self.memory is None:
@@ -1365,6 +1346,8 @@ class HouseDaemon:
                                 if pid in self.registry.definitions
                                 else {}
                             )
+                            t_defn = self.registry.definitions.get(pid)
+                            t_daemon: Any = PluginHostProxy(self) if (t_defn is not None and t_defn.source != "builtin") else self
                             tctx = ToolContext(
                                 actor=_aid,
                                 scope=scope,
@@ -1372,7 +1355,7 @@ class HouseDaemon:
                                 speaker=speaker,
                                 now=now,
                                 plugin_config=plug_cfg,
-                                daemon=self,
+                                daemon=t_daemon,
                                 pending_media=_turn_media,
                             )
                             return invoke_tool_handler(reg, targs, tctx)
@@ -1387,13 +1370,14 @@ class HouseDaemon:
 
             rep = self.chat_agent.reply_as(
                 aid,
-                model_user_text,
+                text,
                 residents[aid],
                 snaps_by_target[aid],
                 recent,
                 where=where,
                 speaker=speaker,
                 memory_context=mem_ctx,
+                attachment_notes=media_notes,
                 extra_tools=extra_tools,
                 tool_runner=_run_tool,
             )
@@ -1895,7 +1879,9 @@ class HouseDaemon:
         started_ids: set[str] = set()
         for ch_pid, inst in cand_channels:
             try:
-                inst.start(self)
+                ch_defn = self.registry.definitions.get(ch_pid)
+                ch_host: Any = PluginHostProxy(self) if (ch_defn is not None and ch_defn.source != "builtin") else self
+                inst.start(ch_host)
                 started_channels.append(inst)
                 started_ids.add(ch_pid)
             except ChannelConfigError:
@@ -2259,7 +2245,7 @@ class HouseDaemon:
             query=dict(query or {}),
             body=body,
             plugin_config=cfg,
-            daemon=self,
+            daemon=PluginHostProxy(self) if defn.source != "builtin" else self,
             now=self.clock.now(),
         )
         res = route.handler(ctx)
@@ -2660,6 +2646,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 sc = (qs.get("scope") or ["world"])[0].strip().lower()
                 act = (qs.get("actor") or [None])[0]
                 lim = int((qs.get("limit") or ["24"])[0])
+                inline = (qs.get("inline") or ["1"])[0].strip() != "0"
                 need_tier = "read" if sc == "world" else "private"
                 if not self._need(parsed, need_tier):
                     return
@@ -2667,7 +2654,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json({"ok": True, "enabled": False, "scope": sc, "items": []})
                     return
                 try:
-                    self._send_json(daemon.list_album_view(scope=sc, actor=act, limit=lim))
+                    self._send_json(daemon.list_album_view(scope=sc, actor=act, limit=lim, include_data_uri=inline))
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return

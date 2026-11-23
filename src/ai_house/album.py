@@ -8,6 +8,7 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from .media_safety import (
     DEFAULT_MAX_MEDIA_BYTES,
@@ -32,10 +33,12 @@ CREATE TABLE IF NOT EXISTS album_items (
     media_rel TEXT NOT NULL,
     mime TEXT NOT NULL DEFAULT 'image/png',
     diary_day TEXT NOT NULL DEFAULT '',
+    sha256 TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_album_scope_time ON album_items(scope, actor, created_at DESC);
 """
+MAX_CHAT_IMAGES_PER_CHANNEL = 200
 
 
 class AlbumStore:
@@ -57,6 +60,12 @@ class AlbumStore:
         with self._lock, contextlib.closing(self._conn()) as c:
             with c:
                 c.executescript(ALBUM_SCHEMA)
+                cols = {r[1] for r in c.execute("PRAGMA table_info(album_items)").fetchall()}
+                if "sha256" not in cols:
+                    c.execute("ALTER TABLE album_items ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
+                c.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_album_dedup ON album_items(scope, channel, actor, kind, sha256)"
+                )
 
     def reset(self) -> None:
         with self._lock:
@@ -101,49 +110,89 @@ class AlbumStore:
             raise ValueError("图像大小无效")
 
         ext = media_ext_for_mime(mime, default="png")
-        aid = f"alb-{int(now or 0)}-{hashlib.sha256(raw_bytes).hexdigest()[:8]}-{uuid.uuid4().hex[:6]}"
-        rel_dir = self.runtime_dir / "media" / "album" / eff_scope
-        rel_dir.mkdir(parents=True, exist_ok=True)
-        target_path = rel_dir / f"{aid}.{ext}"
-        target_path.write_bytes(raw_bytes)
-        media_rel = f"media/album/{eff_scope}/{target_path.name}"
+        clean_channel = str(channel or "").strip()
+        eff_kind = str(kind or "photo").strip()[:32]
+        digest = hashlib.sha256(raw_bytes).hexdigest()
 
         self.init_schema()
         with self._lock, contextlib.closing(self._conn()) as c:
+            existing = c.execute(
+                "SELECT album_id, scope, actor, channel, kind, title, caption, media_rel, mime, diary_day, created_at "
+                "FROM album_items WHERE scope=? AND channel=? AND actor=? AND kind=? AND sha256=? AND sha256!='' LIMIT 1",
+                (eff_scope, clean_channel, clean_actor, eff_kind, digest),
+            ).fetchone()
+            if existing is not None:
+                return self._hydrate_item(existing, include_data_uri=False)
+
+            aid = f"alb-{int(now or 0)}-{digest[:8]}-{uuid.uuid4().hex[:6]}"
+            rel_dir = self.runtime_dir / "media" / "album" / eff_scope
+            rel_dir.mkdir(parents=True, exist_ok=True)
+            target_path = rel_dir / f"{aid}.{ext}"
+            target_path.write_bytes(raw_bytes)
+            media_rel = f"media/album/{eff_scope}/{target_path.name}"
+            eff_mime = str(mime or mime_for_path(target_path, "image/png"))
+            clean_title = str(title or "").strip()[:120]
+            clean_caption = str(caption or "").strip()[:240]
+            clean_day = str(diary_day or "").strip()
+            eff_now = float(now or 0.0)
+
             with c:
                 c.execute(
-                    "INSERT INTO album_items(album_id, scope, actor, channel, kind, title, caption, media_rel, mime, diary_day, created_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO album_items(album_id, scope, actor, channel, kind, title, caption, media_rel, mime, diary_day, sha256, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         aid,
                         eff_scope,
                         clean_actor,
-                        str(channel or "").strip(),
-                        str(kind or "photo").strip()[:32],
-                        str(title or "").strip()[:120],
-                        str(caption or "").strip()[:240],
+                        clean_channel,
+                        eff_kind,
+                        clean_title,
+                        clean_caption,
                         media_rel,
-                        str(mime or mime_for_path(target_path, "image/png")),
-                        str(diary_day or "").strip(),
-                        float(now or 0.0),
+                        eff_mime,
+                        clean_day,
+                        digest,
+                        eff_now,
                     ),
                 )
-        return {
+                if eff_kind == "chat_image":
+                    overflow = c.execute(
+                        "SELECT album_id, media_rel FROM album_items "
+                        "WHERE scope=? AND channel=? AND kind='chat_image' "
+                        "ORDER BY created_at DESC, album_id DESC LIMIT -1 OFFSET ?",
+                        (eff_scope, clean_channel, MAX_CHAT_IMAGES_PER_CHANNEL),
+                    ).fetchall()
+                    for ov in overflow:
+                        c.execute("DELETE FROM album_items WHERE album_id=?", (ov["album_id"],))
+                        still = c.execute(
+                            "SELECT COUNT(*) FROM album_items WHERE media_rel=?", (ov["media_rel"],)
+                        ).fetchone()[0]
+                        if int(still) == 0:
+                            try:
+                                resolve_runtime_media_path(self.runtime_dir, str(ov["media_rel"])).unlink(missing_ok=True)
+                            except ValueError:
+                                pass
+
+        res_doc: Dict[str, Any] = {
             "album_id": aid,
             "scope": eff_scope,
             "actor": clean_actor,
-            "channel": str(channel or "").strip(),
-            "kind": str(kind or "photo").strip()[:32],
-            "title": str(title or "").strip()[:120],
-            "caption": str(caption or "").strip()[:240],
+            "channel": clean_channel,
+            "kind": eff_kind,
+            "title": clean_title,
+            "caption": clean_caption,
             "media_rel": media_rel,
-            "mime": str(mime or mime_for_path(target_path, "image/png")),
-            "diary_day": str(diary_day or "").strip(),
-            "created_at": float(now or 0.0),
+            "mime": eff_mime,
+            "diary_day": clean_day,
+            "created_at": eff_now,
+            "media_url": f"/api/album/media?path={quote(media_rel, safe='')}",
         }
+        return res_doc
 
     def _hydrate_item(self, row: sqlite3.Row, *, include_data_uri: bool) -> Dict[str, Any]:
         doc = dict(row)
+        if doc.get("media_rel"):
+            doc["media_url"] = f"/api/album/media?path={quote(str(doc['media_rel']), safe='')}"
         if include_data_uri:
             try:
                 fp = resolve_runtime_media_path(self.runtime_dir, doc["media_rel"])

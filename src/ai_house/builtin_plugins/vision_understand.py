@@ -1,6 +1,7 @@
 """Stage 3.1 optional multimodal vision understanding plugin (`vision_understand`, default disabled)."""
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from ..chat_agent import quote_untrusted
@@ -14,6 +15,8 @@ from ..media_safety import (
     to_data_uri,
 )
 from ..plugin_api import (
+    AttachmentContext,
+    AttachmentProcessor,
     ConfigField,
     PluginDefinition,
     PluginManifest,
@@ -100,6 +103,15 @@ def _load_image_as_data_uri(
     raise ValueError("不支持的图片地址形式（仅支持 http(s)://、data:image/... 或 media/...）")
 
 
+def _quota_fns(daemon: Any):
+    if daemon is None:
+        return None, None
+    router = getattr(daemon, "model_router", None)
+    chk = getattr(router, "check_plugin_quota", None) or getattr(daemon, "check_plugin_quota", None)
+    rec = getattr(router, "record_plugin_call", None) or getattr(daemon, "record_plugin_call", None)
+    return (chk if callable(chk) else None), (rec if callable(rec) else None)
+
+
 def describe_image_source(
     source: str,
     prompt: str = "请简述这张图片里的画面内容、人物/物品与氛围。",
@@ -109,10 +121,13 @@ def describe_image_source(
     actor: str = "",
     scope: str = "private",
     channel: str = "",
+    speaker_id: str = "",
+    is_owner: bool = True,
 ) -> Dict[str, Any]:
     """Understand one image via an OpenAI-compatible vision endpoint, degrading quietly on any fault."""
     conf = dict(cfg or {})
     base_url, api_key, model = _resolve_vision_endpoint(conf, daemon=daemon, actor=actor)
+    daily_limit = max(1, min(int(conf.get("daily_limit") or 60), 5000))
     if not api_key:
         return {
             "ok": False,
@@ -129,6 +144,12 @@ def describe_image_source(
             "error": "视觉模型 Base URL 必须以 http:// 或 https:// 开头",
             "summary": "",
         }
+
+    chk_quota, rec_call = _quota_fns(daemon)
+    if chk_quota is not None:
+        q_err = chk_quota(PLUGIN_ID, speaker_id=speaker_id, is_owner=is_owner, daily_limit=daily_limit)
+        if q_err:
+            return {"ok": False, "degraded": True, "status": "quota_exceeded", "error": q_err, "summary": ""}
 
     allow_loopback = bool(conf.get("allow_loopback_media", False))
     try:
@@ -171,10 +192,23 @@ def describe_image_source(
         "temperature": 0.2,
         "max_tokens": 220,
     }
+    t0 = time.monotonic()
     try:
         doc = post_openai_chat_json(base_url=base_url, api_key=api_key, payload=payload, timeout_s=15.0)
         summary = quote_untrusted(_extract_choice_text(doc))[:240]
         if not summary:
+            if rec_call is not None:
+                rec_call(
+                    PLUGIN_ID,
+                    actor=actor,
+                    model=model,
+                    base_url=base_url,
+                    speaker_id=speaker_id,
+                    is_owner=is_owner,
+                    latency_ms=int((time.monotonic() - t0) * 1000),
+                    ok=False,
+                    error_code="empty_response",
+                )
             return {
                 "ok": False,
                 "degraded": True,
@@ -182,8 +216,33 @@ def describe_image_source(
                 "error": "视觉模型未返回有效描述",
                 "summary": "",
             }
+        tokens = int((doc.get("usage") or {}).get("total_tokens") or 0)
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=True,
+                total_tokens=tokens,
+            )
         return {"ok": True, "degraded": False, "status": "ok", "model": model, "summary": summary}
     except LLMAPIError as exc:
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                error_code=f"HTTP_{exc.status_code}",
+            )
         return {
             "ok": False,
             "degraded": True,
@@ -192,6 +251,18 @@ def describe_image_source(
             "summary": "",
         }
     except Exception as exc:  # noqa: BLE001
+        if rec_call is not None:
+            rec_call(
+                PLUGIN_ID,
+                actor=actor,
+                model=model,
+                base_url=base_url,
+                speaker_id=speaker_id,
+                is_owner=is_owner,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                ok=False,
+                error_code=type(exc).__name__,
+            )
         return {
             "ok": False,
             "degraded": True,
@@ -209,6 +280,8 @@ def enrich_chat_images(
     scope: str = "group",
     channel: str = "",
     cfg: Optional[Mapping[str, Any]] = None,
+    speaker_id: str = "",
+    is_owner: bool = True,
 ) -> List[str]:
     """Inspect up to 2 inbound image refs cleanly; faults degrade to empty annotations."""
     notes: List[str] = []
@@ -220,10 +293,31 @@ def enrich_chat_images(
             actor=actor,
             scope=scope,
             channel=channel,
+            speaker_id=speaker_id,
+            is_owner=is_owner,
         )
         if res.get("ok") and res.get("summary"):
             notes.append(f"[附带图片画面参考：{res['summary']}]")
     return notes
+
+
+def _process_attachments(actx: AttachmentContext) -> List[str]:
+    imgs = actx.attachments.get("images") if isinstance(actx.attachments, Mapping) else None
+    if not imgs:
+        return []
+    sp = actx.speaker
+    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
+    return enrich_chat_images(
+        list(imgs),
+        daemon=actx.daemon,
+        actor=actx.actor,
+        scope=actx.scope,
+        channel=actx.channel,
+        cfg=actx.plugin_config,
+        speaker_id=sp_id,
+        is_owner=is_owner,
+    )
 
 
 def _tool_inspect_image(
@@ -237,7 +331,20 @@ def _tool_inspect_image(
     actor = ctx.actor if ctx is not None else ""
     scope = ctx.scope if ctx is not None else "group"
     channel = ctx.channel if ctx is not None else ""
-    return describe_image_source(source, prompt=prompt, cfg=cfg, daemon=daemon, actor=actor, scope=scope, channel=channel)
+    sp = ctx.speaker if ctx is not None else None
+    sp_id = str(getattr(sp, "identity_id", "") or getattr(sp, "name", "") or "")
+    is_owner = bool(getattr(sp, "is_owner", True)) if sp is not None else True
+    return describe_image_source(
+        source,
+        prompt=prompt,
+        cfg=cfg,
+        daemon=daemon,
+        actor=actor,
+        scope=scope,
+        channel=channel,
+        speaker_id=sp_id,
+        is_owner=is_owner,
+    )
 
 
 def _route_describe(rctx: PluginRequestContext) -> Dict[str, Any]:
@@ -308,6 +415,16 @@ PLUGIN_DEF = PluginDefinition(
                 env_var="AI_HOUSE_VISION_ALLOW_LOOPBACK",
                 description="本地 OneBot / 调试服务在同一宿主机吐出 127.0.0.1 图片地址时开启。",
             ),
+            ConfigField(
+                key="daily_limit",
+                label="每日调用上限",
+                field_type="int",
+                default=60,
+                min_val=1,
+                max_val=5000,
+                env_var="AI_HOUSE_VISION_DAILY_LIMIT",
+                description="每天允许调用视觉理解接口的最大次数。",
+            ),
         ),
     ),
     tools=(
@@ -331,5 +448,8 @@ PLUGIN_DEF = PluginDefinition(
     ),
     routes=(
         PluginRoute(method="POST", subpath="/describe", handler=_route_describe, tier="write"),
+    ),
+    attachment_processors=(
+        AttachmentProcessor(processor_id="vision_images", handler=_process_attachments, priority=20),
     ),
 )

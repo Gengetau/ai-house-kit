@@ -99,32 +99,56 @@ def _extract_http_error_detail(exc: urllib.error.HTTPError, api_key: str = "") -
     return mask_secrets(detail, api_key=api_key)[:280]
 
 
-def _adapt_reasoning_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def _adapt_reasoning_payload(payload: Mapping[str, Any], *, min_tokens: int = 2048) -> Dict[str, Any]:
     adapted = dict(payload)
+    floor = max(1024, int(min_tokens))
     if "max_tokens" in adapted:
         old_max = adapted.pop("max_tokens")
         try:
             n = int(old_max or 0)
         except (TypeError, ValueError):
             n = 0
-        adapted["max_completion_tokens"] = max(n, 1024)
+        adapted["max_completion_tokens"] = max(n * 4, floor)
     elif "max_completion_tokens" in adapted:
         try:
             n = int(adapted["max_completion_tokens"] or 0)
         except (TypeError, ValueError):
             n = 0
-        if n < 1024:
-            adapted["max_completion_tokens"] = 1024
+        if n < floor:
+            adapted["max_completion_tokens"] = floor
     adapted.pop("temperature", None)
     return adapted
 
 
 def _compat_retry_payload(payload: Mapping[str, Any], detail: str) -> Optional[Dict[str, Any]]:
     low = detail.lower()
+    if any(exc_tok in low for exc_tok in ("context_length", "maximum context", "too long")):
+        return None
     if not any(tok in low for tok in ("max_tokens", "max_completion_tokens", "temperature")):
+        return None
+    indicators = (
+        "unsupported",
+        "not supported",
+        "unrecognized",
+        "unknown parameter",
+        "unsupported_parameter",
+        "unsupported_value",
+        "only the default",
+    )
+    if not any(ind in low for ind in indicators):
         return None
     adapted = _adapt_reasoning_payload(payload)
     return adapted if adapted != dict(payload) else None
+
+
+def _is_empty_reasoning_length(doc: Mapping[str, Any]) -> bool:
+    choice = (doc.get("choices") or [{}])[0]
+    if str(choice.get("finish_reason") or "").strip().lower() != "length":
+        return False
+    msg = choice.get("message") or {}
+    content = str(msg.get("content") or "").strip()
+    tcalls = msg.get("tool_calls") or []
+    return (not content) and (not tcalls)
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -149,6 +173,27 @@ def _send_chat_request(url: str, api_key: str, payload: Mapping[str, Any], timeo
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
+def _send_with_length_retry(
+    url: str,
+    api_key: str,
+    payload: Mapping[str, Any],
+    timeout_s: float,
+) -> Dict[str, Any]:
+    doc = _send_chat_request(url, api_key, payload, timeout_s)
+    if _is_empty_reasoning_length(doc):
+        cur_limit = _safe_int(payload.get("max_completion_tokens") or payload.get("max_tokens"), 2048)
+        bumped = _adapt_reasoning_payload(payload, min_tokens=max(cur_limit * 2, 4096))
+        doc2 = _send_chat_request(url, api_key, bumped, timeout_s)
+        if _is_empty_reasoning_length(doc2):
+            raise LLMAPIError(
+                502,
+                "HTTP 502: reasoning tokens exhausted with empty content",
+                detail="empty_reasoning_length",
+            )
+        return doc2
+    return doc
+
+
 def post_openai_chat_json(
     *,
     base_url: str,
@@ -159,14 +204,14 @@ def post_openai_chat_json(
     """POST to `/v1/chat/completions`, auto-adapting GPT-5/o-series parameter limits on HTTP 400."""
     url = _chat_completions_url(base_url)
     try:
-        return _send_chat_request(url, api_key, payload, timeout_s)
+        return _send_with_length_retry(url, api_key, payload, timeout_s)
     except urllib.error.HTTPError as exc:
         detail = _extract_http_error_detail(exc, api_key=api_key)
         if exc.code == 400:
             retry_payload = _compat_retry_payload(payload, detail)
             if retry_payload is not None:
                 try:
-                    return _send_chat_request(url, api_key, retry_payload, timeout_s)
+                    return _send_with_length_retry(url, api_key, retry_payload, timeout_s)
                 except urllib.error.HTTPError as retry_exc:
                     retry_detail = _extract_http_error_detail(retry_exc, api_key=api_key)
                     raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {retry_detail}", detail=retry_detail) from retry_exc
@@ -277,6 +322,8 @@ class ModelRouter:
         self._clock = clock
         self.retry_delay_s = max(0.0, float(retry_delay_s))
         self._reasoning_caps: set[Tuple[str, str]] = set()
+        self._breaker_state: Dict[Tuple[str, str], Tuple[int, float]] = {}
+        self._plugin_visitor_calls: Dict[Tuple[str, str], List[float]] = {}
         self._config_path = (self.runtime_dir / self.CONFIG_FILENAME) if self.runtime_dir is not None else None
         self._usage_db = (self.runtime_dir / self.USAGE_DB_FILENAME) if self.runtime_dir is not None else None
         self._overrides: Dict[str, Any] = self._load_overrides()
@@ -316,10 +363,14 @@ class ModelRouter:
     def close(self) -> None:
         with self._lock:
             self._reasoning_caps.clear()
+            self._breaker_state.clear()
+            self._plugin_visitor_calls.clear()
 
     def update_env(self, env: Mapping[str, str]) -> None:
         with self._lock:
             self.env = dict(env)
+            self._reasoning_caps.clear()
+            self._breaker_state.clear()
 
     def update_overrides(self, spec: Mapping[str, Any], *, persist: bool = True) -> None:
         """Persist optional fallback, per-resident model routes, and task parameter overrides."""
@@ -399,8 +450,11 @@ class ModelRouter:
                 self._overrides["task_profiles"] = tp_out
                 changed = True
 
-            if changed and persist:
-                self._save_overrides()
+            if changed:
+                self._reasoning_caps.clear()
+                self._breaker_state.clear()
+                if persist:
+                    self._save_overrides()
 
     def status_view(self) -> Dict[str, Any]:
         with self._lock:
@@ -766,6 +820,103 @@ class ModelRouter:
             "recent": recent,
         }
 
+    def check_plugin_quota(
+        self,
+        plugin_id: str,
+        *,
+        speaker_id: str = "",
+        is_owner: bool = True,
+        daily_limit: int = 60,
+        visitor_hourly_limit: int = 20,
+    ) -> Optional[str]:
+        """Enforce per-plugin daily ledger limit and non-owner hourly burst cap; returns reason or None."""
+        pid = str(plugin_id or "").strip() or "unknown"
+        eff_daily = max(1, min(int(daily_limit or 60), 5000))
+        now_ts = self._now()
+        day_jst = dt.datetime.fromtimestamp(now_ts, JST).date().isoformat()
+        purpose = f"plugin:{pid}"
+        with self._lock:
+            if self._usage_db is not None and self._usage_db.exists():
+                with contextlib.closing(sqlite3.connect(self._usage_db, timeout=5)) as c:
+                    used_today = int(
+                        c.execute(
+                            "SELECT COUNT(*) FROM llm_usage WHERE day_jst=? AND purpose=? AND ok=1",
+                            (day_jst, purpose),
+                        ).fetchone()[0]
+                    )
+                if used_today >= eff_daily:
+                    return f"插件 {pid} 已达到今日调用上限 ({used_today}/{eff_daily})"
+            if not is_owner:
+                eff_hourly = max(1, int(visitor_hourly_limit or 20))
+                vkey = (pid, str(speaker_id or "visitor").strip() or "visitor")
+                cutoff = now_ts - 3600.0
+                recent = [t for t in self._plugin_visitor_calls.get(vkey, ()) if t >= cutoff]
+                self._plugin_visitor_calls[vkey] = recent
+                if len(recent) >= eff_hourly:
+                    return f"插件 {pid} 非房主每小时调用已达上限 ({len(recent)}/{eff_hourly})"
+        return None
+
+    def record_plugin_call(
+        self,
+        plugin_id: str,
+        *,
+        actor: str = "",
+        model: str = "",
+        base_url: str = "",
+        speaker_id: str = "",
+        is_owner: bool = True,
+        latency_ms: int = 0,
+        ok: bool = True,
+        error_code: str = "",
+        total_tokens: int = 0,
+    ) -> None:
+        """Record a third-party/optional plugin billable call into `usage.db` under `plugin:<id>`."""
+        pid = str(plugin_id or "").strip() or "unknown"
+        now_ts = self._now()
+        with self._lock:
+            if not is_owner and ok:
+                vkey = (pid, str(speaker_id or "visitor").strip() or "visitor")
+                cutoff = now_ts - 3600.0
+                recent = [t for t in self._plugin_visitor_calls.get(vkey, ()) if t >= cutoff]
+                recent.append(now_ts)
+                self._plugin_visitor_calls[vkey] = recent
+        ep = ModelEndpoint(
+            base_url=str(base_url or "plugin://local"),
+            api_key="",
+            model=str(model or pid),
+        )
+        self._record_usage(
+            purpose=f"plugin:{pid}",
+            actor=actor,
+            endpoint=ep,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=int(total_tokens or 0),
+            latency_ms=int(latency_ms or 0),
+            ok=ok,
+            fallback_used=False,
+            error_code=error_code,
+        )
+
+    def _breaker_is_open(self, cap_key: Tuple[str, str]) -> bool:
+        with self._lock:
+            _, open_until = self._breaker_state.get(cap_key, (0, 0.0))
+            return open_until > self._now()
+
+    def _record_breaker_success(self, cap_key: Tuple[str, str]) -> None:
+        with self._lock:
+            self._breaker_state.pop(cap_key, None)
+
+    def _record_breaker_failure(self, cap_key: Tuple[str, str]) -> bool:
+        with self._lock:
+            cnt, _ = self._breaker_state.get(cap_key, (0, 0.0))
+            cnt += 1
+            if cnt >= 3:
+                self._breaker_state[cap_key] = (cnt, self._now() + 30.0)
+                return True
+            self._breaker_state[cap_key] = (cnt, 0.0)
+            return False
+
     def _call_single_endpoint(
         self,
         ep: ModelEndpoint,
@@ -778,7 +929,7 @@ class ModelRouter:
             is_reasoning = cap_key in self._reasoning_caps
         payload = _adapt_reasoning_payload(base_payload) if is_reasoning else dict(base_payload)
         try:
-            return _send_chat_request(url, ep.api_key, payload, timeout_s)
+            return _send_with_length_retry(url, ep.api_key, payload, timeout_s)
         except urllib.error.HTTPError as exc:
             detail = _extract_http_error_detail(exc, api_key=ep.api_key)
             if exc.code == 400 and not is_reasoning:
@@ -787,7 +938,7 @@ class ModelRouter:
                     with self._lock:
                         self._reasoning_caps.add(cap_key)
                     try:
-                        return _send_chat_request(url, ep.api_key, retry_payload, timeout_s)
+                        return _send_with_length_retry(url, ep.api_key, retry_payload, timeout_s)
                     except urllib.error.HTTPError as retry_exc:
                         r_detail = _extract_http_error_detail(retry_exc, api_key=ep.api_key)
                         raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {r_detail}", detail=r_detail) from retry_exc
@@ -816,6 +967,23 @@ class ModelRouter:
 
         last_exc: Optional[BaseException] = None
         for ep, is_fallback in eps:
+            cap_key = (ep.base_url, ep.model)
+            if self._breaker_is_open(cap_key):
+                self._record_usage(
+                    purpose=purpose,
+                    actor=actor,
+                    endpoint=ep,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    latency_ms=0,
+                    ok=False,
+                    fallback_used=is_fallback,
+                    error_code="CIRCUIT_OPEN",
+                )
+                last_exc = LLMAPIError(503, "Endpoint circuit breaker open", detail="circuit_open")
+                continue
+
             payload: Dict[str, Any] = {
                 "model": ep.model,
                 "messages": list(messages),
@@ -830,12 +998,14 @@ class ModelRouter:
                 t0 = time.monotonic()
                 try:
                     doc = self._call_single_endpoint(ep, payload, eff_timeout)
+                    self._record_breaker_success(cap_key)
                     return self._finish_usage_success(doc, ep, purpose, actor, is_fallback, t0)
                 except LLMAPIError as exc:
                     if exc.status_code == 400 and tools and retry_without_tools_on_400:
                         plain_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
                         try:
                             doc2 = self._call_single_endpoint(ep, plain_payload, eff_timeout)
+                            self._record_breaker_success(cap_key)
                             return self._finish_usage_success(doc2, ep, purpose, actor, is_fallback, t0)
                         except LLMAPIError as inner_exc:
                             exc = inner_exc
@@ -854,6 +1024,8 @@ class ModelRouter:
                                 error_code=type(inner_exc).__name__,
                             )
                             last_exc = inner_exc
+                            if self._record_breaker_failure(cap_key):
+                                break
                             if attempt < prof.max_retries:
                                 time.sleep(self.retry_delay_s * (attempt + 1))
                                 continue
@@ -873,9 +1045,13 @@ class ModelRouter:
                         error_code=f"HTTP_{exc.status_code}",
                     )
                     last_exc = exc
-                    if exc.status_code in _TRANSIENT_HTTP_CODES and attempt < prof.max_retries:
-                        time.sleep(self.retry_delay_s * (attempt + 1))
-                        continue
+                    if exc.status_code in _TRANSIENT_HTTP_CODES:
+                        opened = self._record_breaker_failure(cap_key)
+                        if opened:
+                            break
+                        if exc.detail != "empty_reasoning_length" and attempt < prof.max_retries:
+                            time.sleep(self.retry_delay_s * (attempt + 1))
+                            continue
                     break
                 except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                     latency_ms = int((time.monotonic() - t0) * 1000)
@@ -892,7 +1068,8 @@ class ModelRouter:
                         error_code=type(exc).__name__,
                     )
                     last_exc = exc
-                    if attempt < prof.max_retries:
+                    opened = self._record_breaker_failure(cap_key)
+                    if not opened and attempt < prof.max_retries:
                         time.sleep(self.retry_delay_s * (attempt + 1))
                         continue
                     break

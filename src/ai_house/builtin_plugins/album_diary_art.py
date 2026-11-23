@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from ..chat_identity import quote_untrusted
 from ..media_safety import DEFAULT_MAX_MEDIA_BYTES, fetch_media_bytes, parse_data_uri
 from ..plugin_api import (
+    AttachmentContext,
+    AttachmentProcessor,
     ConfigField,
     PluginDefinition,
     PluginManifest,
@@ -141,7 +143,7 @@ def archive_chat_images(
                 mime, raw = fetch_media_bytes(
                     src,
                     max_bytes=DEFAULT_MAX_MEDIA_BYTES,
-                    timeout_s=8.0,
+                    timeout_s=3.0,
                     allow_loopback=bool(vcfg.get("allow_loopback_media", False)),
                 )
             else:
@@ -237,6 +239,22 @@ def _tool_browse_album(
             for it in items
         ]
     return {"ok": True, "scope": req_scope, "items": items}
+
+
+def _process_attachments(actx: AttachmentContext) -> List[str]:
+    imgs = actx.attachments.get("images") if isinstance(actx.attachments, Mapping) else None
+    if not imgs:
+        return []
+    archive_chat_images(
+        list(imgs),
+        scope=actx.scope,
+        channel=actx.channel,
+        actor=actx.actor,
+        daemon=actx.daemon,
+        now=actx.now,
+        cfg=actx.plugin_config,
+    )
+    return []
 
 
 def _route_public_items(rctx: PluginRequestContext) -> Dict[str, Any]:
@@ -357,5 +375,8 @@ PLUGIN_DEF = PluginDefinition(
     routes=(
         PluginRoute(method="GET", subpath="/items", handler=_route_public_items, tier="read"),
         PluginRoute(method="GET", subpath="/private", handler=_route_private_items, tier="private"),
+    ),
+    attachment_processors=(
+        AttachmentProcessor(processor_id="album_archive_images", handler=_process_attachments, priority=10),
     ),
 )

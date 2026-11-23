@@ -267,6 +267,89 @@ class PluginTaskContext:
 
 
 @dataclass(frozen=True)
+class AttachmentContext:
+    """Execution context passed to inbound chat attachment hooks (`ai_house.attachment_processors`)."""
+
+    scope: str
+    channel: str
+    actor: str
+    speaker: Any
+    now: float
+    attachments: Mapping[str, Any] = field(default_factory=dict)
+    plugin_config: Mapping[str, Any] = field(default_factory=dict)
+    daemon: Any = None
+
+
+@dataclass(frozen=True)
+class AttachmentProcessor:
+    """Declarative inbound attachment analyzer/archiver executed before LLM reply generation."""
+
+    processor_id: str
+    handler: Callable[[AttachmentContext], Sequence[str]]
+    priority: int = 50
+
+
+class PluginHostProxy:
+    """Read-safe daemon façade exposed to third-party plugins so single-writer kernel DBs stay protected."""
+
+    def __init__(self, daemon: Any) -> None:
+        self._daemon = daemon
+
+    @property
+    def runtime_dir(self) -> Path:
+        return Path(self._daemon.runtime_dir)
+
+    @property
+    def env(self) -> Mapping[str, str]:
+        return dict(getattr(self._daemon, "env", {}) or {})
+
+    @property
+    def clock(self) -> Any:
+        return getattr(self._daemon, "clock", None)
+
+    @property
+    def vocab(self) -> Any:
+        return getattr(self._daemon, "vocab", None)
+
+    @property
+    def guard(self) -> Any:
+        return getattr(self._daemon, "guard", None)
+
+    @property
+    def album(self) -> Any:
+        return getattr(self._daemon, "album", None)
+
+    def log(self, msg: str) -> None:
+        self._daemon.log(msg)
+
+    def get_state(self) -> Dict[str, Any]:
+        return self._daemon.get_state()
+
+    def list_memories(self, **kwargs: Any) -> List[Dict[str, Any]]:
+        return self._daemon.list_memories(**kwargs)
+
+    def list_chat(self, channel: str = "group", limit: int = 50) -> List[Dict[str, Any]]:
+        return self._daemon.list_chat(channel, limit=limit)
+
+    def list_album_view(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._daemon.list_album_view(**kwargs)
+
+    def get_usage_summary(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._daemon.get_usage_summary(**kwargs)
+
+    def check_plugin_quota(self, plugin_id: str, **kwargs: Any) -> Optional[str]:
+        router = getattr(self._daemon, "model_router", None)
+        if router is not None and hasattr(router, "check_plugin_quota"):
+            return router.check_plugin_quota(plugin_id, **kwargs)
+        return None
+
+    def record_plugin_call(self, plugin_id: str, **kwargs: Any) -> None:
+        router = getattr(self._daemon, "model_router", None)
+        if router is not None and hasattr(router, "record_plugin_call"):
+            router.record_plugin_call(plugin_id, **kwargs)
+
+
+@dataclass(frozen=True)
 class PluginTask:
     """Declarative periodic background job dispatched during post-step cycles."""
 
@@ -404,6 +487,7 @@ class PluginDefinition:
     tools: Tuple[ToolRegistration, ...] = ()
     routes: Tuple[PluginRoute, ...] = ()
     tasks: Tuple[PluginTask, ...] = ()
+    attachment_processors: Tuple[AttachmentProcessor, ...] = ()
     source: str = "builtin"
 
     @property
@@ -610,6 +694,7 @@ class PluginRegistry:
                 ),
                 routes=loaded.routes,
                 tasks=loaded.tasks,
+                attachment_processors=loaded.attachment_processors,
                 source=source,
             )
             self.register_definition(defn)
@@ -989,6 +1074,18 @@ class PluginRegistry:
         for defn in self.active_definitions(env=env, stored_plugins=stored_plugins):
             for task in defn.tasks:
                 out.append((defn, task))
+        return out
+
+    def active_attachment_processors(
+        self,
+        env: Optional[Mapping[str, str]] = None,
+        stored_plugins: Optional[Mapping[str, Any]] = None,
+    ) -> List[Tuple[PluginDefinition, AttachmentProcessor]]:
+        out: List[Tuple[PluginDefinition, AttachmentProcessor]] = []
+        for defn in self.active_definitions(env=env, stored_plugins=stored_plugins):
+            for proc in defn.attachment_processors:
+                out.append((defn, proc))
+        out.sort(key=lambda pair: (int(pair[1].priority), pair[0].plugin_id, pair[1].processor_id))
         return out
 
 

@@ -1,6 +1,6 @@
 // 珍藏页 (#/keep/<tab>): 精装日记书架与翻页器 / 小屋相册 / 长期记忆筛选与遗忘 / 书架便签。
 import {el, put, api, icon, ava, go, setCurrentActor, pageHead, pageTabs, residentFilter,
-  emptyState, errState, ownerOnly, loading, confirmBox, dialog, fmtTime, jstDate, hasTier, isOnboarding, toast, LoginNeeded} from '../core.js';
+  emptyState, errState, ownerOnly, loading, confirmBox, dialog, fmtTime, jstDate, hasTier, isOnboarding, toast, LoginNeeded, bindMediaBlob} from '../core.js';
 import {RESIDENTS, byActor, nameOf, toneStyle} from '../residents.js';
 import {MEM_SCOPES, MEM_KINDS} from '../vocab.js';
 
@@ -194,11 +194,14 @@ async function renderAlbum(view, q){
 
   function previewItem(it){
     const res = byActor(it.actor);
+    let fullImg = null;
+    if (it.data_uri || it.media_rel){
+      fullImg = el('img', {alt: it.title || '相册照片'});
+      if (it.data_uri) fullImg.src = it.data_uri;
+      else bindMediaBlob(fullImg, it.media_rel);
+    }
     const body = el('div', {class: 'stack'},
-      it.data_uri
-        ? el('div', {class: 'album-full'},
-            el('img', {src: it.data_uri, alt: it.title || '相册照片'}))
-        : null,
+      fullImg ? el('div', {class: 'album-full'}, fullImg) : null,
       el('div', {class: 'row wrap', style: 'gap:8px'},
         el('span', {class: 'tag'}, MEM_SCOPES[it.scope] || it.scope),
         it.actor ? el('span', {class: 'tag'}, nameOf(it.actor)) : null,
@@ -221,7 +224,7 @@ async function renderAlbum(view, q){
       return;
     }
     put(stage, loading());
-    const qs = new URLSearchParams({scope, limit: '24'});
+    const qs = new URLSearchParams({scope, limit: '24', inline: '0'});
     if (actor) qs.set('actor', actor);
     try {
       const d = await api('/api/album?' + qs.toString());
@@ -241,21 +244,27 @@ async function renderAlbum(view, q){
       put(stage, items.length
         ? el('div', {class: 'album-grid'}, items.map((it, idx) => {
             const res = byActor(it.actor);
-            const imgAttrs = {
-              src: it.data_uri || '',
-              alt: it.title || '小屋照片',
-              width: 480,
-              height: 360,
-            };
-            if (idx === 0) imgAttrs.fetchpriority = 'high';
-            else imgAttrs.loading = 'lazy';
+            let thumbNode = icon('image');
+            if (it.data_uri || it.media_rel){
+              const imgAttrs = {
+                alt: it.title || '小屋照片',
+                width: 480,
+                height: 360,
+              };
+              if (it.data_uri) imgAttrs.src = it.data_uri;
+              if (idx === 0) imgAttrs.fetchpriority = 'high';
+              else imgAttrs.loading = 'lazy';
+              const imgEl = el('img', imgAttrs);
+              if (!it.data_uri && it.media_rel) bindMediaBlob(imgEl, it.media_rel);
+              thumbNode = imgEl;
+            }
             return el('article', {class: 'card album-card', style: res ? toneStyle(res) : ''},
               el('button', {
                 type: 'button',
                 class: 'album-thumb',
                 'aria-label': `查看大图：${it.title || '小屋照片'}`,
                 onclick: () => previewItem(it),
-              }, it.data_uri ? el('img', imgAttrs) : icon('image')),
+              }, thumbNode),
               el('div', {class: 'album-meta'},
                 el('div', {class: 'row between wrap', style: 'gap:6px'},
                   el('b', {}, it.title || '瞬间留念'),
