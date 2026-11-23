@@ -672,6 +672,7 @@ class PluginRegistry:
             svg_wardrobe_studio,
             vision_understand,
             voice_io,
+            web_search,
         )
 
         for mod in (
@@ -688,6 +689,7 @@ class PluginRegistry:
             vision_understand,
             voice_io,
             image_gen,
+            web_search,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 
