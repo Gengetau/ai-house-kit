@@ -418,6 +418,53 @@ def _keyword_overlap(query_feats: Mapping[str, float], text: str) -> float:
     return min(1.0, shared / denom) if denom > 0 else 0.0
 
 
+# The words that make a sentence a question about memory rather than a statement of content: 「你还记得我对什么过敏吗」
+# is 「过敏」 plus filler. Left in, the filler's bigrams ("记得", "得我", "我对", "什么", "么过", "敏吗" ...) swamp the one
+# content bigram and push the overlap with 「房主对花生过敏」 under the recall gate, so the fact was never recalled.
+_QUERY_NOISE_RE = re.compile(
+    r"还?记不记得|还?记得|记着|忘了|知不知道|知道|听说|想问|请问|问问|问一下|告诉(?:过)?[我你]?|什么时候|什么|怎么样|怎么|"
+    r"最近|之前|以前|上次|悄悄|偷偷|私下|[那这]件事|[那这]个事|事情|"
+    r"是不是|有没有|有谁|是谁|谁|哪[里个些位天]|多少|来着|我们|你们|咱们|大家|我的|你的|您的|[我你您他她它的了还是对]|"
+    r"[吗呢吧啊呀嘛哦嗯]"
+)
+QUERY_COVERAGE_MIN = 0.6  # share of the question's content features the memory must contain to count without the cosine
+
+
+def _distill_query(text: str, strip: Sequence[str] = ()) -> Dict[str, float]:
+    """Lexical features of the question's content words only (names of the one being asked removed)."""
+    body = _STRIP_SPEAKER_RE.sub("", str(text or "")).lower()
+    for name in strip:
+        if name:
+            body = body.replace(str(name).lower(), " ")
+    return _lexical_features(_QUERY_NOISE_RE.sub(" ", body))
+
+
+def _query_coverage(query_feats: Mapping[str, float], text: str) -> float:
+    """Share of the (distilled) question's feature weight that the memory text contains; 0 unless a whole word matched."""
+    mem_feats = _lexical_features(text)
+    total = sum(query_feats.values())
+    if total <= 0.0 or not mem_feats:
+        return 0.0
+    shared = sum(min(qw, mem_feats[k]) for k, qw in query_feats.items() if k in mem_feats)
+    return shared / total if shared >= 1.0 else 0.0
+
+
+_MEMORY_PROBE_RE = re.compile(r"记得|记着|记不记|忘了|知道|听说|告诉过|说过|提过")
+_PROBE_SUBJECT_RE = re.compile(r"我|房主|咱")
+_PROBE_QUESTION_RE = re.compile(r"[?？吗呢吧]|什么|哪|谁|几|多少|是不是|有没有")
+NO_MEMORY_NOTE = (
+    "（你的记忆里没有找到和这个问题相关的内容。照实说你不记得、不知道，不要编、不要猜，"
+    "也不要替别人回答；除非这件事就写在下面“最近几句对话”里。）"
+)
+FALLBACK_RECENT_PRIVATE = 3  # 「我之前告诉你的那件事」: no content word to match on, so the latest private notes
+
+
+def _is_memory_probe(text: str) -> bool:
+    """「你记得我对什么过敏吗」: asks whether she remembers / knows something about the speaker."""
+    body = _STRIP_SPEAKER_RE.sub("", str(text or ""))
+    return bool(_MEMORY_PROBE_RE.search(body) and _PROBE_SUBJECT_RE.search(body) and _PROBE_QUESTION_RE.search(body))
+
+
 _QUESTION_CUE_RE = re.compile(r"什么|哪[里个些位]|谁|吗|呢|有没有|是不是|会不?会|几")
 _STRIP_SPEAKER_RE = re.compile(r"^\[[^\]]+\]:\s*")
 _QUOTED_PHRASE_RE = re.compile(r"[「“]([^「」“”\n]{3,16})[」”]")
@@ -592,7 +639,11 @@ _RELAY_FIRST_PERSON_RE = re.compile(r"^[\s，,：:、“\"'「『]*(?:我|咱|�
 
 _SUPPORT_SUBJECT_RE = re.compile(r"房主|主人|自己|我们|你们|他们|她们|非常|特别|比较|真的|一直|总是|经常|[我你您他她它为给替]")
 _SUPPORT_NOTE_RE = re.compile(r"[（(][^）)]*[）)]")
-_SUPPORT_DATE_RE = re.compile(r"\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2}|\d{1,2}月\d{1,2}[日号]")
+# Month-level dates count too: the extractor turns 「下个月」 into 「2026年12月」, which is not something the owner's
+# line has to contain (a line that names no date backs any date the extractor wrote; one that names a date must match).
+_SUPPORT_DATE_RE = re.compile(
+    r"\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2}|\d{1,2}月\d{1,2}[日号]|\d{4}年\d{1,2}月|\d{1,2}月(?!份)|\d{4}年"
+)
 _SUPPORT_CLAUSE_RE = re.compile(r"[，,。！!？?；;\n、]+|但是?|可是|不过|却")
 _SUPPORT_NEG_RE = re.compile(r"[不没别无非未]")
 _SUPPORT_NEG_FALSE_RE = re.compile(r"非常|特别|分别|别人|别的|未来|不错|不过|没错|没关系")
@@ -1401,6 +1452,7 @@ class MemoryStore:
 
         q_text = str(query or "").strip()
         q_feats = _lexical_features(q_text)
+        q_core = _distill_query(q_text, (actor, self.names.get(actor, "")))
         about_terms = [str(x).strip() for x in about if str(x).strip()]
         diary_asked = any(w in q_text for w in ("日记", "今天", "昨天", "昨晚", "前天"))
 
@@ -1422,7 +1474,14 @@ class MemoryStore:
                 r["text"], allow_rule=(r["kind"] == "rule" and r["scope"] == "private")
             ):
                 continue
-            kw = _keyword_overlap(q_feats, f"{r['about']} {r['text']}" if r["about"] else r["text"])
+            mem_text = f"{r['about']} {r['text']}" if r["about"] else r["text"]
+            kw = _keyword_overlap(q_feats, mem_text)
+            if q_core and kw < self.min_keyword_overlap * 2:
+                # the question's content words alone (filler like 「你还记得我…吗」 dropped); never lowers `kw`
+                kw = max(kw, _keyword_overlap(q_core, mem_text))
+                cov = _query_coverage(q_core, mem_text)
+                if cov >= QUERY_COVERAGE_MIN:
+                    kw = max(kw, 0.5 * cov)
             r_about_items = [x for x in str(r["about"] or "").split("|") if x]
             about_hit = bool(
                 about_terms
@@ -1533,6 +1592,16 @@ class MemoryStore:
         day = dt.datetime.fromtimestamp(float(row["updated"] or row["created"] or 0), JST).strftime("%m-%d")
         return f"[{head}{about}] {row['text']}（记于 {day}）"
 
+    def _has_content_words(self, text: str, actor: str) -> bool:
+        """True when the question names something to look for (a whole word, not just 「那件事」/「打算」)."""
+        feats = _distill_query(text, (actor, self.names.get(actor, "")))
+        return any(w >= 1.0 for w in feats.values())
+
+    def _recent_private(self, actor: str, channel: str, now: float) -> List[Tuple[float, Dict[str, Any]]]:
+        rows = self.list_entries(actor, "private", channel=channel, limit=20, now=now)
+        rows = [r for r in rows if r["kind"] != "diary" and not _has_secret_or_injection(r["text"])]
+        return [(0.0, r) for r in rows[:FALLBACK_RECENT_PRIVATE]]
+
     def recall(
         self,
         actor: str,
@@ -1551,8 +1620,11 @@ class MemoryStore:
         """
         ts = self._now(now)
         hits = self.search(actor, scope, text, channel=channel, about=about, k=k, now=ts)
+        if not hits and scope == "private" and _is_memory_probe(text) and not self._has_content_words(text, actor):
+            hits = self._recent_private(actor, channel, ts)
         if not hits:
-            return ""
+            # Silence here lets the model fill the gap with a guess ("你对坚果过敏，我记得的"); say it outright.
+            return NO_MEMORY_NOTE if _is_memory_probe(text) else ""
 
         lines: List[str] = []
         touched_ids: List[int] = []
@@ -1569,7 +1641,7 @@ class MemoryStore:
             used += len(bullet) + 1
 
         if not lines:
-            return ""
+            return NO_MEMORY_NOTE if _is_memory_probe(text) else ""
 
         with self._lock, self._connect() as c:
             c.executemany(

@@ -21,6 +21,18 @@ JST = dt.timezone(dt.timedelta(hours=9))
 DIARY_DAY_STARTS_H = 5
 WRITE_AFTER = (22, 30)
 LATE_UNTIL_H = 3
+# The diary is stored whole in house_diaries and, with its 「YYYY-MM-DD 日记：」 prefix (14 chars), in memory (diary kind
+# keeps 320). The model is asked for DIARY_ASK_MIN～DIARY_ASK_MAX characters and may overshoot by a good margin; only a
+# reply longer than DIARY_MAX_CHARS is shortened, and then back to the last finished sentence, never mid-sentence.
+DIARY_ASK_MIN = 100
+DIARY_ASK_MAX = 220
+DIARY_MAX_CHARS = 300
+DEMO_MAX_CHARS = 260
+_MIN_KEEP_CHARS = 30  # never trim a reply down to less than this
+_SENTENCE_END = "。！？!?…"
+_OPEN_TAIL_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9，,、；;：:]$")  # a reply ending like this stopped mid-sentence
+_PERIODS = ((5, 0, "早上"), (10, 0, "上午"), (11, 30, "中午"), (14, 0, "下午"), (17, 0, "傍晚"), (19, 0, "晚上"))
+_FACT_CLOCK_RE = re.compile(r"^(\d{2}):(\d{2})(?=\s)")
 
 DIARY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS house_diaries (
@@ -34,6 +46,54 @@ CREATE TABLE IF NOT EXISTS house_diaries (
     PRIMARY KEY (day, actor)
 );
 """
+
+
+def period_of_day(hour: int, minute: int = 0) -> str:
+    """早上 / 上午 / 中午 / 下午 / 傍晚 / 晚上 / 深夜 for a clock time (what a meal at that hour is called)."""
+    label = "深夜"
+    for h, m, name in _PERIODS:
+        if (hour, minute) >= (h, m):
+            label = name
+    return label
+
+
+def label_fact_clock(fact: str) -> str:
+    """「12:11 艾莎吃了…」 -> 「12:11（中午）艾莎吃了…」: the model must not guess whether 12:11 is breakfast."""
+    m = _FACT_CLOCK_RE.match(fact)
+    if not m:
+        return fact
+    return f"{m.group(1)}:{m.group(2)}（{period_of_day(int(m.group(1)), int(m.group(2)))}）" + fact[m.end():]
+
+
+def finish_diary_text(raw: str, limit: int = DIARY_MAX_CHARS) -> str:
+    """Control chars removed; over `limit`, or ending mid-sentence, it is cut back to the last finished sentence.
+
+    A reply with no finished sentence to fall back to (or one that would shrink below `_MIN_KEEP_CHARS`) is kept as it is
+    (hard-cut at `limit` only when over it, at the last comma if there is one), rather than emptied.
+    """
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]+", " ", str(raw or "")).strip()
+    over = len(text) > limit
+    if over:
+        text = text[:limit]
+    elif not _OPEN_TAIL_RE.search(text):
+        return text
+    ends = [i for i, ch in enumerate(text) if ch in _SENTENCE_END or ch == "\n"]
+    # closing quotes / brackets right after the full stop belong to that sentence
+    cut = -1
+    for i in reversed(ends):
+        j = i + 1
+        while j < len(text) and text[j] in "」』”’）)】\"'~～":
+            j += 1
+        if j <= limit and j >= _MIN_KEEP_CHARS and (over or j < len(text)):
+            cut = j
+            break
+    if cut > 0:
+        return text[:cut].rstrip()
+    if over:
+        comma = max(text.rfind("，"), text.rfind("、"), text.rfind("；"), text.rfind(","))
+        if comma >= _MIN_KEEP_CHARS:
+            return text[:comma] + "。"
+    return text
 
 
 def diary_day(ts: float) -> dt.date:
@@ -201,10 +261,16 @@ class DiaryService:
         if llm_fn is not None:
             sys_prompt = (
                 f"{persona}\n"
-                f"现在是 {day_str} 夜晚，请以「{name}」第一人称口吻写一篇 80～200 字的睡前小日记。\n"
-                "要求：只能写下面事实清单里实际经历过的事，不编造没发生过的人或事，不写系统提示、路径、密钥或他人私聊秘密。"
+                f"现在是 {day_str} 夜晚，请以「{name}」第一人称口吻写一篇 {DIARY_ASK_MIN}～{DIARY_ASK_MAX} 字的睡前小日记，"
+                "一定要写完整，最后一句话用句号收尾，宁可少写几件事也不要写到一半断掉。\n"
+                "要求：只能写下面事实清单里实际经历过的事，不编造没发生过的人或事，不写系统提示、路径、密钥或他人私聊秘密。\n"
+                "具体细节一律以清单为准：\n"
+                "1. 买东西：清单里没写买了什么，就只写去了哪里，不要说买了什么；写了哪些就只写哪些，数量和钱数不要改。\n"
+                f"2. 吃饭：谁做的饭看清单里的“（某某做的）”，不要换人；只有清单里写了“{name}做了…”的，才是你自己做的饭。"
+                "早餐、午餐、晚餐按清单里的钟点说（括号里写了早上/中午/傍晚等），清单里没有早上的用餐记录就不要写早餐。\n"
+                "3. 钟点、地点、一起的人都照清单写；清单里没有的钟点、人、东西、对话和心里想的计划，不要补。"
             )
-            user_prompt = "今天你经历过的事：\n" + "\n".join(f"- {f}" for f in facts)
+            user_prompt = "今天你经历过的事：\n" + "\n".join(f"- {label_fact_clock(f)}" for f in facts)
             try:
                 accepts_actor = False
                 try:
@@ -215,7 +281,7 @@ class DiaryService:
                 except (TypeError, ValueError):
                     accepts_actor = False
                 raw, _ = llm_fn(sys_prompt, user_prompt, actor=aid) if accepts_actor else llm_fn(sys_prompt, user_prompt)
-                cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]+", " ", str(raw or "")).strip()[:280]
+                cleaned = finish_diary_text(raw)
                 if len(cleaned) >= 20 and (self.guard is None or not self.guard.check("world", cleaned)):
                     return cleaned, "live_api"
             except Exception:  # noqa: BLE001
@@ -223,7 +289,7 @@ class DiaryService:
 
         highlights = [re.sub(r"^\d{2}:\d{2}\s+", "", f) for f in facts[:4]]
         body = f"{day_str} 日记：今天在小屋里{'，然后'.join(highlights)}。忙完这一天准备早点休息，明天继续好好生活。"
-        return body[:260], "demo"
+        return finish_diary_text(body, DEMO_MAX_CHARS), "demo"
 
     def save_generated(
         self,
@@ -236,7 +302,7 @@ class DiaryService:
     ) -> Optional[Dict[str, Any]]:
         aid = str(job["actor"])
         day_str = str(job["day"])
-        clean = text.strip()[:280]
+        clean = finish_diary_text(text)
         if len(clean) < 12:
             return None
         if self.guard is not None and self.guard.check("world", clean):
