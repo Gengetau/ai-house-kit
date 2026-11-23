@@ -663,6 +663,7 @@ class PluginRegistry:
             city_mcp_outing,
             dice_tabletop,
             group_behavior,
+            image_gen,
             mini_games,
             onebot_ws,
             proactive_talk,
@@ -686,6 +687,7 @@ class PluginRegistry:
             mini_games,
             vision_understand,
             voice_io,
+            image_gen,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 
