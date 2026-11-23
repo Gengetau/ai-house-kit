@@ -652,7 +652,7 @@ def restore_backup(
         )
 
     if target.exists() and not overwrite and any(target.glob("*.db")):
-        raise FileExistsError(f"目标运行目录已存在数据库文件：{target}（如确需覆盖请传 overwrite=True）")
+        raise FileExistsError(f"目标运行目录已存在数据库文件：{target}（确实要覆盖的话，命令行加上 --overwrite 再运行一次）")
 
     verified = verify_backup(archive_path)
     warnings = _check_backup_version(verified["manifest"], force=force)
