@@ -649,6 +649,39 @@ _SUPPORT_NEG_RE = re.compile(r"[不没别无非未]")
 _SUPPORT_NEG_FALSE_RE = re.compile(r"非常|特别|分别|别人|别的|未来|不错|不过|没错|没关系")
 _SUPPORT_STOP_RE = re.compile("[" + "".join(sorted(_CJK_STOP_CHARS)) + "]+")
 PRIVATE_SUPPORT_MIN = 0.6  # share of the item's content units that the cited owner lines must contain
+# How the owner said it (in private / asked to keep it secret / "told X") is not a claim the owner has to have made:
+# the extractor describes the *manner* of speaking, the owner's line is the content. Stripped from the item before the
+# content check (and before the negation check: 「不要告诉别人」 is a request, not a denial of the content).
+_SUPPORT_MANNER_RE = re.compile(
+    r"(?:并|还|同时|且)?(?:要求|叮嘱|嘱咐|嘱托|请求|恳请|拜托|希望)[^，,。；;]{0,8}?"
+    r"(?:保密|保守[^，,。；;]{0,4}秘密|(?:不要|别|勿)(?:再)?(?:告诉|说出去|外传|对外说)[^，,。；;]*)"
+    r"|(?:千万)?(?:不要|别|勿)(?:再)?(?:告诉|说出去|外传|对外说)[^，,。；;]*"
+    r"|保守[^，,。；;]{0,4}秘密|保密|(?:(?:一个|一件)小?)?秘密|私下|私底下|悄悄|偷偷|暗中|亲口|当面"
+    r"|(?:告诉|告知|透露|表示|表明|提到|声称)(?:了|过)?"
+    # 「打算」/「计划」 are interchangeable ways to say the same intent; the owner's own verb decides which one he used.
+    r"|(?:计划|打算)(?:于|在)?"
+)
+_SUPPORT_LEAD_DATE_RE = re.compile(r"^\s*(?:截至|于|在)?\s*(?:\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2})\s*[，,：:]?")
+
+
+_REL_MONTH_RE = re.compile(r"下个?月|这个?月|本月|上个?月")
+
+
+def _annotate_relative_months(line: str, ts: float) -> str:
+    """「下个月」 -> 「下个月〔即2026年12月〕」, so an item that moved the month (「2026年10月」) cannot ride on it."""
+    at = dt.datetime.fromtimestamp(float(ts), JST)
+
+    def _repl(m: re.Match[str]) -> str:
+        step = {"下": 1, "上": -1}.get(m.group(0)[0], 0)
+        idx = at.year * 12 + (at.month - 1) + step
+        return f"{m.group(0)}〔即{idx // 12}年{idx % 12 + 1}月〕"
+
+    return _REL_MONTH_RE.sub(_repl, str(line or ""))
+
+
+def _record_day_forms(ts: float) -> Tuple[str, ...]:
+    d = dt.datetime.fromtimestamp(float(ts), JST)
+    return (f"{d.year}年{d.month}月{d.day}日", f"{d.year}年{d.month}月{d.day}号", f"{d.year}-{d.month}-{d.day}", f"{d.year}-{d.month:02d}-{d.day:02d}")
 
 
 def _support_units(text: str, *, chars: bool = False) -> set[str]:
@@ -670,11 +703,18 @@ def _is_negated(text: str) -> bool:
     return bool(_SUPPORT_NEG_RE.search(_SUPPORT_NEG_FALSE_RE.sub("", text)))
 
 
-def _owner_lines_support(text: str, cited_lines: Sequence[str], names: Sequence[str] = ()) -> bool:
+def _owner_lines_support(
+    text: str,
+    cited_lines: Sequence[str],
+    names: Sequence[str] = (),
+    record_days: Sequence[str] = (),
+) -> bool:
     """Deterministic check that the cited owner line(s) really say `text` (the model never decides this).
 
     The item's content units (see `_support_units`) must be covered >= PRIVATE_SUPPORT_MIN by the cited clauses.
     Clauses whose negation differs from the item's are ignored, so 「我不吃香菜」 cannot back 「房主爱吃香菜」.
+    `record_days` are the dates (「2026年11月21日」) on which the cited lines were said: a leading date equal to one is
+    the extractor's record date, not a claim, even when the line itself names another date (「我的生日是3月14日」).
     """
     cited = "\n".join(cited_lines)
     # The roommate's own name is a subject word too: the owner says 「你」, the extractor writes 「奈尔」.
@@ -682,6 +722,10 @@ def _owner_lines_support(text: str, cited_lines: Sequence[str], names: Sequence[
         text = text.replace(name, " ") if name else text
     # Parenthetical notes, and a record date the extractor added to a line that names no date, are not claims.
     body = _SUPPORT_NOTE_RE.sub("", text)
+    lead = _SUPPORT_LEAD_DATE_RE.match(body)
+    if lead and any(day in lead.group(0) for day in record_days):
+        body = body[lead.end():]
+    body = _SUPPORT_MANNER_RE.sub(" ", body)
     if not _SUPPORT_DATE_RE.search(cited):
         body = _SUPPORT_DATE_RE.sub(" ", body)
     want = _support_units(body)
@@ -695,7 +739,19 @@ def _owner_lines_support(text: str, cited_lines: Sequence[str], names: Sequence[
     # Numbers / latin names are exact: "3月6日" must not ride on a line that says "3月5日".
     if any(u.isascii() and u not in have for u in want):
         return False
-    return len(want & have) / len(want) >= PRIVATE_SUPPORT_MIN
+    # Dates / numbers were matched exactly above; they must not pad the share of the words that carry the meaning.
+    words = {u for u in want if not u.isascii()} or want
+    return len(words & have) / len(words) >= PRIVATE_SUPPORT_MIN
+
+
+_FIRST_PERSON_RE = re.compile(r"[我咱俺]|本人")
+_OWNER_SUBJECT_RE = re.compile(r"^\s*(?:截至)?(?:\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2})?\s*[，,：:]?\s*(?:房主|主人)")
+
+
+def _is_owner_self_text(text: str, others: Sequence[str] = ()) -> bool:
+    """True when an extracted item is about the owner himself (「2026年11月21日，房主说自己对花生过敏」)."""
+    body = _SUPPORT_NOTE_RE.sub("", str(text or ""))
+    return bool(_OWNER_SUBJECT_RE.match(body)) and not any(n and n in body for n in others)
 
 
 def _is_relayed_line(line: str) -> bool:
@@ -1858,6 +1914,7 @@ class MemoryStore:
         is_update: bool = False,
         info: Optional[Dict[str, Any]] = None,
         actor: str = "",
+        about: Any = "",
     ) -> Tuple[str, str]:
         non_self_all = [r for r in selected if str(r["speaker_role"] or "member").lower() != "self"]
         self_rows = [r for r in selected if str(r["speaker_role"] or "member").lower() == "self"]
@@ -1954,13 +2011,35 @@ class MemoryStore:
 
         if scope == "private" and not is_update:
             # Citing *some* owner line is not enough: the line must actually say it, else same downgrade as group.
-            cited = [_strip_speaker_prefix(r["line"]) for r in ev_rows if not _is_pure_question_line(r["line"])]
-            if not _owner_lines_support(text_val, cited, [actor, self.names.get(actor, "")]):
+            cited_rows = [r for r in ev_rows if not _is_pure_question_line(r["line"])]
+            cited = [_annotate_relative_months(_strip_speaker_prefix(r["line"]), float(r["ts"])) for r in cited_rows]
+            record_days = tuple(f for r in cited_rows for f in _record_day_forms(float(r["ts"])))
+            if not _owner_lines_support(text_val, cited, [actor, self.names.get(actor, "")], record_days):
                 if eff_kind == "rule":
                     raise ValueError("私聊规则缺乏房主原话支持")
                 if eff_kind in ("fact", "preference", "person", "claim"):
                     return "claim", "group_stated"
                 return eff_kind, "group_stated"
+            if eff_kind == "claim":
+                # `claim` is the group-chat label for "somebody's unconfirmed statement". In a private room the only
+                # speaker is the owner, so a claim his own first-person line backs is simply what he said about
+                # himself ("房主说自己对花生过敏"): a fact. A claim about someone else, or one that rests on a
+                # relayed line ("小林说他…"), stays unverified.
+                backing = [
+                    c for c in cited
+                    if _owner_lines_support(text_val, [c], [actor, self.names.get(actor, "")], record_days)
+                ] or cited
+                others = [n for k, n in self.names.items() if k != actor and n]
+                own_about = {"房主", "主人", "", actor, self.names.get(actor, "")}
+                about_self = all(a in own_about for a in _normalize_about(about).split("|"))
+                if (
+                    about_self
+                    and _is_owner_self_text(text_val, others)
+                    and backing
+                    and all(_FIRST_PERSON_RE.search(c) and not _is_relayed_line(c) for c in backing)
+                ):
+                    return "fact", "verified"
+                return "claim", "group_stated"
 
         return eff_kind, ("group_stated" if eff_kind == "claim" else "verified")
 
@@ -2072,6 +2151,7 @@ class MemoryStore:
                         is_update=False,
                         info=trust_info,
                         actor=actor,
+                        about=raw_op.get("about") or "",
                     )
                     is_shared = bool(allow_shared and scope in ("group", "world") and raw_op.get("shared"))
                     eff_source = "auto:owner_verified" if (scope == "group" and eff_trust == "verified") else "auto"
