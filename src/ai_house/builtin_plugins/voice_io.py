@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..chat_identity import quote_untrusted
-from ..llm import LLMAPIError, _extract_http_error_detail, mask_secrets
+from ..llm import LLMAPIError, _extract_http_error_detail, clamp_timeout, mask_secrets
 from ..media_safety import (
     DEFAULT_MAX_MEDIA_BYTES,
     fetch_media_bytes,
@@ -227,7 +227,7 @@ def transcribe_audio_source(
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
+        with urllib.request.urlopen(req, timeout=clamp_timeout(20.0)) as resp:
             raw_resp = resp.read().decode("utf-8", errors="replace")
         try:
             doc = json.loads(raw_resp)
@@ -375,7 +375,7 @@ def synthesize_speech(
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
+        with urllib.request.urlopen(req, timeout=clamp_timeout(20.0)) as resp:
             raw_audio = resp.read(DEFAULT_MAX_MEDIA_BYTES + 1)
             if len(raw_audio) > DEFAULT_MAX_MEDIA_BYTES:
                 raise ValueError("合成音频体积超过上限")

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime as dt
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -19,6 +21,7 @@ from urllib.parse import urlparse
 from .onboarding import atomic_write_private_text, mask_secret
 
 JST = dt.timezone(dt.timedelta(hours=9))
+_LOG = logging.getLogger("ai_house.llm")
 _SK_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _TRANSIENT_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
 VALID_PURPOSES = ("chat", "life", "memory_extract", "diary", "ping")
@@ -31,6 +34,26 @@ DEFAULT_TASK_PROFILES: Dict[str, Tuple[float, int, float, int]] = {
     "diary": (0.7, 500, 25.0, 1),
     "ping": (0.7, 350, 12.0, 0),
 }
+
+# Total wall-clock budget (seconds) for ONE logical call: every retry, fallback hop and tool round shares it.
+# Override globally with AI_HOUSE_LLM_TOTAL_BUDGET_S or per purpose with AI_HOUSE_<PURPOSE>_TOTAL_BUDGET_S.
+DEFAULT_TOTAL_BUDGET_S: Dict[str, float] = {
+    "chat": 45.0,
+    "life": 45.0,
+    "diary": 45.0,
+    "memory_extract": 90.0,
+    "ping": 15.0,
+}
+_MIN_BUDGET_S = 0.5
+_MAX_BUDGET_S = 600.0
+_DEADLINE_EPSILON_S = 0.05
+
+# Circuit breaker: BREAKER_THRESHOLD failures inside BREAKER_WINDOW_S open it for BREAKER_OPEN_S; afterwards
+# exactly one probe request is let through (half-open) until it succeeds or fails.
+BREAKER_THRESHOLD = 3
+BREAKER_WINDOW_S = 120.0
+BREAKER_OPEN_S = 30.0
+BREAKER_PROBE_STALE_S = 120.0
 
 USAGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS llm_usage (
@@ -60,6 +83,63 @@ class LLMAPIError(RuntimeError):
         self.status_code = int(status_code or 0)
         self.detail = detail
         super().__init__(message)
+
+
+class LLMDeadlineError(LLMAPIError):
+    """The total time budget of a call (retries + fallbacks + tool rounds) is used up."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(504, message, detail="deadline_exceeded")
+
+
+# Monotonic deadline shared by everything running inside `deadline_scope` (same thread / context).
+_DEADLINE: "contextvars.ContextVar[Optional[float]]" = contextvars.ContextVar("ai_house_llm_deadline", default=None)
+
+
+@contextlib.contextmanager
+def deadline_scope(budget_s: float):
+    """Bound every LLM/HTTP call made inside the block by `budget_s` seconds (nested scopes take the earliest)."""
+    new = time.monotonic() + max(0.0, float(budget_s))
+    cur = _DEADLINE.get()
+    eff = new if cur is None else min(cur, new)
+    token = _DEADLINE.set(eff)
+    try:
+        yield eff
+    finally:
+        _DEADLINE.reset(token)
+
+
+def remaining_budget() -> Optional[float]:
+    """Seconds left in the innermost `deadline_scope`, or None when no scope is active."""
+    cur = _DEADLINE.get()
+    return None if cur is None else cur - time.monotonic()
+
+
+def clamp_timeout(timeout_s: float) -> float:
+    """Return `min(timeout_s, remaining budget)`; raise `LLMDeadlineError` when the budget is already spent."""
+    rem = remaining_budget()
+    if rem is None:
+        return float(timeout_s)
+    if rem <= _DEADLINE_EPSILON_S:
+        raise LLMDeadlineError("LLM 总时限已耗尽（附件/调用预算用完）")
+    return max(_DEADLINE_EPSILON_S, min(float(timeout_s), rem))
+
+
+def _effective_deadline(deadline: Optional[float]) -> Optional[float]:
+    ctx = _DEADLINE.get()
+    if deadline is None:
+        return ctx
+    return deadline if ctx is None else min(deadline, ctx)
+
+
+def _request_timeout(timeout_s: float, deadline: Optional[float]) -> float:
+    eff = _effective_deadline(deadline)
+    if eff is None:
+        return float(timeout_s)
+    rem = eff - time.monotonic()
+    if rem <= _DEADLINE_EPSILON_S:
+        raise LLMDeadlineError("LLM 总时限已耗尽")
+    return max(_DEADLINE_EPSILON_S, min(float(timeout_s), rem))
 
 
 def mask_secrets(text: str, api_key: str = "") -> str:
@@ -158,7 +238,28 @@ def _chat_completions_url(base_url: str) -> str:
     return url
 
 
-def _send_chat_request(url: str, api_key: str, payload: Mapping[str, Any], timeout_s: float) -> Dict[str, Any]:
+def _is_empty_reply(doc: Mapping[str, Any]) -> bool:
+    """HTTP 200 whose first choice has neither text nor tool calls (any finish_reason)."""
+    choice = (doc.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    return (not str(msg.get("content") or "").strip()) and (not (msg.get("tool_calls") or []))
+
+
+def _doc_tokens(doc: Mapping[str, Any]) -> int:
+    usage = doc.get("usage") or {}
+    return _safe_int(usage.get("total_tokens"), 0) or (
+        _safe_int(usage.get("prompt_tokens"), 0) + _safe_int(usage.get("completion_tokens"), 0)
+    )
+
+
+def _send_chat_request(
+    url: str,
+    api_key: str,
+    payload: Mapping[str, Any],
+    timeout_s: float,
+    deadline: Optional[float] = None,
+) -> Dict[str, Any]:
+    req_timeout = _request_timeout(timeout_s, deadline)
     req = urllib.request.Request(
         url,
         data=json.dumps(dict(payload), ensure_ascii=False).encode("utf-8"),
@@ -169,7 +270,7 @@ def _send_chat_request(url: str, api_key: str, payload: Mapping[str, Any], timeo
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=req_timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
@@ -178,19 +279,32 @@ def _send_with_length_retry(
     api_key: str,
     payload: Mapping[str, Any],
     timeout_s: float,
+    deadline: Optional[float] = None,
+    *,
+    retry_empty: bool = False,
 ) -> Dict[str, Any]:
-    doc = _send_chat_request(url, api_key, payload, timeout_s)
+    cur_payload: Mapping[str, Any] = payload
+    doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
     if _is_empty_reasoning_length(doc):
         cur_limit = _safe_int(payload.get("max_completion_tokens") or payload.get("max_tokens"), 2048)
-        bumped = _adapt_reasoning_payload(payload, min_tokens=max(cur_limit * 2, 4096))
-        doc2 = _send_chat_request(url, api_key, bumped, timeout_s)
-        if _is_empty_reasoning_length(doc2):
-            raise LLMAPIError(
+        cur_payload = _adapt_reasoning_payload(payload, min_tokens=max(cur_limit * 2, 4096))
+        doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
+        if _is_empty_reasoning_length(doc):
+            err = LLMAPIError(
                 502,
                 "HTTP 502: reasoning tokens exhausted with empty content",
                 detail="empty_reasoning_length",
             )
-        return doc2
+            err.total_tokens = _doc_tokens(doc)  # type: ignore[attr-defined]
+            raise err
+    if retry_empty and _is_empty_reply(doc):
+        # HTTP 200 + finish_reason=stop + nothing to say: one more try, then a loud failure (never a silent success)
+        first_tokens = _doc_tokens(doc)
+        doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
+        if _is_empty_reply(doc):
+            err = LLMAPIError(502, "HTTP 502: model returned an empty reply", detail="empty_reply")
+            err.total_tokens = first_tokens + _doc_tokens(doc)  # type: ignore[attr-defined]
+            raise err
     return doc
 
 
@@ -201,17 +315,22 @@ def post_openai_chat_json(
     payload: Mapping[str, Any],
     timeout_s: float = 25.0,
 ) -> Dict[str, Any]:
-    """POST to `/v1/chat/completions`, auto-adapting GPT-5/o-series parameter limits on HTTP 400."""
+    """POST to `/v1/chat/completions`, auto-adapting GPT-5/o-series parameter limits on HTTP 400.
+
+    `timeout_s` bounds the WHOLE call (including the internal length/compat retries), and never exceeds
+    the budget of an enclosing `deadline_scope`.
+    """
     url = _chat_completions_url(base_url)
+    deadline = time.monotonic() + max(0.05, float(timeout_s))
     try:
-        return _send_with_length_retry(url, api_key, payload, timeout_s)
+        return _send_with_length_retry(url, api_key, payload, timeout_s, deadline)
     except urllib.error.HTTPError as exc:
         detail = _extract_http_error_detail(exc, api_key=api_key)
         if exc.code == 400:
             retry_payload = _compat_retry_payload(payload, detail)
             if retry_payload is not None:
                 try:
-                    return _send_with_length_retry(url, api_key, retry_payload, timeout_s)
+                    return _send_with_length_retry(url, api_key, retry_payload, timeout_s, deadline)
                 except urllib.error.HTTPError as retry_exc:
                     retry_detail = _extract_http_error_detail(retry_exc, api_key=api_key)
                     raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {retry_detail}", detail=retry_detail) from retry_exc
@@ -322,7 +441,9 @@ class ModelRouter:
         self._clock = clock
         self.retry_delay_s = max(0.0, float(retry_delay_s))
         self._reasoning_caps: set[Tuple[str, str]] = set()
-        self._breaker_state: Dict[Tuple[str, str], Tuple[int, float]] = {}
+        # per (base_url, model): {"fails": [ts, ...], "open_until": float, "probing": bool, "probe_ts": float}
+        self._breaker_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._issue_logged: set[Tuple[str, str, str]] = set()
         self._plugin_visitor_calls: Dict[Tuple[str, str], List[float]] = {}
         self._config_path = (self.runtime_dir / self.CONFIG_FILENAME) if self.runtime_dir is not None else None
         self._usage_db = (self.runtime_dir / self.USAGE_DB_FILENAME) if self.runtime_dir is not None else None
@@ -364,6 +485,7 @@ class ModelRouter:
         with self._lock:
             self._reasoning_caps.clear()
             self._breaker_state.clear()
+            self._issue_logged.clear()
             self._plugin_visitor_calls.clear()
 
     def update_env(self, env: Mapping[str, str]) -> None:
@@ -371,6 +493,7 @@ class ModelRouter:
             self.env = dict(env)
             self._reasoning_caps.clear()
             self._breaker_state.clear()
+            self._issue_logged.clear()
 
     def update_overrides(self, spec: Mapping[str, Any], *, persist: bool = True) -> None:
         """Persist optional fallback, per-resident model routes, and task parameter overrides."""
@@ -388,6 +511,8 @@ class ModelRouter:
                     u = str(fb_in.get("base_url") or "").strip().rstrip("/")
                     if u and not u.startswith(("http://", "https://")):
                         raise ValueError("备用 Base URL 必须以 http:// 或 https:// 开头")
+                    if u and ModelRouter._origin_tuple(u) is None:
+                        raise ValueError("备用 Base URL 无效（端口必须是数字）")
                     fb_cur["base_url"] = u
                 if "model" in fb_in:
                     fb_cur["model"] = str(fb_in.get("model") or "").strip()
@@ -406,6 +531,8 @@ class ModelRouter:
                     url = str(raw_ent.get("base_url") or "").strip().rstrip("/")
                     if url and not url.startswith(("http://", "https://")):
                         raise ValueError(f"住客 {clean_aid} Base URL 必须以 http:// 或 https:// 开头")
+                    if url and ModelRouter._origin_tuple(url) is None:
+                        raise ValueError(f"住客 {clean_aid} Base URL 无效（端口必须是数字）")
                     if raw_ent.get("clear_key") is True:
                         key = ""
                     elif str(raw_ent.get("api_key") or "").strip():
@@ -439,6 +566,8 @@ class ModelRouter:
                         u = str(raw_tp["base_url"]).strip().rstrip("/")
                         if u and not u.startswith(("http://", "https://")):
                             raise ValueError(f"任务 {clean_p} Base URL 必须以 http:// 或 https:// 开头")
+                        if u and ModelRouter._origin_tuple(u) is None:
+                            raise ValueError(f"任务 {clean_p} Base URL 无效（端口必须是数字）")
                         ent["base_url"] = u
                     if raw_tp.get("clear_key") is True:
                         pass
@@ -453,6 +582,7 @@ class ModelRouter:
             if changed:
                 self._reasoning_caps.clear()
                 self._breaker_state.clear()
+                self._issue_logged.clear()
                 if persist:
                     self._save_overrides()
 
@@ -480,6 +610,7 @@ class ModelRouter:
                     "api_key_masked": mask_secret(fb[1] if fb else ""),
                 },
                 "resident_models": res_view,
+                "config_issues": self.config_issues(),
                 "task_profiles": {
                     p: {
                         "temperature": prof.temperature,
@@ -534,6 +665,7 @@ class ModelRouter:
         return url, key, model
 
     def _fallback_tuple(self, default_url: str, default_model: str) -> Optional[Tuple[str, str, str]]:
+        """Fallback layer. Without an address of its own it is addressed at `default_url` (callers pass the PRIMARY url)."""
         fb_ov = self._overrides.get("fallback") or {}
         key = str(fb_ov.get("api_key") or self.env.get("AI_HOUSE_FALLBACK_API_KEY") or "").strip()
         if not key:
@@ -593,18 +725,19 @@ class ModelRouter:
         return url, key, mdl
 
     @staticmethod
-    def _origin_tuple(url: str) -> Tuple[str, str, int]:
+    def _origin_tuple(url: str) -> Optional[Tuple[str, str, int]]:
+        """(scheme, host, port) of `url`, or None when it cannot be parsed (e.g. a non-numeric port)."""
         try:
             p = urlparse(str(url or "").strip())
+            scheme = (p.scheme or "").lower()
+            host = (p.hostname or "").strip().lower().rstrip(".")
+            port = int(p.port or (443 if scheme == "https" else 80))
         except ValueError:
-            return "", "", 0
-        scheme = (p.scheme or "").lower()
-        host = (p.hostname or "").strip().lower().rstrip(".")
-        port = int(p.port or (443 if scheme == "https" else 80))
+            return None
         return scheme, host, port
 
-    def resolve_endpoints(self, *, purpose: str = "chat", actor: str = "") -> List[Tuple[ModelEndpoint, bool]]:
-        """Return ordered `[(ModelEndpoint, is_fallback), ...]` for the given task purpose and roommate."""
+    def _resolve(self, purpose: str, actor: str) -> Tuple[List[Tuple[ModelEndpoint, bool]], Optional[Dict[str, Any]]]:
+        """Resolve endpoints plus a config issue (or None). A key is only ever sent to the address of its own layer."""
         with self._lock:
             p_url, p_key, p_model = self._primary_tuple()
             t_url, t_key, t_model = self._task_endpoint_override(purpose)
@@ -620,27 +753,95 @@ class ModelRouter:
             sel_url = next((u for u, _, _ in layers if u), p_url)
             sel_origin = self._origin_tuple(sel_url)
             sel_model = next((m for _, _, m in layers if m), p_model)
+            p_origin = self._origin_tuple(p_url)
 
-            # Never send a primary/fallback key from a different origin to a custom override base_url
+            # Never send a key to an origin other than its own layer's (a layer without its own url sits on the primary url)
             sel_key = ""
-            for l_url, l_key, _ in layers:
-                if not l_key:
-                    continue
-                layer_eff_url = l_url or p_url
-                if self._origin_tuple(layer_eff_url) == sel_origin:
-                    sel_key = l_key
-                    break
+            if sel_origin is not None:
+                for l_url, l_key, _ in layers:
+                    if not l_key:
+                        continue
+                    if self._origin_tuple(l_url or p_url) == sel_origin:
+                        sel_key = l_key
+                        break
 
             eps: List[Tuple[ModelEndpoint, bool]] = []
             if sel_key:
                 eps.append((ModelEndpoint(base_url=sel_url, api_key=sel_key, model=sel_model), False))
 
-            fb = self._fallback_tuple(sel_url, sel_model)
-            if fb is not None:
+            # A fallback without its own address is only valid for the primary address, never the resident/task url.
+            same_as_primary = sel_origin is not None and sel_origin == p_origin
+            fb = self._fallback_tuple(p_url, sel_model if same_as_primary else p_model)
+            if fb is not None and self._origin_tuple(fb[0]) is not None:
                 fb_ep = ModelEndpoint(base_url=fb[0], api_key=fb[1], model=fb[2])
                 if not eps or fb_ep != eps[0][0]:
                     eps.append((fb_ep, True))
-            return eps
+
+            issue: Optional[Dict[str, Any]] = None
+            if not sel_key:
+                reason = ""
+                code = "CONFIG_NO_KEY"
+                if sel_origin is None:
+                    code = "CONFIG_BAD_URL"
+                    reason = "base_url 无效（例如端口不是数字），该地址不会被调用"
+                elif sel_origin != p_origin:
+                    reason = "已配置自定义 base_url 但没有为该地址配置 api_key；主 API Key 不会发往其它地址，请补上该层的 api_key"
+                if reason:
+                    issue = {
+                        "purpose": purpose,
+                        "actor": str(actor or ""),
+                        "base_url_host": _host_label(sel_url),
+                        "reason": reason,
+                        "code": code,
+                    }
+            return eps, issue
+
+    def resolve_endpoints(self, *, purpose: str = "chat", actor: str = "") -> List[Tuple[ModelEndpoint, bool]]:
+        """Return ordered `[(ModelEndpoint, is_fallback), ...]` for the given task purpose and roommate."""
+        eps, issue = self._resolve(purpose, actor)
+        if issue is not None:
+            self._warn_issue_once(issue)
+        return eps
+
+    def _warn_issue_once(self, issue: Mapping[str, Any]) -> None:
+        sig = (str(issue.get("purpose")), str(issue.get("actor")), str(issue.get("base_url_host")))
+        with self._lock:
+            if sig in self._issue_logged:
+                return
+            self._issue_logged.add(sig)
+        who = f"住客 {issue['actor']}" if issue.get("actor") else f"任务 {issue['purpose']}"
+        _LOG.warning(
+            "LLM 配置错误：%s -> %s 不可用（%s）。缺少 api_key 或地址无效，已拒绝调用且不会使用主 Key。",
+            who,
+            issue.get("base_url_host"),
+            issue.get("reason"),
+        )
+
+    def config_issue(self, *, purpose: str = "chat", actor: str = "") -> Optional[Dict[str, Any]]:
+        """The config problem that makes (purpose, actor) unusable, or None. Never contains key material."""
+        return self._resolve(purpose, actor)[1]
+
+    def config_issues(self) -> List[Dict[str, Any]]:
+        """All override misconfigurations that would silently disable a task/resident (no key material)."""
+        with self._lock:
+            actors: List[str] = [""]
+            actors += [str(a) for a in (self._overrides.get("resident_models") or {})]
+            for k in self.env:
+                for pref in ("AI_HOUSE_ACTOR_BASE_URL_", "AI_HOUSE_ACTOR_API_KEY_"):
+                    if k.startswith(pref) and k[len(pref):]:
+                        actors.append(k[len(pref):].lower())  # env labels are upper-cased; actor ids are lower-case
+            grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+            for actor in dict.fromkeys(actors):
+                for purpose in VALID_PURPOSES:
+                    issue = self._resolve(purpose, actor)[1]
+                    if issue is None:
+                        continue
+                    gk = (issue["actor"], issue["base_url_host"], issue["code"])
+                    if issue["actor"] and ("", issue["base_url_host"], issue["code"]) in grouped:
+                        continue  # same problem already reported for the task layer
+                    ent = grouped.setdefault(gk, {**issue, "purposes": []})
+                    ent["purposes"].append(purpose)
+            return list(grouped.values())
 
     def has_live_endpoint(self, *, purpose: str = "chat", actor: str = "") -> bool:
         return bool(self.resolve_endpoints(purpose=purpose, actor=actor))
@@ -732,6 +933,7 @@ class ModelRouter:
             "by_actor": [],
             "by_model": [],
             "recent": [],
+            "config_issues": self.config_issues(),
         }
         if self._usage_db is None or not self._usage_db.is_file():
             return empty
@@ -818,6 +1020,7 @@ class ModelRouter:
             "by_actor": by_actor,
             "by_model": by_model,
             "recent": recent,
+            "config_issues": self.config_issues(),
         }
 
     # ---- paid-plugin quota: atomic reserve -> settle -------------------------------------------------------------
@@ -1014,23 +1217,60 @@ class ModelRouter:
             error_code=error_code,
         )
 
+    def resolve_total_budget(self, purpose: str = "chat") -> float:
+        """Total wall-clock seconds one logical call may take, across retries, fallbacks and tool rounds."""
+        p = purpose if purpose in DEFAULT_TOTAL_BUDGET_S else "chat"
+        with self._lock:
+            raw = self.env.get(f"AI_HOUSE_{p.upper()}_TOTAL_BUDGET_S") or self.env.get("AI_HOUSE_LLM_TOTAL_BUDGET_S")
+        return max(_MIN_BUDGET_S, min(_safe_float(raw, DEFAULT_TOTAL_BUDGET_S[p]), _MAX_BUDGET_S))
+
+    # ------------------------------------------------------------------ circuit breaker
+    def _breaker_acquire(self, cap_key: Tuple[str, str]) -> str:
+        """'allow' (closed), 'probe' (half-open, this caller is THE probe) or 'block' (open / probe in flight)."""
+        with self._lock:
+            st = self._breaker_state.get(cap_key)
+            if not st:
+                return "allow"
+            now = self._now()
+            if st["open_until"] > now:
+                return "block"
+            if st["open_until"] > 0:
+                if st["probing"] and now - st["probe_ts"] < BREAKER_PROBE_STALE_S:
+                    return "block"
+                st["probing"] = True
+                st["probe_ts"] = now
+                return "probe"
+            return "allow"
+
+    def _breaker_release_probe(self, cap_key: Tuple[str, str]) -> None:
+        with self._lock:
+            st = self._breaker_state.get(cap_key)
+            if st:
+                st["probing"] = False
+
     def _breaker_is_open(self, cap_key: Tuple[str, str]) -> bool:
         with self._lock:
-            _, open_until = self._breaker_state.get(cap_key, (0, 0.0))
-            return open_until > self._now()
+            st = self._breaker_state.get(cap_key)
+            return bool(st and st["open_until"] > self._now())
 
     def _record_breaker_success(self, cap_key: Tuple[str, str]) -> None:
         with self._lock:
             self._breaker_state.pop(cap_key, None)
 
     def _record_breaker_failure(self, cap_key: Tuple[str, str]) -> bool:
+        """Count a failure inside the time window; True when the breaker is (re)opened by it."""
         with self._lock:
-            cnt, _ = self._breaker_state.get(cap_key, (0, 0.0))
-            cnt += 1
-            if cnt >= 3:
-                self._breaker_state[cap_key] = (cnt, self._now() + 30.0)
+            now = self._now()
+            st = self._breaker_state.setdefault(cap_key, {"fails": [], "open_until": 0.0, "probing": False, "probe_ts": 0.0})
+            if st["probing"]:
+                st.update(probing=False, open_until=now + BREAKER_OPEN_S, fails=[now])
                 return True
-            self._breaker_state[cap_key] = (cnt, 0.0)
+            fails = [t for t in st["fails"] if 0.0 <= now - t <= BREAKER_WINDOW_S]
+            fails.append(now)
+            st["fails"] = fails
+            if len(fails) >= BREAKER_THRESHOLD:
+                st.update(open_until=now + BREAKER_OPEN_S, fails=[])
+                return True
             return False
 
     def _call_single_endpoint(
@@ -1038,6 +1278,7 @@ class ModelRouter:
         ep: ModelEndpoint,
         base_payload: Mapping[str, Any],
         timeout_s: float,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         url = _chat_completions_url(ep.base_url)
         cap_key = (ep.base_url, ep.model)
@@ -1045,20 +1286,40 @@ class ModelRouter:
             is_reasoning = cap_key in self._reasoning_caps
         payload = _adapt_reasoning_payload(base_payload) if is_reasoning else dict(base_payload)
         try:
-            return _send_with_length_retry(url, ep.api_key, payload, timeout_s)
+            return _send_with_length_retry(url, ep.api_key, payload, timeout_s, deadline, retry_empty=True)
         except urllib.error.HTTPError as exc:
             detail = _extract_http_error_detail(exc, api_key=ep.api_key)
             if exc.code == 400 and not is_reasoning:
                 retry_payload = _compat_retry_payload(base_payload, detail)
                 if retry_payload is not None:
-                    with self._lock:
-                        self._reasoning_caps.add(cap_key)
                     try:
-                        return _send_with_length_retry(url, ep.api_key, retry_payload, timeout_s)
+                        doc = _send_with_length_retry(url, ep.api_key, retry_payload, timeout_s, deadline, retry_empty=True)
                     except urllib.error.HTTPError as retry_exc:
                         r_detail = _extract_http_error_detail(retry_exc, api_key=ep.api_key)
                         raise LLMAPIError(retry_exc.code, f"HTTP {retry_exc.code}: {r_detail}", detail=r_detail) from retry_exc
+                    # remember the adapted parameter shape only once the adapted request has actually succeeded
+                    with self._lock:
+                        self._reasoning_caps.add(cap_key)
+                    return doc
             raise LLMAPIError(exc.code, f"HTTP {exc.code}: {detail}", detail=detail) from exc
+
+    def _attempt_once(
+        self,
+        ep: ModelEndpoint,
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        deadline: float,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]],
+        retry_without_tools_on_400: bool,
+    ) -> Dict[str, Any]:
+        try:
+            return self._call_single_endpoint(ep, payload, timeout_s, deadline)
+        except LLMAPIError as exc:
+            if exc.status_code == 400 and tools and retry_without_tools_on_400 and not isinstance(exc, LLMDeadlineError):
+                plain_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+                return self._call_single_endpoint(ep, plain_payload, timeout_s, deadline)
+            raise
 
     def complete_messages(
         self,
@@ -1071,20 +1332,73 @@ class ModelRouter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout_s: Optional[float] = None,
+        total_budget_s: Optional[float] = None,
     ) -> LLMCallResult:
-        """Execute a chat completion across resolved endpoints with retries, failover, and usage logging."""
-        eps = self.resolve_endpoints(purpose=purpose, actor=actor)
+        """Execute a chat completion across resolved endpoints with retries, failover, and usage logging.
+
+        One total deadline (`total_budget_s`, default per purpose, env-configurable, and never later than an
+        enclosing `deadline_scope`) covers every retry and fallback hop; each HTTP request gets
+        `min(per-request timeout, remaining budget)`. When the budget is gone the call stops with `LLMDeadlineError`.
+        """
+        eps, issue = self._resolve(purpose, actor)
         if not eps:
+            if issue is not None:
+                self._warn_issue_once(issue)
+                self._record_usage(
+                    purpose=purpose,
+                    actor=actor,
+                    endpoint=ModelEndpoint(base_url=str(issue["base_url_host"]), api_key="", model=""),
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    latency_ms=0,
+                    ok=False,
+                    fallback_used=False,
+                    error_code=str(issue["code"]),
+                )
+                raise RuntimeError(f"no usable endpoint: {issue['reason']}")
             raise RuntimeError("no API key configured")
         prof = self.resolve_profile(purpose)
         eff_temp = prof.temperature if temperature is None else float(temperature)
         eff_max = prof.max_tokens if max_tokens is None else int(max_tokens)
         eff_timeout = prof.timeout_s if timeout_s is None else float(timeout_s)
+        started = time.monotonic()
+        budget = self.resolve_total_budget(purpose) if total_budget_s is None else max(_MIN_BUDGET_S, float(total_budget_s))
+        deadline = _effective_deadline(started + budget) or (started + budget)
+        use_breaker = purpose != "ping"  # connectivity tests neither feed nor consult the traffic breaker
+
+        def out_of_budget() -> bool:
+            return deadline - time.monotonic() <= _DEADLINE_EPSILON_S
+
+        def give_up(ep: ModelEndpoint, is_fallback: bool, cause: Optional[BaseException]) -> LLMDeadlineError:
+            self._record_usage(
+                purpose=purpose,
+                actor=actor,
+                endpoint=ep,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                ok=False,
+                fallback_used=is_fallback,
+                error_code="DEADLINE",
+            )
+            if deadline < started + budget - 0.01:
+                err = LLMDeadlineError("LLM 总时限已耗尽（外层调用共享的预算已用完），已停止重试与回退")
+            else:
+                err = LLMDeadlineError(f"LLM 总时限 {budget:.1f}s 已耗尽，已停止重试与回退")
+            err.__cause__ = cause
+            return err
 
         last_exc: Optional[BaseException] = None
+        last_ep = eps[0]
         for ep, is_fallback in eps:
+            last_ep = (ep, is_fallback)
+            if out_of_budget():
+                raise give_up(ep, is_fallback, last_exc)
             cap_key = (ep.base_url, ep.model)
-            if self._breaker_is_open(cap_key):
+            mode = self._breaker_acquire(cap_key) if use_breaker else "allow"
+            if mode == "block":
                 self._record_usage(
                     purpose=purpose,
                     actor=actor,
@@ -1110,103 +1424,62 @@ class ModelRouter:
                 payload["tools"] = [{"type": "function", "function": t} for t in tools]
                 payload["tool_choice"] = "auto"
 
-            for attempt in range(prof.max_retries + 1):
-                t0 = time.monotonic()
-                try:
-                    doc = self._call_single_endpoint(ep, payload, eff_timeout)
-                    self._record_breaker_success(cap_key)
-                    return self._finish_usage_success(doc, ep, purpose, actor, is_fallback, t0)
-                except LLMAPIError as exc:
-                    if exc.status_code == 400 and tools and retry_without_tools_on_400:
-                        plain_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
-                        try:
-                            doc2 = self._call_single_endpoint(ep, plain_payload, eff_timeout)
+            try:
+                for attempt in range(prof.max_retries + 1):
+                    if attempt > 0 and out_of_budget():
+                        raise give_up(ep, is_fallback, last_exc)
+                    t0 = time.monotonic()
+                    err_code = ""
+                    err_tokens = 0
+                    retryable = False
+                    try:
+                        doc = self._attempt_once(
+                            ep, payload, eff_timeout, deadline,
+                            tools=tools, retry_without_tools_on_400=retry_without_tools_on_400,
+                        )
+                        if use_breaker:
                             self._record_breaker_success(cap_key)
-                            return self._finish_usage_success(doc2, ep, purpose, actor, is_fallback, t0)
-                        except LLMAPIError as inner_exc:
-                            exc = inner_exc
-                        except Exception as inner_exc:  # noqa: BLE001
-                            latency_ms = int((time.monotonic() - t0) * 1000)
-                            self._record_usage(
-                                purpose=purpose,
-                                actor=actor,
-                                endpoint=ep,
-                                prompt_tokens=0,
-                                completion_tokens=0,
-                                total_tokens=0,
-                                latency_ms=latency_ms,
-                                ok=False,
-                                fallback_used=is_fallback,
-                                error_code=type(inner_exc).__name__,
-                            )
-                            last_exc = inner_exc
-                            if self._record_breaker_failure(cap_key):
-                                break
-                            if attempt < prof.max_retries:
-                                time.sleep(self.retry_delay_s * (attempt + 1))
-                                continue
-                            break
-
-                    latency_ms = int((time.monotonic() - t0) * 1000)
+                        return self._finish_usage_success(doc, ep, purpose, actor, is_fallback, t0)
+                    except LLMDeadlineError as exc:
+                        raise give_up(ep, is_fallback, last_exc) from exc
+                    except LLMAPIError as exc:
+                        last_exc = exc
+                        err_code = "EMPTY_REPLY" if exc.detail == "empty_reply" else f"HTTP_{exc.status_code}"
+                        err_tokens = int(getattr(exc, "total_tokens", 0) or 0)
+                        if exc.status_code in _TRANSIENT_HTTP_CODES:
+                            opened = use_breaker and self._record_breaker_failure(cap_key)
+                            retryable = (not opened) and exc.detail not in ("empty_reasoning_length", "empty_reply")
+                    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                        last_exc = exc
+                        err_code = type(exc).__name__
+                        opened = use_breaker and self._record_breaker_failure(cap_key)
+                        retryable = not opened
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        err_code = type(exc).__name__
                     self._record_usage(
                         purpose=purpose,
                         actor=actor,
                         endpoint=ep,
                         prompt_tokens=0,
                         completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=latency_ms,
+                        total_tokens=err_tokens,
+                        latency_ms=int((time.monotonic() - t0) * 1000),
                         ok=False,
                         fallback_used=is_fallback,
-                        error_code=f"HTTP_{exc.status_code}",
+                        error_code=err_code,
                     )
-                    last_exc = exc
-                    if exc.status_code in _TRANSIENT_HTTP_CODES:
-                        opened = self._record_breaker_failure(cap_key)
-                        if opened:
-                            break
-                        if exc.detail != "empty_reasoning_length" and attempt < prof.max_retries:
-                            time.sleep(self.retry_delay_s * (attempt + 1))
-                            continue
-                    break
-                except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-                    latency_ms = int((time.monotonic() - t0) * 1000)
-                    self._record_usage(
-                        purpose=purpose,
-                        actor=actor,
-                        endpoint=ep,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=latency_ms,
-                        ok=False,
-                        fallback_used=is_fallback,
-                        error_code=type(exc).__name__,
-                    )
-                    last_exc = exc
-                    opened = self._record_breaker_failure(cap_key)
-                    if not opened and attempt < prof.max_retries:
-                        time.sleep(self.retry_delay_s * (attempt + 1))
+                    if retryable and attempt < prof.max_retries:
+                        time.sleep(min(self.retry_delay_s * (attempt + 1), max(0.0, deadline - time.monotonic())))
                         continue
                     break
-                except Exception as exc:  # noqa: BLE001
-                    latency_ms = int((time.monotonic() - t0) * 1000)
-                    self._record_usage(
-                        purpose=purpose,
-                        actor=actor,
-                        endpoint=ep,
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        total_tokens=0,
-                        latency_ms=latency_ms,
-                        ok=False,
-                        fallback_used=is_fallback,
-                        error_code=type(exc).__name__,
-                    )
-                    last_exc = exc
-                    break
+            finally:
+                if use_breaker and mode == "probe":
+                    self._breaker_release_probe(cap_key)
 
         assert last_exc is not None
+        if isinstance(last_exc, OSError) and out_of_budget():
+            raise give_up(last_ep[0], last_ep[1], last_exc)
         raise last_exc
 
     def _finish_usage_success(

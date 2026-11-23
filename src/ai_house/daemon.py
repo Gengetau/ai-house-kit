@@ -42,7 +42,7 @@ from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .intents import CommitmentStore
-from .llm import ModelRouter
+from .llm import ModelRouter, deadline_scope, remaining_budget
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
 from .proactive import ProactiveEngine
@@ -184,6 +184,18 @@ def _acquire_runtime_lock(lock_file: Path) -> None:
         return
     with contextlib.suppress(OSError):
         lock_file.write_text(payload, encoding="utf-8")
+
+
+# `RoommateChatAgent.pick_group_responders` lets at most this many roommates answer one house-group message.
+_GROUP_MAX_RESPONDERS = 2
+
+
+def _env_float(raw: Any, default: float) -> float:
+    try:
+        v = float(raw)
+        return v if v == v else default
+    except (TypeError, ValueError):
+        return default
 
 
 class HouseDaemon:
@@ -1199,6 +1211,31 @@ class HouseDaemon:
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
+
+        Each reply (its retries, fallbacks and tool rounds) is bounded by the chat budget
+        (`AI_HOUSE_LLM_TOTAL_BUDGET_S`, default 45s). The whole turn - attachment analysis, every reply and the
+        life-model calls of the following world step - is bounded by a ceiling of one chat budget per possible
+        responder: the house `group` room may have up to two roommates answer, every other room has one.
+        `AI_HOUSE_CONVERSE_BUDGET_S` overrides the ceiling. A hanging endpoint therefore cannot stretch one turn
+        to minutes, while a healthy but slow model still gets to finish a two-roommate group turn.
+        """
+        router = getattr(self, "model_router", None)
+        budget = router.resolve_total_budget("chat") if router is not None else 45.0
+        responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
+        ceiling = _env_float(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
+        with deadline_scope(max(1.0, min(ceiling, 600.0))):
+            return self._converse(channel, text, speaker, actor=actor, attachments=attachments)
+
+    def _converse(
+        self,
+        channel: str,
+        text: str,
+        speaker: Speaker,
+        *,
+        actor: Optional[str] = None,
+        attachments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """The one conversation entry shared by the web studio and chat plugins (OneBot).
 
         `speaker` comes from the transport and is the only source of the owner/member role.
@@ -1307,43 +1344,56 @@ class HouseDaemon:
         single_target = targets[0] if len(targets) == 1 else ""
 
         def _run_att_procs(specs: List[Any], deadline_s: float) -> List[str]:
+            # `deadline_s` is one shared LLM/HTTP deadline for the whole pipeline: every processor's HTTP timeouts
+            # (vision 15s, transcription 20s, ...) are clamped to what is left of it.
             notes: List[str] = []
-            att_deadline = time.monotonic() + deadline_s
-            for proc_defn, proc in specs:
-                if time.monotonic() >= att_deadline:
-                    self.log(f"attachment pipeline timed out after {deadline_s:g}s before {proc_defn.plugin_id}.{proc.processor_id}")
-                    break
-                try:
-                    p_cfg = self.plugin_config(proc_defn.plugin_id, stored_plugins)
-                    proc_daemon: Any = PluginHostProxy(self, proc_defn.plugin_id) if proc_defn.source != "builtin" else self
-                    proc_actor = single_target if proc_defn.plugin_id == "album_diary_art" else (targets[0] if targets else "")
-                    actx = AttachmentContext(
-                        scope=scope,
-                        channel=channel,
-                        actor=proc_actor,
-                        speaker=speaker,
-                        now=now,
-                        attachments=attachments,
-                        plugin_config=p_cfg,
-                        daemon=proc_daemon,
-                    )
-                    out_notes = proc.handler(actx)
-                    if out_notes:
-                        for note in out_notes:
-                            clean_note = str(note or "").strip()
-                            if clean_note:
-                                notes.append(clean_note)
-                except Exception as exc:  # noqa: BLE001
-                    err_txt = mask_secrets(f"{type(exc).__name__}: {exc}")
-                    for sec in self.model_router.collect_secrets():
-                        err_txt = mask_secrets(err_txt, api_key=sec)
-                    self.log(f"attachment {proc_defn.plugin_id}.{proc.processor_id} skipped: {err_txt}")
+            with deadline_scope(deadline_s):
+                for proc_defn, proc in specs:
+                    if (remaining_budget() or 0.0) <= 0.05:
+                        self.log(
+                            f"attachment pipeline timed out after {deadline_s:g}s "
+                            f"before {proc_defn.plugin_id}.{proc.processor_id}"
+                        )
+                        break
+                    try:
+                        p_cfg = self.plugin_config(proc_defn.plugin_id, stored_plugins)
+                        proc_daemon: Any = (
+                            PluginHostProxy(self, proc_defn.plugin_id) if proc_defn.source != "builtin" else self
+                        )
+                        proc_actor = (
+                            single_target if proc_defn.plugin_id == "album_diary_art" else (targets[0] if targets else "")
+                        )
+                        actx = AttachmentContext(
+                            scope=scope,
+                            channel=channel,
+                            actor=proc_actor,
+                            speaker=speaker,
+                            now=now,
+                            attachments=attachments,
+                            plugin_config=p_cfg,
+                            daemon=proc_daemon,
+                        )
+                        out_notes = proc.handler(actx)
+                        if out_notes:
+                            for note in out_notes:
+                                clean_note = str(note or "").strip()
+                                if clean_note:
+                                    notes.append(clean_note)
+                    except Exception as exc:  # noqa: BLE001
+                        err_txt = mask_secrets(f"{type(exc).__name__}: {exc}")
+                        for sec in self.model_router.collect_secrets():
+                            err_txt = mask_secrets(err_txt, api_key=sec)
+                        self.log(f"attachment {proc_defn.plugin_id}.{proc.processor_id} skipped: {err_txt}")
             return notes
 
         post_reply_specs: List[Any] = []
         if isinstance(attachments, Mapping) and attachments and proc_specs:
+            # Total budget for the pre-reply attachment pipeline (default 10s).
+            att_budget = max(0.5, min(_env_float(self.env.get("AI_HOUSE_ATTACHMENT_BUDGET_S"), 10.0), 120.0))
             post_reply_specs = [x for x in proc_specs if getattr(x[1], "after_reply", False)]
-            media_notes.extend(_run_att_procs([x for x in proc_specs if not getattr(x[1], "after_reply", False)], 10.0))
+            media_notes.extend(
+                _run_att_procs([x for x in proc_specs if not getattr(x[1], "after_reply", False)], att_budget)
+            )
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
             if not self._turn_world_ok(turn_epoch):
