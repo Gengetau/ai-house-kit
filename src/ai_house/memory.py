@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 
 log = logging.getLogger("ai_house.memory")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 JST = dt.timezone(dt.timedelta(hours=9))
 
 SCOPES = ("private", "group", "world")
@@ -470,6 +470,60 @@ def _extract_sensitive_clues(text: str) -> Tuple[List[str], List[Tuple[str, str]
     return phrases, pairs
 
 
+_CONFLICT_NEG_STRIP_RE = re.compile(
+    r"不太?[喜偏]?欢|不爱吃|不能吃|不吃|不喝|别[放吃买喝]|讨厌|厌恶|受不了|忌口|过敏|禁食|拒绝"
+)
+_CONFLICT_NEG_CUES = ("过敏", "忌口", "不能吃", "不吃", "不喜欢", "不太喜欢", "不爱吃", "讨厌", "厌恶", "受不了", "别放", "别买", "不喝")
+_CONFLICT_POS_CUES = ("最喜欢", "很喜欢", "超喜欢", "喜欢", "最爱", "爱吃", "能吃", "可以吃", "常吃", "爱喝")
+_DIET_ALLERGY_TOKENS = ("海鲜", "花生", "芒果", "牛奶", "乳糖", "鸡蛋", "小麦", "牛肉", "猪肉", "鱼", "蟹", "虾")
+_CONFLICT_DISH_TOKENS = (
+    "寿喜锅", "麻辣火锅", "火锅", "咖喱", "乌冬", "拉面", "意面", "炒面",
+    "蛋包饭", "味噌汤", "炒饭", "松饼", "司康", "饺子", "烤肉", "寿司",
+)
+_CONFLICT_WEEKDAY_RE = re.compile(r"(?:周|星期|礼拜)[一二三四五六日天]|\d{1,2}月\d{1,2}日")
+
+
+def _conflicts_with_verified(claim_row: Mapping[str, Any], verified_rows: Sequence[Mapping[str, Any]]) -> bool:
+    """Return True when an unverified `group_stated`/`hearsay`/`claim` contradicts an active `verified` memory."""
+    trust = str(claim_row.get("trust") or "verified")
+    kind = str(claim_row.get("kind") or "")
+    if kind != "claim" and trust not in ("group_stated", "hearsay"):
+        return False
+    c_text = str(claim_row.get("text") or "")
+    if not c_text:
+        return False
+    c_bg = {bg for bg in _char_bigrams(c_text) if bg not in _LOW_IDF_BIGRAMS and len(bg) >= 2}
+    c_about = {x for x in str(claim_row.get("about") or "").split("|") if x}
+    c_neg = any(w in c_text for w in _CONFLICT_NEG_CUES)
+    c_pos_text = _CONFLICT_NEG_STRIP_RE.sub(" ", c_text)
+    c_pos = any(w in c_pos_text for w in _CONFLICT_POS_CUES)
+    c_days = set(_CONFLICT_WEEKDAY_RE.findall(c_text))
+    c_dishes = [d for d in _CONFLICT_DISH_TOKENS if d in c_text]
+    for v in verified_rows:
+        if v.get("id") == claim_row.get("id"):
+            continue
+        v_text = str(v.get("text") or "")
+        v_bg = {bg for bg in _char_bigrams(v_text) if bg not in _LOW_IDF_BIGRAMS and len(bg) >= 2}
+        v_about = {x for x in str(v.get("about") or "").split("|") if x}
+        shared_bg = c_bg & v_bg
+        shared_about = c_about & v_about
+        shared_food = [tok for tok in _DIET_ALLERGY_TOKENS if tok in c_text and tok in v_text]
+        v_neg = any(w in v_text for w in _CONFLICT_NEG_CUES)
+        v_pos_text = _CONFLICT_NEG_STRIP_RE.sub(" ", v_text)
+        v_pos = any(w in v_pos_text for w in _CONFLICT_POS_CUES)
+        opposite_polarity = (c_pos and v_neg) or (c_neg and v_pos)
+        if opposite_polarity and (len(shared_bg) >= 1 or bool(shared_food) or bool(shared_about)):
+            return True
+        if len(shared_bg) >= 2:
+            v_days = set(_CONFLICT_WEEKDAY_RE.findall(v_text))
+            if c_days and v_days and c_days != v_days and not (c_days <= v_days or v_days <= c_days):
+                return True
+            v_dishes = [d for d in _CONFLICT_DISH_TOKENS if d in v_text]
+            if c_dishes and v_dishes and set(c_dishes).isdisjoint(set(v_dishes)):
+                return True
+    return False
+
+
 def resolve_db_path(data_dir_or_db: Union[str, Path]) -> Path:
     """Place `memory.db` inside the kernel's `runtime_dir` (or use an explicit `.db` path)."""
     p = Path(data_dir_or_db)
@@ -721,6 +775,16 @@ class MemoryStore:
                     c.execute(f"ALTER TABLE seen ADD COLUMN {col_name} {col_ddl}")
 
             c.executescript(BASE_INDEXES_SQL)
+
+            already_v3 = c.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone() is not None
+            if not already_v3:
+                # PR-B3: Demote legacy unverified group facts created before strict owner-evidence binding.
+                c.execute(
+                    "UPDATE mem SET kind='claim', trust='group_stated' "
+                    "WHERE scope='group' AND trust='verified' "
+                    "AND kind IN ('fact', 'preference', 'person') "
+                    "AND source NOT IN ('auto:owner_verified', 'owner_verified', 'diary')"
+                )
 
             for ver in (1, SCHEMA_VERSION):
                 c.execute(
@@ -1177,6 +1241,13 @@ class MemoryStore:
             got = self._embed([q_text])
             q_vec = got[0] if got else None
 
+        verified_rows = [
+            dict(r)
+            for r in rows
+            if (str(r["trust"] or "verified") if "trust" in r.keys() else "verified") == "verified"
+            and str(r["kind"] or "") in ("fact", "preference", "person", "rule")
+        ]
+
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for r in rows:
             if _has_secret_or_injection(
@@ -1219,10 +1290,14 @@ class MemoryStore:
                     + diary_boost
                 )
 
-            trust_mult = TRUST_WEIGHTS.get(str(r["trust"] or "verified") if "trust" in r.keys() else "verified", 1.0)
+            row_dict = dict(r)
+            trust_mult = TRUST_WEIGHTS.get(str(row_dict.get("trust") or "verified"), 1.0)
             score *= trust_mult
+            if _conflicts_with_verified(row_dict, verified_rows):
+                score *= 0.20
+                row_dict["_conflict_verified"] = True
             if score >= threshold:
-                scored.append((score, dict(r)))
+                scored.append((score, row_dict))
 
         scored.sort(key=lambda item: (-item[0], -float(item[1]["updated"]), -int(item[1]["id"])))
         return scored[:limit]
@@ -1273,7 +1348,9 @@ class MemoryStore:
         kind = str(row["kind"])
         trust = str(row.get("trust") or "verified")
         kind_zh = KIND_LABELS.get(kind, kind)
-        if kind == "claim" or trust in ("group_stated", "hearsay"):
+        if row.get("_conflict_verified"):
+            head = "群聊未核实传言·与已知事实冲突，勿采信"
+        elif kind == "claim" or trust in ("group_stated", "hearsay"):
             head = "群聊陈述·未核实"
         else:
             tag = (
@@ -1540,6 +1617,7 @@ class MemoryStore:
     ) -> Tuple[str, str]:
         non_self_all = [r for r in selected if str(r["speaker_role"] or "member").lower() != "self"]
         self_rows = [r for r in selected if str(r["speaker_role"] or "member").lower() == "self"]
+        explicit_ev_rows: List[sqlite3.Row] = []
         if src_spec is not None:
             items = src_spec if isinstance(src_spec, (list, tuple)) else [src_spec]
             picked_rows: List[sqlite3.Row] = []
@@ -1550,7 +1628,8 @@ class MemoryStore:
                 idx = int(m.group(1)) if m else 0
                 if 1 <= idx <= len(selected):
                     picked_rows.append(selected[idx - 1])
-            ev_rows = [r for r in picked_rows if str(r["speaker_role"] or "member").lower() != "self"]
+            explicit_ev_rows = [r for r in picked_rows if str(r["speaker_role"] or "member").lower() != "self"]
+            ev_rows = explicit_ev_rows
         else:
             ev_rows = non_self_all
 
@@ -1559,6 +1638,10 @@ class MemoryStore:
 
         eff_kind = kind if kind in KINDS else "fact"
         strict_kinds = ("fact", "preference", "person", "claim", "rule")
+        ignore_bg = _LOW_IDF_BIGRAMS | {
+            "可能", "好像", "应该", "大概", "不确定", "记住", "知道", "觉得", "一点",
+            "有点", "什么", "还是", "或者", "比如", "私下", "悄悄", "房主", "群里",
+        }
         if eff_kind in strict_kinds and (not is_update or src_spec is not None):
             decl_lines = [_strip_speaker_prefix(r["line"]) for r in ev_rows if not _is_pure_question_line(r["line"])]
             non_self_text = "\n".join(_strip_speaker_prefix(r["line"]) for r in non_self_all)
@@ -1570,14 +1653,10 @@ class MemoryStore:
                     raise ValueError("抽取记忆与陈述原话缺乏实词关联")
             if self_rows and not is_update:
                 self_text = "\n".join(_strip_speaker_prefix(r["line"]) for r in self_rows)
-                ignore = _LOW_IDF_BIGRAMS | {
-                    "可能", "好像", "应该", "大概", "不确定", "记住", "知道", "觉得", "一点",
-                    "有点", "什么", "还是", "或者", "比如", "私下", "悄悄",
-                }
                 non_self_bg = _char_bigrams(non_self_text)
                 self_only_bg = {
                     bg for bg in _char_bigrams(self_text)
-                    if bg not in non_self_bg and bg not in ignore and len(bg) >= 2
+                    if bg not in non_self_bg and bg not in ignore_bg and len(bg) >= 2
                 }
                 out_bg = _char_bigrams(text_val)
                 hallucinated = {bg for bg in (self_only_bg & out_bg) if bg not in decl_text}
@@ -1587,11 +1666,43 @@ class MemoryStore:
                 if len(hallucinated) >= 2 and len(hallucinated) >= max(2, len(supported_bg)):
                     raise ValueError("拒绝将室友猜测的新实体写入事实记忆")
 
-        has_owner = any(str(r["speaker_role"] or "").lower() == "owner" for r in ev_rows)
-        if scope == "group" and not has_owner:
-            if eff_kind in ("fact", "preference", "person", "claim"):
-                return "claim", "group_stated"
+        if scope == "group":
+            # PR-B1: Only explicit owner-cited statements with lexical alignment and no member-only import become verified.
+            owner_decl_lines: List[str] = []
+            if src_spec is not None and explicit_ev_rows:
+                owner_decl_lines = [
+                    _strip_speaker_prefix(r["line"])
+                    for r in explicit_ev_rows
+                    if str(r["speaker_role"] or "").lower() == "owner" and not _is_pure_question_line(r["line"])
+                ]
+            owner_verified = False
+            if owner_decl_lines and not is_update:
+                owner_text = "\n".join(owner_decl_lines)
+                if _keyword_overlap(_lexical_features(text_val), owner_text) > 0.0:
+                    other_decl_lines = [
+                        _strip_speaker_prefix(r["line"])
+                        for r in (non_self_all + self_rows)
+                        if str(r["speaker_role"] or "").lower() != "owner"
+                    ]
+                    owner_bg = _char_bigrams(owner_text)
+                    other_only_bg = {
+                        bg
+                        for bg in _char_bigrams("\n".join(other_decl_lines))
+                        if bg not in owner_bg and bg not in ignore_bg and len(bg) >= 2
+                    }
+                    if not (other_only_bg & _char_bigrams(text_val)):
+                        owner_verified = True
+            elif is_update and owner_decl_lines:
+                owner_verified = _keyword_overlap(_lexical_features(text_val), "\n".join(owner_decl_lines)) > 0.0
+
+            if not owner_verified:
+                if eff_kind == "rule":
+                    raise ValueError("群聊规则缺乏显式房主原话陈述证据")
+                if eff_kind in ("fact", "preference", "person", "claim"):
+                    return "claim", "group_stated"
+                return eff_kind, "group_stated"
             return eff_kind, ("group_stated" if eff_kind == "claim" else "verified")
+
         return eff_kind, ("group_stated" if eff_kind == "claim" else "verified")
 
     def _extract_bucket(
@@ -1701,6 +1812,7 @@ class MemoryStore:
                         is_update=False,
                     )
                     is_shared = bool(allow_shared and scope in ("group", "world") and raw_op.get("shared"))
+                    eff_source = "auto:owner_verified" if (scope == "group" and eff_trust == "verified") else "auto"
                     # Scope is strictly clamped to the source `seen` bucket (`scope`, `channel`).
                     mid, how = self.add(
                         actor,
@@ -1713,7 +1825,7 @@ class MemoryStore:
                         shared=is_shared,
                         expires_at=float(exp_at) if isinstance(exp_at, (int, float)) and not isinstance(exp_at, bool) else None,
                         ttl_s=float(ttl_s) if isinstance(ttl_s, (int, float)) and not isinstance(ttl_s, bool) else None,
-                        source="auto",
+                        source=eff_source,
                         now=now,
                     )
                     if how != "same":
