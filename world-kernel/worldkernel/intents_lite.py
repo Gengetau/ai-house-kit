@@ -177,6 +177,9 @@ class CommitmentStore:
                 c.execute(
                     "CREATE INDEX IF NOT EXISTS idx_intents_plan_ref ON house_intents(plan_ref)"
                 )
+                c.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_intent_evidence_at ON intent_evidence(at, event_id)"
+                )
 
     def _row_to_dict(self, r: sqlite3.Row) -> Dict[str, Any]:
         d = dict(r)
@@ -313,8 +316,9 @@ class CommitmentStore:
         req_qty = max(1, int(row["qty"] or 1))
         summary = str(row["summary"] or "")
 
-        if intent_kind == "errand" or item:
-            if not item:
+        is_errand = intent_kind == "errand" or bool(item) or any(v in summary for v in _BUY_VERBS)
+        if is_errand:
+            if not item and not any(v in summary for v in _BUY_VERBS):
                 return None
             accum_qty = 0
             last_hit: Optional[Tuple[float, str]] = None
@@ -330,7 +334,9 @@ class CommitmentStore:
                 if kind in ("purchased", "brought_home"):
                     if ev.get("intent_ref") == iid:
                         return ev_at or created, key
-                    if ev.get("actor") in party and ev.get("item") == item:
+                    if ev.get("actor") in party and (
+                        (item and ev.get("item") == item) or (not item and bool(ev.get("item")))
+                    ):
                         accum_qty += max(1, int(ev.get("qty") or 1))
                         last_hit = (ev_at or created, key)
                         if accum_qty >= req_qty:
@@ -418,13 +424,16 @@ class CommitmentStore:
                     "FROM house_intents WHERE state='open' ORDER BY created_at ASC"
                 ).fetchall()
                 if open_rows:
+                    min_created = min(float(r["created_at"]) for r in open_rows) - 2.0
                     ev_rows = c.execute(
-                        "SELECT key, body FROM intent_evidence ORDER BY event_id ASC LIMIT 500"
+                        "SELECT key, body FROM intent_evidence WHERE at >= ? OR at = 0 ORDER BY at ASC, event_id ASC",
+                        (min_created,),
                     ).fetchall()
                     has_script = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='script'").fetchone()
                     script_rows = (
                         c.execute(
-                            "SELECT id, ts, actors, text FROM script WHERE source='kernel' ORDER BY id DESC LIMIT 300"
+                            "SELECT id, ts, actors, text FROM script WHERE source='kernel' AND ts >= ? ORDER BY ts ASC, id ASC",
+                            (min_created,),
                         ).fetchall()
                         if has_script
                         else []
@@ -503,6 +512,8 @@ class CommitmentStore:
         combined = f"{owner_text}\n{summary}"
         if any(w in combined for w in _ALLERGY_MEMO_WORDS) and not any(w in combined for w in _COOK_COMMIT_WORDS):
             return "memo"
+        if any(v in combined for v in _BUY_VERBS):
+            return "errand"
         rk = str(raw_kind or "").strip().lower()
         if rk in _VALID_KINDS and rk != "chat_promise":
             return rk
@@ -599,7 +610,8 @@ class CommitmentStore:
                     "出门", "买", "看书", "散步", "一起", "晴空都",
                 )
                 cook_or_life = tuple(k for k in keywords if k != "买")
-                if any(k in combined for k in cook_or_life) or (not buy_item and "买" in combined):
+                has_buy_phrase = any(v in clean_owner for v in _BUY_VERBS)
+                if (not buy_item and not has_buy_phrase) and any(k in combined for k in cook_or_life):
                     extracted.append({
                         "text": f"和房主聊到：{clean_owner[:80]}",
                         "kind": "chat_promise",
