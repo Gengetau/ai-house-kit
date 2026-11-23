@@ -754,6 +754,7 @@ class MemoryStore:
             c.executescript(BASE_TABLES_SQL)
             mem_cols = {r[1] for r in c.execute("PRAGMA table_info(mem)").fetchall()}
             for col_name, col_ddl in (
+                ("source", "TEXT NOT NULL DEFAULT ''"),
                 ("trust", "TEXT NOT NULL DEFAULT 'verified'"),
                 ("invalidated_reason", "TEXT NOT NULL DEFAULT ''"),
                 ("prev", "TEXT"),

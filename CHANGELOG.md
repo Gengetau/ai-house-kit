@@ -2,6 +2,11 @@
 
 ## 0.3.0
 
+- **0.3.0 安全、隐私与可靠性全量审计加固（PR #32–#37）**：
+  - **隐私与访问边界**：统一 `world / group / private` 作用域大小写规范化；看图与语音插件强制通过 `resolve_scoped_media_path` 做分域隔离；`browse_album` 与 `/api/album` 校验渠道与权限档位；`ModelRouter` 禁止主密钥跨自定义 `base_url` 泄露；收紧 Web `write` 档令牌身份边界与配置/手动外部账号同步规则；备份目录 `0o700` 建夹与敏感字段文档补齐；强化媒体网关 DNS 解析绑定、`.localhost` 拦截与 CGNAT 网段防护；私密密钥文件原子建档零窗口。
+  - **记忆与约定真实凭据闭环**：群聊未核实陈述绑定单行原始说话人（防房主在场越权晋升 `fact`）与冲突降权裁决，`memory.db` 升级 v3 迁移降权历史存疑事实；词表外采购约定保留 `raw_item` 不误消；`plan_ref` 按作用域与成员分桶防串单；收紧外出/晚睡结单凭据约束。
+  - **消息投递、媒体回传与数据安全**：打通 QQ 气泡统一 `SendGate` 与显式群目标路由；主动发言补全 `target_group_id`、闭麦静默拦截、先投后扣与 `expired_ttl`；断线发送失败降级持久化补发与过期丢弃、`ChannelSpool` 定期清理与 `<sep>`/代码块保真分段；`Dispatcher` 并发加锁与异常隔离；打通文生图/语音/贴纸包（含纯标准库光栅化 PNG）在 Web UI 与 OneBot 的持久化附件投递及懒加载。
+  - **备份恢复、熔断限额与扩展沙箱**：改为真实挂钟备份淘汰并纳入 `runtime/media/` 归档；新增 `.daemon.lock` 实例互斥、临时目录 SHA-256/`PRAGMA integrity_check` 原子回滚恢复与 `ai-house restore` 命令；`converse` 增设 `_world_epoch` 重置守护及 `reset_house` 全量边库清理；环境变量校验异常自动容错降级不拖垮设置页与周期任务；引入端点熔断器（3 错熔断 30s）、工具循环总预算、收窄推理模型 compat 缓存与空回复重试报错；内置付费插件每日/访客每小时限额与 `usage.db` 记账；网页搜索/视觉/语音注入隔离边界，相册哈希去重、滚动上限与 `inline=0` 懒加载；提醒禁设过去时间、按频道限额与先入队后标已触发；新增 `AttachmentProcessor` 入站扩展钩子与第三方插件只读 `PluginHostProxy` 沙箱，并完成无注入 32h 回归、`gpt-6.1-terra` 真模型 32h 实测与真实 `.dist-info` 发现验证。
 - **插件底座 1.1–1.3（清单、通用设置页、钩子与失败隔离）**：
   - 升级 `ai_house.plugin_api`：新增 `PluginManifest`、`ConfigField`、`PluginDefinition`、`PluginLoadErrorRecord`、`ToolRegistration`（支持 `ToolContext`）、`PluginRoute`（`/api/plugins/<plugin_id>/<subpath>`）与 `PluginTask`（周期任务钩子）；统一按插件生效与失败隔离，不因单个插件配置或导入失败拖垮宿主，并新增 `ai-house plugins` 清单与报错输出。
   - 新增 `SettingsStore`（原子写入 `plugin_settings.json`、`0o600` 密钥存储及脱敏回显）、`GET/POST /api/settings/plugins` 热重载接口，以及网页端动态 `#/settings` 插件设置页；提供独立第三方示例插件包 `examples/hello-tea-plugin`。
