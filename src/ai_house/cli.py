@@ -20,7 +20,7 @@ from .auth import BindRefused, check_bind
 from .backup import create_backup, restore_backup, verify_backup
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, mask_secrets, openai_compatible_chat
-from .daemon import HouseDaemon, make_http_server
+from .daemon import DaemonLockError, HouseDaemon, make_http_server
 from .plugin_api import PluginRegistry
 
 
@@ -88,6 +88,9 @@ def cmd_up(args: argparse.Namespace) -> int:
         )
     except ChannelConfigError as exc:
         print(f"[ai-house] QQ 接入配置有问题，没有启动：{exc}", file=sys.stderr, flush=True)
+        return 2
+    except DaemonLockError as exc:
+        print(f"[ai-house] 没有启动：{exc}", file=sys.stderr, flush=True)
         return 2
     try:
         srv = make_http_server(daemon, host=host, port=port)

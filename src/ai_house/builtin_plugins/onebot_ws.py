@@ -285,6 +285,22 @@ class OneBotChannel(ChannelPlugin):
         if self._spool is not None:
             self._spool.close()
 
+    def on_world_reset(self) -> None:
+        """Called by the daemon after `reset_house` wiped the runtime dir: start again with an empty inbound cache."""
+        for q in (self._owner_events, self._events):
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        self._owner_backlog.clear()
+        self._group_backlog.clear()
+        with self._dedup_lock:
+            self._inflight_spool_ids.clear()
+            self._mem_dedup.clear()
+        if self._spool is not None:
+            self._spool.reset()
+
     def _bump(self, key: str) -> None:
         with self._stats_lock:
             self.stats[key] += 1

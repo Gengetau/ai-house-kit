@@ -5,7 +5,7 @@ import html
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from ..chat_identity import quote_untrusted
-from ..media_safety import DEFAULT_MAX_MEDIA_BYTES, fetch_media_bytes, parse_data_uri
+from ..media_safety import DEFAULT_MAX_MEDIA_BYTES, fetch_media_bytes, parse_data_uri, resolve_runtime_media_path
 from ..plugin_api import (
     AttachmentContext,
     AttachmentProcessor,
@@ -79,7 +79,7 @@ def maybe_illustrate_diary(
     raw_bytes: Optional[bytes] = None
     mime = "image/png"
     if "image_gen" in active_pids:
-        img_cfg = daemon.registry.resolve_config("image_gen", env=daemon.env, stored_plugins=stored_plugins)
+        img_cfg = daemon.plugin_config("image_gen", stored_plugins)
         gen = generate_image_asset(prompt, scope="world", actor=aid, cfg=img_cfg, daemon=daemon)
         if gen.get("ok") and gen.get("data_uri"):
             try:
@@ -136,7 +136,7 @@ def archive_chat_images(
             elif src.lower().startswith(("http://", "https://")):
                 stored = daemon.settings_store.get_plugins_map()
                 vcfg = (
-                    daemon.registry.resolve_config("vision_understand", env=daemon.env, stored_plugins=stored)
+                    daemon.plugin_config("vision_understand", stored)
                     if "vision_understand" in daemon.registry.definitions
                     else {}
                 )
@@ -165,9 +165,23 @@ def archive_chat_images(
     return saved
 
 
+def _media_ref_visible(item: Mapping[str, Any], *, ctx_scope: str, actor: str, channel: str) -> bool:
+    """Scope check for `save_to_album(media_rel=...)`: only images the current conversation could already see."""
+    sc = str(item.get("scope") or "")
+    if sc == "world":
+        return True
+    if sc == "private":
+        return ctx_scope == "private" and bool(actor) and str(item.get("actor") or "") == actor
+    if sc == "group":
+        return ctx_scope != "private" and bool(channel) and str(item.get("channel") or "") == channel
+    return False
+
+
 def _tool_save_to_album(
     *,
     source: str = "",
+    image_index: Any = None,
+    media_rel: str = "",
     title: str = "",
     caption: str = "",
     ctx: Optional[ToolContext] = None,
@@ -184,10 +198,45 @@ def _tool_save_to_album(
     if eff_scope != "private" and getattr(daemon, "memory", None) is not None and actor:
         if daemon.memory.check_outbound_leak(actor, "group", f"{clean_title} {clean_cap}", now=now):
             return {"ok": False, "status": "blocked", "error": "memory_leak:private_to_public"}
+    invalid = {"ok": False, "degraded": True, "status": "invalid_source", "error": "请用 image_index（当前消息里第几张图，从 1 开始）、media_rel（已归档图片）或合法 data:image URI 指定图片"}
+    raw: Optional[bytes] = None
+    mime = "image/png"
     try:
-        mime, raw = parse_data_uri(source, max_bytes=DEFAULT_MAX_MEDIA_BYTES)
+        if image_index not in (None, ""):
+            imgs = (ctx.attachments or {}).get("images") if (ctx is not None and isinstance(ctx.attachments, Mapping)) else None
+            idx = int(image_index)
+            if not imgs or not (1 <= idx <= len(imgs)):
+                return {**invalid, "error": "当前消息没有这个序号的图片"}
+            src = str(imgs[idx - 1] or "").strip()
+            if src.lower().startswith("data:"):
+                mime, raw = parse_data_uri(src, max_bytes=DEFAULT_MAX_MEDIA_BYTES)
+            elif src.lower().startswith(("http://", "https://")):
+                stored = daemon.settings_store.get_plugins_map()
+                vcfg = (
+                    daemon.plugin_config("vision_understand", stored)
+                    if "vision_understand" in daemon.registry.definitions
+                    else {}
+                )
+                mime, raw = fetch_media_bytes(
+                    src,
+                    max_bytes=DEFAULT_MAX_MEDIA_BYTES,
+                    timeout_s=3.0,
+                    allow_loopback=bool(vcfg.get("allow_loopback_media", False)),
+                )
+            else:
+                return invalid
+        elif str(media_rel or "").strip():
+            ref = daemon.album.get_by_media_rel(str(media_rel), include_data_uri=False)
+            if ref is None or not _media_ref_visible(ref, ctx_scope=eff_scope, actor=actor, channel=channel):
+                # same answer for "missing" and "not yours": never reveal what exists in other scopes
+                return {"ok": False, "status": "forbidden", "error": "找不到当前会话可见的这张图片"}
+            fp = resolve_runtime_media_path(daemon.runtime_dir, str(ref["media_rel"]))
+            raw = fp.read_bytes()
+            mime = str(ref.get("mime") or "image/png")
+        else:
+            mime, raw = parse_data_uri(source, max_bytes=DEFAULT_MAX_MEDIA_BYTES)
     except Exception:  # noqa: BLE001
-        return {"ok": False, "degraded": True, "status": "invalid_source", "error": "仅支持合法 data:image URI 写入相册"}
+        return invalid
     item = daemon.album.add_item(
         scope=eff_scope,
         actor=actor,
@@ -255,6 +304,13 @@ def _process_attachments(actx: AttachmentContext) -> List[str]:
         cfg=actx.plugin_config,
     )
     return []
+
+
+def _hint_attachments(actx: AttachmentContext) -> List[str]:
+    imgs = actx.attachments.get("images") if isinstance(actx.attachments, Mapping) else None
+    if not imgs:
+        return []
+    return [f"[本条消息附带 {len(imgs)} 张图片；想收进相册可调用 save_to_album，用 image_index=1..{len(imgs)} 指定]"]
 
 
 def _route_public_items(rctx: PluginRequestContext) -> Dict[str, Any]:
@@ -344,11 +400,12 @@ PLUGIN_DEF = PluginDefinition(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "source": {"type": "string", "description": "data:image URI"},
+                        "image_index": {"type": "integer", "description": "当前这条消息附带的第几张图片（从 1 开始）"},
+                        "media_rel": {"type": "string", "description": "当前会话可见的已归档图片的 media_rel"},
+                        "source": {"type": "string", "description": "data:image URI（一般用不到）"},
                         "title": {"type": "string"},
                         "caption": {"type": "string"},
                     },
-                    "required": ["source"],
                 },
             },
             handler=_tool_save_to_album,
@@ -377,6 +434,7 @@ PLUGIN_DEF = PluginDefinition(
         PluginRoute(method="GET", subpath="/private", handler=_route_private_items, tier="private"),
     ),
     attachment_processors=(
-        AttachmentProcessor(processor_id="album_archive_images", handler=_process_attachments, priority=10),
+        AttachmentProcessor(processor_id="album_image_hint", handler=_hint_attachments, priority=11),
+        AttachmentProcessor(processor_id="album_archive_images", handler=_process_attachments, priority=10, after_reply=True),
     ),
 )

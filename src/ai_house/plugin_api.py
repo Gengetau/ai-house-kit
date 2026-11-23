@@ -217,6 +217,7 @@ class ToolContext:
     plugin_config: Mapping[str, Any] = field(default_factory=dict)
     daemon: Any = None
     pending_media: Optional[List[Dict[str, Any]]] = None
+    attachments: Optional[Mapping[str, Any]] = None  # the current message's attachments (e.g. {"images": [...]})
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ class AttachmentProcessor:
     processor_id: str
     handler: Callable[[AttachmentContext], Sequence[str]]
     priority: int = 50
+    after_reply: bool = False  # True: run in a background job once the reply is stored (its notes are not used)
 
 
 _SECRET_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|AUTH|COOKIE", re.I)

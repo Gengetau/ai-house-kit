@@ -290,6 +290,16 @@ class ChannelSpool:
         except sqlite3.Error:
             pass
 
+    def reset(self) -> None:
+        """Drop every cached inbound row and dedup mark, leaving a fresh, usable (empty) spool database."""
+        with self._lock:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    Path(str(self.db_path) + suffix).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.migrate()
+
     def _now(self, now: Optional[float] = None) -> float:
         return float(now) if now is not None else float(self._clock())
 

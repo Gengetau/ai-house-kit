@@ -198,7 +198,7 @@ class Stage3AlbumAndDiaryArtTests(unittest.TestCase):
         self.assertTrue(all(row.get("image_album_id") for row in d3_rows))
         self.assertTrue(all(str(row.get("image_data_uri", "")).startswith("data:image/png;base64,") for row in d3_rows))
 
-        _, alb3 = _http_json(f"{base}/api/album?scope=world&limit=24", token=read_tok)
+        _, alb3 = _http_json(f"{base}/api/album?scope=world&limit=24&inline=1", token=read_tok)
         self.assertEqual(len(alb3["items"]), len(d3_rows))
         self.assertTrue(all(it["kind"] == "diary_art" and it["scope"] == "world" for it in alb3["items"]))
         self.assertTrue(all(it["data_uri"].startswith("data:image/png;base64,") for it in alb3["items"]))
@@ -224,6 +224,7 @@ class Stage3AlbumAndDiaryArtTests(unittest.TestCase):
             "这是只给我们看的晚安拍立得",
             attachments={"images": [TINY_DATA_URI]},
         )
+        self.assertTrue(d.drain_post_reply_jobs(5.0))  # chat photos are archived after the reply
         st_priv, alb_priv = _http_json(f"{base}/api/album?scope=private", token=owner_tok)
         self.assertEqual(st_priv, 200)
         self.assertEqual(len(alb_priv["items"]), 1)

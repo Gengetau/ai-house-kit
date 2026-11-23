@@ -120,6 +120,7 @@ class ReminderStore:
         now: float,
         max_active_per_user: int = 20,
         max_active_per_channel: int = 30,
+        max_active_per_user_per_channel: Optional[int] = None,
     ) -> Dict[str, Any]:
         clean_msg = str(message or "").strip()[:240]
         if not clean_msg:
@@ -148,8 +149,20 @@ class ReminderStore:
                         (ch,),
                     ).fetchone()[0]
                 )
-                if ch_cnt >= max(1, int(max_active_per_channel or 30)):
+                chan_cap = max(1, int(max_active_per_channel or 30))
+                if ch_cnt >= chan_cap:
                     raise ValueError(f"当前频道待触发提醒已达上限 ({max_active_per_channel})")
+                if sc == "group":
+                    # one person must not be able to use up the whole shared channel (default: at most half of it)
+                    per_chan = max(1, int(max_active_per_user_per_channel or (chan_cap + 1) // 2))
+                    mine_here = int(
+                        c.execute(
+                            "SELECT COUNT(*) FROM reminders WHERE channel=? AND creator_id=? AND state='pending'",
+                            (ch, creator_id),
+                        ).fetchone()[0]
+                    )
+                    if mine_here >= per_chan:
+                        raise ValueError(f"你在当前频道的待触发提醒已达上限 ({per_chan})，请等它们触发或先取消几条")
                 cur = c.execute(
                     "INSERT INTO reminders("
                     "actor, scope, channel, target_channel, creator_id, creator_role, creator_name, "
