@@ -78,7 +78,7 @@ _QUESTION_CLAUSE_RE = re.compile(
     r"[？?]\s*$|吗|呢|(?:什么|啥)(?!都|也|的)|谁知道|是不是|是否|有没有|记不记得|哪(?:些|个|种)|怎么|多少|为什么|为啥"
 )
 _COOK_COMMIT_WORDS = ("做饭", "下厨", "我来做", "我煮", "给你做", "帮做", "做顿", "做一顿", "做晚饭", "煮晚饭", "做早饭", "做午饭")
-_OUTING_WORDS = ("出门", "晴空都", "逛", "图书馆", "咖啡店", "喫茶", "超市", "车站", "公园", "书店", "便利店")
+_OUTING_WORDS = ("出门", "晴空都", "逛", "陪我去", "陪我出", "图书馆", "咖啡店", "喫茶", "超市", "车站", "公园", "书店", "便利店")
 _TOGETHER_WORDS = ("一起", "约好", "约了", "大扫除", "桌游", "看电影", "开黑", "联机")
 _DISH_WORDS = ("咖喱", "火锅", "寿喜锅", "乌冬", "拉面", "意面", "炒面", "蛋包饭", "味噌汤", "炒饭", "松饼", "司康")
 _VALID_KINDS = frozenset({"errand", "cook", "memo", "outing", "together", "chat_promise"})
@@ -240,6 +240,7 @@ def diet_memo_blocked(text: str) -> bool:
 # full of "一起/咖喱" while answering small talk, and the owner's question about a past event is not a plan either.
 _CHAT_PLAN_KEYWORDS = (
     "早点睡", "去睡", "做饭", "火锅", "咖喱", "喝茶", "下午茶", "打游戏", "出门", "看书", "散步", "一起", "晴空都",
+    "逛街", "逛逛", "陪我去", "陪我出", "陪我逛",
 )
 # A question that is really an invitation or a request ("要不要一起…", "能做咖喱饭吗", "…好不好", "…怎么样").
 _INVITE_MARKER_RE = re.compile(
@@ -283,10 +284,14 @@ def reply_declines(reply_text: str) -> bool:
     return False
 
 
+# 「陪我去商店街买衣服」: the owner shops herself and asks for company, she does not ask the resident to buy anything.
+_COMPANION_BUY_RE = re.compile(r"(?:陪我|陪着我|陪我一起|跟我|和我|与我)[^，,。.！!？?；;\n]{0,12}?" + _BUY_VERB)
+
+
 def _clause_blocked(clause: str) -> bool:
-    """Past tense, questions and negations never form a purchase errand."""
+    """Past tense, questions, negations and 「陪我去…买」 never form a purchase errand."""
     c = _FORGET_RE.sub("记得", clause)
-    if _PAST_BUY_RE.search(c) or _NEG_BUY_RE.search(c) or _QUESTION_RE.search(c):
+    if _PAST_BUY_RE.search(c) or _NEG_BUY_RE.search(c) or _QUESTION_RE.search(c) or _COMPANION_BUY_RE.search(c):
         return True
     if "吗" in c and not _POLITE_RE.search(c):
         return True
@@ -409,8 +414,25 @@ def _loads_list(raw: Any, fallback: Sequence[str] = ()) -> List[str]:
     return _clean_actors(fallback)
 
 
+# A part of the day named in the sentence: (start, end) as (hour, minute). Ends run a little past the hour a person
+# would say (tea that began at 17:00 ends after 18:00), so an activity that is just finishing still counts.
+_DAY_PARTS = (
+    ("上午", (7, 0), (12, 30)),
+    ("中午", (11, 0), (14, 0)),
+    ("下午", (12, 0), (18, 30)),
+    ("晚上", (18, 0), (23, 59)),
+)
+# 「下午茶」 is something to drink, not a time.
+_DAY_PART_RE = re.compile(r"(今天|明天|后天)?(?:的)?(上午|中午|下午(?!茶)|晚上)")
+_DAY_OFFSET = {"今天": 0, "明天": 1, "后天": 2}
+
+
 def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[float]]:
-    """Parse relative JST due phrases (`今晚`, `明天`, `明早`, `明晚`, `周末`, `等会儿`)."""
+    """Parse relative JST due phrases (`今晚`, `明天`, `明早`, `明晚`, `周末`, `等会儿`, and a part of the day:
+    `下午`, `今天上午`, `明天下午`, `晚上`).
+
+    A part of the day without a day word means the next one that is not over yet; said after it ended, it is
+    tomorrow's. 「今天」 alone is the rest of today. No time word: no window (the caller's default time-to-live)."""
     body = str(text or "")
     cur = dt.datetime.fromtimestamp(float(now), JST)
     d0 = cur.date()
@@ -430,6 +452,17 @@ def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[f
     if any(w in body for w in ("明晚", "明天晚上")):
         d1 = d0 + dt.timedelta(days=1)
         return _ts(d1, 18, 0), _ts(d1, 23, 59)
+    m = _DAY_PART_RE.search(body)
+    if m:
+        _, (sh, sm), (eh, em) = next(p for p in _DAY_PARTS if p[0] == m.group(2))
+        day = d0 + dt.timedelta(days=_DAY_OFFSET.get(m.group(1) or "今天", 0))
+        start, end = _ts(day, sh, sm), _ts(day, eh, em)
+        if day == d0:
+            if not m.group(1) and float(now) >= end:  # 「下午一起喝茶」 at 20:00 means tomorrow afternoon
+                day += dt.timedelta(days=1)
+                return _ts(day, sh, sm), _ts(day, eh, em)
+            return max(float(now), start), max(float(now) + 3600.0, end)
+        return start, end
     if "明天" in body:
         d1 = d0 + dt.timedelta(days=1)
         return _ts(d1, 8, 0), _ts(d1, 23, 59)
@@ -443,6 +476,8 @@ def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[f
         sat = d0 + dt.timedelta(days=days_ahead)
         sun = sat + dt.timedelta(days=1)
         return _ts(sat, 9, 0), _ts(sun, 22, 0)
+    if "今天" in body:
+        return float(now), max(float(now) + 3600.0, _ts(d0, 23, 59))
     return None, None
 
 
@@ -626,9 +661,12 @@ class CommitmentStore:
         req_qty = max(1, int(row["qty"] or 1))
         summary = str(row["summary"] or "")
 
-        is_errand = intent_kind == "errand" or bool(item) or bool(raw_item) or any(v in summary for v in _BUY_VERBS)
+        # An outing/together whose words mention buying ("陪我去逛街买衣服") is still an outing: it closes on arriving,
+        # never on a purchase event (a summary-only "买" is an errand only for a kind that has no better home).
+        buy_in_summary = intent_kind not in ("outing", "together") and any(v in summary for v in _BUY_VERBS)
+        is_errand = intent_kind == "errand" or bool(item) or bool(raw_item) or buy_in_summary
         if is_errand:
-            if not item and not raw_item and not any(v in summary for v in _BUY_VERBS):
+            if not item and not raw_item and not buy_in_summary:
                 return None
             accum_qty = 0
             last_hit: Optional[Tuple[float, str]] = None

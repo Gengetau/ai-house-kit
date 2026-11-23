@@ -508,16 +508,18 @@ class Projector:
                     rid = args.get("resource_id") or ""
                     _, _, act = rid.partition("@")
                     cook = db.execute("SELECT actor_id FROM actions WHERE action_id=?", (act,)).fetchone() if act else None
+                    # "together" means the same dish at the same table: someone at the next seat who ate another dish
+                    # (a soup, not the beef bowl) did not share this meal and is not named in its line
                     mates = sorted({r[0] for r in db.execute(
                         "SELECT x.actor_id FROM events x JOIN actions y ON y.action_id=x.action_id WHERE"
                         " x.kind='action_succeeded' AND y.action_type='eat' AND x.actor_id!=? AND x.location=? AND"
-                        " ABS(x.occurred_at-?)<900 AND json_extract(y.args,'$.item') IN (%s)" %
-                        ",".join("?" * len(self.V.MAIN_FOODS)),
-                        (actor, e["location"], e["occurred_at"], *sorted(self.V.MAIN_FOODS)))} & set(self.V.PEOPLE))
+                        " ABS(x.occurred_at-?)<900 AND json_extract(y.args,'$.item')=?",
+                        (actor, e["location"], e["occurred_at"], args["item"]))} & set(self.V.PEOPLE))
                     by = f"（{self.names[cook[0]]}做的）" if cook and cook[0] != actor else ""
-                    # one line per shared meal: whoever was already named in a line about it is not written again
+                    # one line per shared dish: whoever was already named in a line about this dish is not written again
                     told = c.execute("select 1 from script where source='kernel' and abs(ts-?)<900 and text like ?"
-                                     " and text like ?", (e["occurred_at"], f"%{self.names[actor]}%", "%吃了%")).fetchone()
+                                     " and text like ?", (e["occurred_at"], f"%{self.names[actor]}%",
+                                                          f"%吃了{dish}%")).fetchone()
                     if not (mates and told):
                         line = f"{self.names[actor]}{'和' + _who(mates, self.names) + '一起' if mates else ''}吃了{dish}{by}"
                         line_actors = sorted({actor, *mates})

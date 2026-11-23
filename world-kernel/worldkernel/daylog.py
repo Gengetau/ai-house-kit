@@ -195,8 +195,16 @@ def _item(a, evs, garments):
 
 
 def _round(w):
-    """A walk that ends where it began without going out (to the kitchen to check, and back): not a walk to tell."""
-    return w["frm"] == w["to"] and not any(v and _outside(v) for v in w["via"])
+    """A walk that ends where it began without going out (to the kitchen to check, and back): not a walk to tell.
+    The same holds outside: 「从超市去超市」 says nothing (the shop's own 「到了超市」 line is the arrival)."""
+    return w["frm"] == w["to"] and (_outside(w["frm"]) or not any(v and _outside(v) for v in w["via"]))
+
+
+def _out_again(w, it):
+    """The walk has been outside and is now home (or in some room), and the next move goes out again: a second trip.
+    Folding it in made one walk 「从超市去超市」 out of leaving the shop, a minute at home and going back."""
+    was_out = _outside(w["frm"]) or any(v and _outside(v) for v in w["via"])
+    return was_out and bool(w["to"]) and not _outside(w["to"]) and _outside(it["to"])
 
 
 def _fold(actor, acts, evs, garments, now):
@@ -214,7 +222,7 @@ def _fold(actor, acts, evs, garments, now):
             continue
         near = walk is not None and it["s"] - walk["f"] <= FOLD_S
         if it["kind"] == "move":
-            if near:
+            if near and not _out_again(walk, it):
                 walk.update(to=it["to"], loc=it["to"], f=it["f"], arrived=it["arrived"],
                             events=walk["events"] + it["events"], via=walk["via"] + [walk["to"]])
             else:
