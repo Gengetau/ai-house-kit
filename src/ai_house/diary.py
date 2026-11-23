@@ -28,6 +28,7 @@ DIARY_ASK_MIN = 100
 DIARY_ASK_MAX = 220
 DIARY_MAX_CHARS = 300
 DEMO_MAX_CHARS = 260
+MAX_FACTS = 40  # facts given to the model for one day (a busier day is thinned, not cut off at the evening)
 _MIN_KEEP_CHARS = 30  # never trim a reply down to less than this
 _SENTENCE_END = "。！？!?…"
 _OPEN_TAIL_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9，,、；;：:]$")  # a reply ending like this stopped mid-sentence
@@ -119,18 +120,18 @@ def collect_actor_facts(
     end = min(start + 86400.0, float(now))
     if end <= start:
         return []
-    lines: List[Tuple[float, str]] = []
+    lines: List[Tuple[float, str, bool]] = []  # (time, text, is a bare walk)
 
     if Path(life_db).exists():
         k_uri = Path(life_db).resolve().as_uri() + "?mode=ro"
         with contextlib.closing(sqlite3.connect(k_uri, uri=True, timeout=5)) as k_ro:
             k_ro.row_factory = sqlite3.Row
-            for ent in daylog.entries(k_ro, start, start + 86400.0, now):
+            for ent in daylog.entries(k_ro, start, start + 86400.0, now, names=names):
                 if ent.get("actor") == actor and ent.get("ts", 0) < end:
                     hm = dt.datetime.fromtimestamp(float(ent["ts"]), JST).strftime("%H:%M")
                     others = [names.get(a, a) for a in ent.get("with") or () if a != actor]
                     with_s = f"（和{'、'.join(others)}一起）" if others else ""
-                    lines.append((float(ent["ts"]), f"{hm} {ent.get('text', '')}{with_s}"))
+                    lines.append((float(ent["ts"]), f"{hm} {ent.get('text', '')}{with_s}", _bare_walk(ent)))
 
     if Path(world_db).exists():
         w_uri = Path(world_db).resolve().as_uri() + "?mode=ro"
@@ -147,14 +148,50 @@ def collect_actor_facts(
                     actors = []
                 if actor in actors and r["text"]:
                     hm = dt.datetime.fromtimestamp(float(r["ts"]), JST).strftime("%H:%M")
-                    lines.append((float(r["ts"]), f"{hm} {r['text']}"))
+                    lines.append((float(r["ts"]), f"{hm} {r['text']}", False))
 
-    lines.sort(key=lambda pair: pair[0])
-    deduped: List[str] = []
-    for _, text in lines:
-        if text not in deduped:
-            deduped.append(text)
-    return deduped[:40]
+    lines.sort(key=lambda row: row[0])
+    seen: set = set()
+    rows: List[Tuple[float, str, bool]] = []
+    for row in lines:
+        if row[1] not in seen:
+            seen.add(row[1])
+            rows.append(row)
+    return [text for _, text, _ in _within_limit(rows, MAX_FACTS)]
+
+
+def _bare_walk(ent: Mapping[str, Any]) -> bool:
+    """A walk from room to room. A walk out of the house or back home (to or from a place outside) is a thing."""
+    if ent.get("kind") != "move":
+        return False
+    return not any(daylog._outside(p) for p in (ent.get("frm"), ent.get("to"), *(ent.get("via") or ())))
+
+
+def _spread(rows: List[Any], k: int) -> List[Any]:
+    """k of the rows, evenly spaced by position (the first and the last included when k >= 2), in the same order."""
+    if k <= 0:
+        return []
+    if k >= len(rows):
+        return list(rows)
+    if k == 1:
+        return [rows[len(rows) // 2]]
+    return [rows[round(i * (len(rows) - 1) / (k - 1))] for i in range(k)]
+
+
+def _within_limit(rows: List[Tuple[float, str, bool]], limit: int) -> List[Tuple[float, str, bool]]:
+    """At most `limit` rows that still cover the whole day, in time order. Meals, purchases, shared activities, going
+    out, outfits, sleep (everything but a bare walk from room to room) are kept first; the walks fill what is left,
+    evenly spaced; if the things alone are too many they are thinned evenly. Cutting the tail instead dropped the
+    evening and the night of a busy day."""
+    if len(rows) <= limit:
+        return rows
+    things = [r for r in rows if not r[2]]
+    walks = [r for r in rows if r[2]]
+    if len(things) >= limit:
+        kept = _spread(things, limit)
+    else:
+        kept = things + _spread(walks, limit - len(things))
+    return sorted(kept, key=lambda r: r[0])
 
 
 class DiaryService:

@@ -31,7 +31,7 @@ DEFAULT_TASK_PROFILES: Dict[str, Tuple[float, int, float, int]] = {
     "chat": (0.7, 400, 25.0, 1),
     "life": (0.7, 400, 25.0, 1),
     "memory_extract": (0.2, 2000, 45.0, 1),
-    "diary": (0.7, 500, 25.0, 1),
+    "diary": (0.7, 800, 25.0, 1),
     "ping": (0.7, 350, 12.0, 0),
 }
 
