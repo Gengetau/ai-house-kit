@@ -83,6 +83,21 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS owner_avatar_queue (cmd_id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL, receipt TEXT, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS webchat_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    msg_id INTEGER NOT NULL,
+    ref TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS send_gate_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id TEXT UNIQUE,
+    recip_key TEXT NOT NULL,
+    day_jst TEXT NOT NULL,
+    sent_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_send_gate_log_ts ON send_gate_log(sent_at, day_jst);
 """
 
 
@@ -809,19 +824,35 @@ class HouseDaemon:
             now = self.clock.now()
             sender = actor if actor in self.vocab.ROSTER else self.vocab.ROSTER[0]
             sender_name = self.vocab.NAMES.get(sender, sender)
+            ref = f"web-{delivery_id}"
             with contextlib.closing(sqlite3.connect(self.world_db)) as c:
                 with c:
                     c.execute(
+                        "CREATE TABLE IF NOT EXISTS webchat_deliveries ("
+                        "delivery_id TEXT PRIMARY KEY, channel TEXT NOT NULL, msg_id INTEGER NOT NULL, "
+                        "ref TEXT NOT NULL, created_at REAL NOT NULL)"
+                    )
+                    existing = c.execute(
+                        "SELECT ref FROM webchat_deliveries WHERE delivery_id=?",
+                        (str(delivery_id),),
+                    ).fetchone()
+                    if existing is not None:
+                        return str(existing[0] or ref)
+                    cur = c.execute(
                         "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, created_at) "
                         "VALUES(?, ?, ?, ?, ?, '主动', 'outbox', ?)",
                         (target_ch, sender, sender_name, str(payload.get("to_identity") or "owner"), text, now),
+                    )
+                    c.execute(
+                        "INSERT INTO webchat_deliveries(delivery_id, channel, msg_id, ref, created_at) VALUES(?, ?, ?, ?, ?)",
+                        (str(delivery_id), target_ch, int(cur.lastrowid), ref, now),
                     )
             if self.memory is not None and sender in self.vocab.ROSTER:
                 sc = "private" if target_ch.startswith("private:") else "group"
                 mem_ch = "" if sc == "private" else target_ch
                 self.memory.observe(sender, sc, "", channel=mem_ch, reply=text, now=now)
         self._broadcast("chat", {"channel": "group" if target_ch == "group" else "private", "replies": 1, "delivery_id": delivery_id})
-        return f"web-{delivery_id}"
+        return ref
 
     def enqueue_outbound(
         self,

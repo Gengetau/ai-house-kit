@@ -35,7 +35,7 @@ from urllib.parse import urlparse
 
 from ..channel_spool import ChannelSpool, split_bubbles
 from ..chat_identity import Speaker, member_speaker, owner_speaker
-from worldkernel.outbox import NotSent
+from worldkernel.outbox import BlockedDelivery, NotSent
 from ..plugin_api import ChannelPlugin, ConfigField, PluginDefinition, PluginManifest
 
 
@@ -792,8 +792,14 @@ class OneBotChannel(ChannelPlugin):
             raise ValueError("empty outbox text")
         kind = str(payload.get("kind") or ("group" if payload.get("group_id") else "private")).strip().lower()
         target = str(payload.get("target") or payload.get("group_id") or payload.get("user_id") or "").strip()
+        if target.startswith("qq-group:"):
+            target = target.split(":", 1)[1].strip()
         if not target or not target.isdigit():
             raise NotSent("invalid_target")
+        if kind == "group" and target not in self.cfg.groups:
+            raise BlockedDelivery("group_not_whitelisted")
+        if kind not in ("group", "private"):
+            raise BlockedDelivery("unsupported_kind")
         at_qq = str(payload.get("at") or "").strip() or None
         last_ref = ""
         sent_any = False
