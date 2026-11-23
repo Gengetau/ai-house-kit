@@ -249,6 +249,67 @@ class Stage0ErrandIntentTests(unittest.TestCase):
         self.assertEqual(after_rows[0]["evidence_key"], "ev-buy-egg-506")
         self.assertEqual(d.intents.errands("nell", start + 70.0), [])
 
+    def test_unrecognized_errand_item_ignores_unrelated_purchase_until_explicit_intent_ref(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rt = Path(tmp.name) / "rt"
+        start = dt.datetime(2026, 11, 22, 11, 0, tzinfo=JST).timestamp()
+        d = HouseDaemon(runtime_dir=rt, virtual_clock=True, start_ts=start, env={})
+        self.addCleanup(d.close)
+
+        d.intents.enqueue_chat(
+            "nell",
+            "去商店买电池",
+            "好呀，我出门找找电池。",
+            where="group",
+            intents=[{"text": "去商店买电池", "kind": "errand", "item": "", "答应了的": ["nell"]}],
+            now=start + 10.0,
+        )
+        bat_rows = [r for r in d.intents.list_intents(actor="nell") if "电池" in r["summary"]]
+        self.assertEqual(len(bat_rows), 1)
+        bat_id = bat_rows[0]["intent_id"]
+        self.assertFalse(bat_rows[0]["item"])
+
+        # Unrelated purchase ("onion") must NEVER close an unrecognized-item errand
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            with c:
+                c.execute(
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                    (
+                        "ev-unrelated-onion",
+                        1,
+                        start + 20.0,
+                        json.dumps({"kind": "purchased", "actor": "nell", "item": "onion", "qty": 1, "at": start + 20.0}),
+                    ),
+                )
+        d.intents.sweep(start + 30.0)
+        mid_rows = [r for r in d.intents.list_intents(actor="nell") if r["intent_id"] == bat_id]
+        self.assertEqual(mid_rows[0]["state"], "open")
+
+        # Purchase explicitly linked via intent_ref settles the unrecognized-item errand cleanly
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            with c:
+                c.execute(
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                    (
+                        "ev-linked-battery",
+                        2,
+                        start + 40.0,
+                        json.dumps({
+                            "kind": "purchased",
+                            "actor": "nell",
+                            "intent_ref": bat_id,
+                            "item": "battery",
+                            "qty": 1,
+                            "at": start + 40.0,
+                        }),
+                    ),
+                )
+        d.intents.sweep(start + 50.0)
+        done_rows = [r for r in d.intents.list_intents(actor="nell") if r["intent_id"] == bat_id]
+        self.assertEqual(done_rows[0]["state"], "completed")
+        self.assertEqual(done_rows[0]["evidence_key"], "ev-linked-battery")
+
 
 class Stage0ModelCompatTests(unittest.TestCase):
     def _start_mock_llm_server(self, mode: str, secret_key: str):

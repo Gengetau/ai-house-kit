@@ -332,11 +332,10 @@ class CommitmentStore:
                     continue
                 kind = ev.get("kind")
                 if kind in ("purchased", "brought_home"):
-                    if ev.get("intent_ref") == iid:
+                    fp = str(ev.get("fingerprint") or "")
+                    if ev.get("intent_ref") == iid or ev.get("intent_id") == iid or fp.startswith(f"{iid}:"):
                         return ev_at or created, key
-                    if ev.get("actor") in party and (
-                        (item and ev.get("item") == item) or (not item and bool(ev.get("item")))
-                    ):
+                    if item and ev.get("actor") in party and ev.get("item") == item:
                         accum_qty += max(1, int(ev.get("qty") or 1))
                         last_hit = (ev_at or created, key)
                         if accum_qty >= req_qty:
