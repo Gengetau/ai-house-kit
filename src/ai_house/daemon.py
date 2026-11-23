@@ -1275,12 +1275,33 @@ class HouseDaemon:
                         "kind": kind,
                         "答应了的": [_aid],
                     }
+                    qty_val = max(1, min(3, int(targs.get("qty") or 1)))
                     if targs.get("qty") is not None:
-                        intent_obj["qty"] = max(1, min(3, int(targs.get("qty") or 1)))
-                    if targs.get("item"):
-                        intent_obj["item"] = str(targs["item"])
-                        intent_obj["qty"] = max(1, min(3, int(targs.get("qty") or 1)))
+                        intent_obj["qty"] = qty_val
+                    raw_item_arg = str(targs.get("item") or "").strip()
+                    combined_buy = f"{summary}\n{text}"
+                    is_buy_req = bool(raw_item_arg) or kind in ("errand", "buy", "shopping")
+                    if is_buy_req:
+                        intent_obj["qty"] = qty_val
                         intent_obj["kind"] = "errand"
+                        resolved_sku = self.intents._resolve_item_id(raw_item_arg) if raw_item_arg else None
+                        if not resolved_sku and not raw_item_arg:
+                            resolved_sku, det_qty = self.intents._detect_errand_item(combined_buy)
+                            if resolved_sku and targs.get("qty") is None:
+                                intent_obj["qty"] = det_qty
+                        if resolved_sku:
+                            intent_obj["item"] = resolved_sku
+                            return {"recorded": True, "in_catalog": True, "intent": intent_obj}
+                        from worldkernel.intents_lite import extract_raw_buy_noun
+
+                        raw_noun = raw_item_arg or extract_raw_buy_noun(combined_buy) or summary[:24]
+                        intent_obj["raw_item"] = raw_noun[:24]
+                        return {
+                            "recorded": True,
+                            "in_catalog": False,
+                            "note": "不在内置超市词表，已记为待办提醒，无法自动跑腿购买，需房主确认后结单",
+                            "intent": intent_obj,
+                        }
                     return {"recorded": True, "intent": intent_obj}
                 spec_entry = self._active_tools.get(tname) or next(
                     (v for v in self._active_tools.values() if v["spec"].get("name") == tname),
@@ -1358,6 +1379,7 @@ class HouseDaemon:
                         where=where,
                         intents=rep.get("tool_intents") or None,
                         now=now,
+                        channel=channel,
                         speaker_role=speaker_role,
                         proposer_id=speaker.identity_id or "user:owner",
                         party=list(targets),

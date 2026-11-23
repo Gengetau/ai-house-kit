@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS house_intents (
     kind TEXT NOT NULL DEFAULT 'chat_promise',
     state TEXT NOT NULL DEFAULT 'open',
     item TEXT,
+    raw_item TEXT NOT NULL DEFAULT '',
     qty INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
@@ -73,10 +74,39 @@ _DEFAULT_ITEM_ALIASES = {
 
 _ALLERGY_MEMO_WORDS = ("过敏", "忌口", "不吃", "不能吃", "少糖", "少盐", "少辣", "别放")
 _COOK_COMMIT_WORDS = ("做饭", "下厨", "我来做", "我煮", "给你做", "帮做", "做顿", "做一顿", "做晚饭", "煮晚饭", "做早饭", "做午饭")
-_OUTING_WORDS = ("出门", "晴空都", "逛", "图书馆", "咖啡店", "喫茶", "超市", "车站")
+_OUTING_WORDS = ("出门", "晴空都", "逛", "图书馆", "咖啡店", "喫茶", "超市", "车站", "公园", "书店", "便利店")
 _TOGETHER_WORDS = ("一起", "约好", "约了", "大扫除", "桌游", "看电影", "开黑", "联机")
 _DISH_WORDS = ("咖喱", "火锅", "寿喜锅", "乌冬", "拉面", "意面", "炒面", "蛋包饭", "味噌汤", "炒饭", "松饼", "司康")
 _VALID_KINDS = frozenset({"errand", "cook", "memo", "outing", "together", "chat_promise"})
+_PAST_OR_NEG_BUY_WORDS = ("买好了", "买好啦", "买完了", "买完啦", "买到了", "买回来了", "买过了", "不用买", "别买")
+_RAW_BUY_NOUN_RE = re.compile(
+    r"(?:顺路|帮忙|顺便|去|再|抽空)?(?:买|补货|带点|带些|捎|采购|缺)"
+    r"(?:[一二两俩三四五六七八九十\d]+[节包袋瓶盒斤个颗根把块份只串支]?|点|些|个|节|包|瓶|袋)?"
+    r"([\u4e00-\u9fffA-Za-z0-9]{1,12})"
+)
+_OUTING_DEST_MAP = (
+    (("超市", "杂货", "买菜"), ("supermarket", "shop", "grocery", "market", "超市")),
+    (("公园", "绿地"), ("park", "公园", "绿地")),
+    (("图书馆",), ("library", "图书馆")),
+    (("咖啡", "喫茶"), ("cafe", "coffee", "咖啡", "喫茶")),
+    (("书店", "栞堂"), ("bookstore", "book", "书店", "栞堂")),
+    (("便利店",), ("konbini", "convenience", "便利店")),
+    (("车站", "云港", "棱光街"), ("station", "harbor", "port", "车站", "云港", "棱光街")),
+)
+
+
+def extract_raw_buy_noun(text: str) -> str:
+    body = str(text or "").strip()
+    m = _RAW_BUY_NOUN_RE.search(body)
+    if not m:
+        return ""
+    raw = re.sub(r"[吧呢啊呀哦嘛回来去用吃喝好啦了的呢？?!！。，,\s]+$", "", m.group(1) or "").strip()
+    if not raw or raw in ("东西", "点什么", "一点", "什么", "些", "点"):
+        return ""
+    return raw[:24]
+
+
+_extract_raw_buy_noun = extract_raw_buy_noun
 
 
 def _clean_actors(values: Iterable[str], fallback: str = "") -> List[str]:
@@ -161,6 +191,7 @@ class CommitmentStore:
                 cols = {r[1] for r in c.execute("PRAGMA table_info(house_intents)").fetchall()}
                 for name, ddl in (
                     ("item", "TEXT"),
+                    ("raw_item", "TEXT NOT NULL DEFAULT ''"),
                     ("qty", "INTEGER NOT NULL DEFAULT 1"),
                     ("completed_at", "REAL"),
                     ("evidence_key", "TEXT"),
@@ -194,7 +225,7 @@ class CommitmentStore:
         self.init()
         with contextlib.closing(self._conn()) as c:
             rows = c.execute(
-                "SELECT intent_id, actor, summary, kind, item, qty, created_at, expires_at, "
+                "SELECT intent_id, actor, summary, kind, item, raw_item, qty, created_at, expires_at, "
                 "proposer_id, party_json, agreed_json, due_from, due_to, plan_ref "
                 "FROM house_intents "
                 "WHERE actor=? AND state='open' AND (kind='memo' OR expires_at>?) "
@@ -257,7 +288,7 @@ class CommitmentStore:
             params.append(str(state).strip().lower())
         where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         sql = (
-            "SELECT intent_id, actor, summary, kind, state, item, qty, created_at, expires_at, "
+            "SELECT intent_id, actor, summary, kind, state, item, raw_item, qty, created_at, expires_at, "
             "completed_at, evidence_key, proposer_id, party_json, agreed_json, due_from, due_to, plan_ref, updated_at "
             f"FROM house_intents {where_sql}ORDER BY created_at DESC LIMIT ?"
         )
@@ -313,12 +344,14 @@ class CommitmentStore:
         created = float(row["created_at"])
         iid = str(row["intent_id"])
         item = str(row["item"] or "")
+        raw_item = str(row["raw_item"] if "raw_item" in row.keys() and row["raw_item"] else "")
+        plan_ref = str(row["plan_ref"] if "plan_ref" in row.keys() and row["plan_ref"] else "")
         req_qty = max(1, int(row["qty"] or 1))
         summary = str(row["summary"] or "")
 
-        is_errand = intent_kind == "errand" or bool(item) or any(v in summary for v in _BUY_VERBS)
+        is_errand = intent_kind == "errand" or bool(item) or bool(raw_item) or any(v in summary for v in _BUY_VERBS)
         if is_errand:
-            if not item and not any(v in summary for v in _BUY_VERBS):
+            if not item and not raw_item and not any(v in summary for v in _BUY_VERBS):
                 return None
             accum_qty = 0
             last_hit: Optional[Tuple[float, str]] = None
@@ -331,12 +364,20 @@ class CommitmentStore:
                 if ev_at < created - 1.0:
                     continue
                 kind = ev.get("kind")
+                ev_fp = str(ev.get("fingerprint") or "")
+                ev_iid = str(ev.get("intent_ref") or ev.get("intent_id") or "")
+                if ev_iid == iid or (ev_fp and ev_fp.startswith(f"{iid}:")):
+                    return ev_at or created, key
                 if kind in ("purchased", "brought_home"):
-                    if ev.get("intent_ref") == iid:
-                        return ev_at or created, key
-                    if ev.get("actor") in party and (
-                        (item and ev.get("item") == item) or (not item and bool(ev.get("item")))
-                    ):
+                    if ev.get("actor") not in party:
+                        continue
+                    ev_item = str(ev.get("item") or "").strip()
+                    if item:
+                        matched_item = ev_item == item
+                    else:
+                        # PR-B4: Out-of-catalog buy errand never closes on unrelated catalog items (e.g. onion).
+                        matched_item = bool(raw_item and ev_item == raw_item)
+                    if matched_item:
                         accum_qty += max(1, int(ev.get("qty") or 1))
                         last_hit = (ev_at or created, key)
                         if accum_qty >= req_qty:
@@ -370,20 +411,40 @@ class CommitmentStore:
                 elif ev_kind == "plan_finished" and ev.get("plan_kind") == "cook":
                     return ev_at or created, key
             elif intent_kind in ("outing", "together"):
-                if ev_actor in party and ev_kind in ("arrived", "departed", "invite_settled", "plan_finished"):
-                    if ev_kind == "invite_settled" or ev_kind == "plan_finished":
+                # PR-B6: Departing alone never completes an outing; require arrival or settlement/completion.
+                if ev_actor in party and ev_kind in ("arrived", "invite_settled", "plan_finished"):
+                    if ev_kind in ("invite_settled", "plan_finished"):
                         return ev_at or created, key
-                    if intent_kind == "outing" or ev_kind == "arrived":
-                        return ev_at or created, key
+                    if intent_kind == "outing" and ev_kind == "arrived":
+                        ev_desc = (
+                            f"{ev.get('place') or ''} {ev.get('where') or ''} "
+                            f"{ev.get('location') or ''} {ev.get('detail') or ''} {ev.get('text') or ''}"
+                        ).lower()
+                        ev_ref = str(ev.get("intent_ref") or ev.get("intent_id") or "")
+                        ev_pref = str(ev.get("plan_ref") or "")
+                        dest_ok = True
+                        if ev_ref != iid and not (plan_ref and ev_pref == plan_ref):
+                            for sum_toks, ev_toks in _OUTING_DEST_MAP:
+                                if any(st in summary for st in sum_toks):
+                                    dest_ok = any(et in ev_desc for et in ev_toks)
+                                    break
+                        if dest_ok:
+                            return ev_at or created, key
             else:
                 if ev_actor == actor and ev_kind == "activity":
-                    act = str(ev.get("activity") or "")
+                    act = str(ev.get("activity") or ev.get("act") or "").lower()
                     label = ""
                     if self.vocab and act in getattr(self.vocab, "ACTIVITIES", {}):
                         label = str(self.vocab.ACTIVITIES[act].get("label") or "")
                     if any(
                         w and w in summary
-                        for w in (act, label, "看书" if act == "reading" else "", "散步" if act == "stroll" else "")
+                        for w in (
+                            act,
+                            label,
+                            "睡" if act == "sleep" else "",
+                            "看书" if act == "reading" else "",
+                            "散步" if act == "stroll" else "",
+                        )
                     ):
                         return ev_at or created, key
                 elif ev_actor == actor and ev_kind in ("arrived", "plan_finished"):
@@ -408,8 +469,6 @@ class CommitmentStore:
                 if wanted_dishes and any(d in t for d in _DISH_WORDS) and not any(d in t for d in wanted_dishes):
                     continue
                 return float(ts), f"script:{sid}"
-            if "睡" in t and "睡" in summary and intent_kind == "chat_promise":
-                return float(ts), f"script:{sid}"
         return None
 
     def sweep(self, now: float) -> None:
@@ -420,7 +479,7 @@ class CommitmentStore:
         with contextlib.closing(self._conn()) as c:
             with c:
                 open_rows = c.execute(
-                    "SELECT intent_id, actor, summary, kind, item, qty, created_at, party_json "
+                    "SELECT intent_id, actor, summary, kind, item, raw_item, qty, created_at, party_json, plan_ref "
                     "FROM house_intents WHERE state='open' ORDER BY created_at ASC"
                 ).fetchall()
                 if open_rows:
@@ -477,7 +536,7 @@ class CommitmentStore:
         return _DEFAULT_ITEM_ALIASES.get(raw)
 
     def _detect_errand_item(self, text: str) -> Tuple[Optional[str], int]:
-        if not any(v in text for v in _BUY_VERBS):
+        if any(w in text for w in _PAST_OR_NEG_BUY_WORDS) or not any(v in text for v in _BUY_VERBS):
             return None, 1
         ingredients = getattr(self.vocab, "INGREDIENTS", None) if self.vocab else None
         candidates = {
@@ -534,6 +593,7 @@ class CommitmentStore:
         intents: Optional[Sequence[Mapping[str, Any]]] = None,
         now: Optional[float] = None,
         *,
+        channel: str = "",
         speaker_role: str = "owner",
         proposer_id: str = "user:owner",
         party: Optional[Sequence[str]] = None,
@@ -553,31 +613,43 @@ class CommitmentStore:
         clean_reply = str(reply_text or "")
         base_party = _clean_actors(party or [actor], fallback=actor)
         base_agreed = _clean_actors(agreed or [actor], fallback=actor)
+        scope_sig = str(channel or where or "private").strip() or "private"
+        party_sig = ",".join(sorted(base_party))
         norm_text = re.sub(r"\s+", "", clean_owner) or str(clean_owner)
-        digest = hashlib.sha1(norm_text.encode("utf-8")).hexdigest()[:10]
+        digest = hashlib.sha1(f"{scope_sig}:{party_sig}|{norm_text}".encode("utf-8")).hexdigest()[:10]
         plan_ref = f"plan:{int(ts // 300)}:{digest}"
 
         due_from, due_to = parse_due_window(clean_owner, ts)
 
+        is_past_or_neg_buy = any(w in clean_owner for w in _PAST_OR_NEG_BUY_WORDS)
         extracted: List[Dict[str, Any]] = [dict(it) for it in (intents or ()) if isinstance(it, dict)]
         if extracted:
             for it in extracted:
+                raw_arg = str(it.get("raw_item") or it.get("item") or "").strip()
                 resolved = self._resolve_item_id(it.get("item"))
                 if resolved:
                     it["item"] = resolved
+                    it["raw_item"] = ""
                     it["kind"] = "errand"
                     continue
                 ctx_text = f"{clean_owner}\n{it.get('text') or ''}"
-                if it.get("kind") == "errand" or any(v in ctx_text for v in _BUY_VERBS):
+                if it.get("kind") == "errand" or (not is_past_or_neg_buy and any(v in ctx_text for v in _BUY_VERBS)):
                     det_item, det_qty = self._detect_errand_item(ctx_text)
                     if det_item:
                         it["item"] = det_item
+                        it["raw_item"] = ""
                         it["kind"] = "errand"
                         if not it.get("qty"):
                             it["qty"] = det_qty
                         continue
+                    inferred_raw = (
+                        raw_arg if (raw_arg and raw_arg.lower() not in ("none", "null")) else ""
+                    ) or _extract_raw_buy_noun(ctx_text)
+                    if inferred_raw:
+                        it["raw_item"] = inferred_raw[:24]
+                        it["kind"] = "errand"
                 it.pop("item", None)
-            if clean_owner:
+            if clean_owner and not is_past_or_neg_buy:
                 buy_item, buy_qty = self._detect_errand_item(clean_owner)
                 if buy_item and not any(x.get("item") == buy_item for x in extracted):
                     extracted.append({
@@ -598,6 +670,15 @@ class CommitmentStore:
                     "qty": buy_qty,
                     "答应了的": list(base_agreed),
                 })
+            elif not is_past_or_neg_buy and any(v in clean_owner for v in _BUY_VERBS):
+                raw_buy = _extract_raw_buy_noun(clean_owner)
+                if raw_buy:
+                    extracted.append({
+                        "text": f"待办采购（未在超市词表）：{clean_owner[:68]}",
+                        "kind": "errand",
+                        "raw_item": raw_buy,
+                        "答应了的": list(base_agreed),
+                    })
             if any(w in clean_owner for w in _ALLERGY_MEMO_WORDS) and not any(w in clean_owner for w in _COOK_COMMIT_WORDS):
                 extracted.append({
                     "text": f"记住房主饮食禁忌：{clean_owner[:80]}",
@@ -610,7 +691,7 @@ class CommitmentStore:
                     "出门", "买", "看书", "散步", "一起", "晴空都",
                 )
                 cook_or_life = tuple(k for k in keywords if k != "买")
-                has_buy_phrase = any(v in clean_owner for v in _BUY_VERBS)
+                has_buy_phrase = (not is_past_or_neg_buy) and any(v in clean_owner for v in _BUY_VERBS)
                 if (not buy_item and not has_buy_phrase) and any(k in combined for k in cook_or_life):
                     extracted.append({
                         "text": f"和房主聊到：{clean_owner[:80]}",
@@ -694,15 +775,16 @@ class CommitmentStore:
 
                     c.execute(
                         "INSERT OR REPLACE INTO house_intents("
-                        "intent_id, actor, summary, kind, state, item, qty, created_at, expires_at, "
+                        "intent_id, actor, summary, kind, state, item, raw_item, qty, created_at, expires_at, "
                         "proposer_id, party_json, agreed_json, due_from, due_to, plan_ref, updated_at"
-                        ") VALUES(?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ") VALUES(?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             iid,
                             actor,
                             item["text"],
                             eff_kind,
                             item.get("item") or None,
+                            str(item.get("raw_item") or "")[:24],
                             int(item.get("qty") or 1),
                             ts,
                             exp,
