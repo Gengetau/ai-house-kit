@@ -94,8 +94,9 @@ class AuthPolicy:
 
 
 def tier_for_channel(channel: str, write: bool) -> str:
-    """Private chats are their own tier; the group channel is read/write."""
-    if str(channel or "group") != "group":
+    """Private chats and non-public channels require `private` tier; only `group` uses `read`/`write`."""
+    ch = str(channel or "group").strip().lower()
+    if ch != "group":
         return "private"
     return "write" if write else "read"
 

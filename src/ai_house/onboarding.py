@@ -315,6 +315,33 @@ def _format_dotenv_value(val: str) -> str:
     return clean
 
 
+def atomic_write_private_text(path: Path, text: str) -> None:
+    """Atomically write UTF-8 text via a 0600 temporary file before replacing `path`."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(tmp), flags, 0o600)
+    try:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, target)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+
+
 def upsert_dotenv_vars(env_path: Path, updates: Mapping[str, str]) -> None:
     """Update or insert KEY=VALUE entries in `.env`, preserving unrelated comments and tokens."""
     env_path = Path(env_path)
@@ -339,18 +366,13 @@ def upsert_dotenv_vars(env_path: Path, updates: Mapping[str, str]) -> None:
         if k not in seen:
             out_lines.append(f"{k}={v}")
 
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
-    try:
-        os.chmod(env_path, 0o600)
-    except OSError:
-        pass
+    atomic_write_private_text(env_path, "\n".join(out_lines).rstrip() + "\n")
 
 
 def mask_secret(val: str) -> str:
     clean = str(val or "").strip()
     if not clean:
         return ""
-    if len(clean) <= 8:
-        return "••••"
+    if len(clean) <= 12:
+        return "••••••••"
     return f"{clean[:3]}…{clean[-4:]}"

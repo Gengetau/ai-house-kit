@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import ipaddress
 import re
 import socket
@@ -9,7 +10,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, List, Optional, Tuple
+
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 
 DEFAULT_MAX_MEDIA_BYTES = 5 * 1024 * 1024
 _DATA_URI_RE = re.compile(r"^data:([a-z0-9.+/-]+)(?:;[a-z0-9=_-]+)*;base64,(.+)$", re.IGNORECASE | re.DOTALL)
@@ -75,6 +78,10 @@ def parse_data_uri(uri: str, *, max_bytes: int = DEFAULT_MAX_MEDIA_BYTES) -> Tup
 
 
 def _is_forbidden_ip(ip_obj: ipaddress._BaseAddress, *, allow_loopback: bool) -> bool:
+    if ip_obj.version == 4 and ip_obj in _CGNAT_NET:
+        return True
+    if ip_obj.version == 6 and getattr(ip_obj, "ipv4_mapped", None) is not None:
+        return _is_forbidden_ip(ip_obj.ipv4_mapped, allow_loopback=allow_loopback)
     if ip_obj.is_loopback:
         return not allow_loopback
     return bool(
@@ -86,46 +93,65 @@ def _is_forbidden_ip(ip_obj: ipaddress._BaseAddress, *, allow_loopback: bool) ->
     )
 
 
-def validate_media_url(url: str, *, allow_loopback: bool = False) -> str:
-    """Ensure external URL uses `http(s)://` and does not target forbidden internal/metadata IPs."""
-    raw = str(url or "").strip()
-    parsed = urllib.parse.urlparse(raw)
-    if parsed.scheme.lower() not in ("http", "https"):
-        raise ValueError(f"仅支持 http/https 媒体地址: {parsed.scheme or 'empty'}")
-    host = (parsed.hostname or "").strip().lower()
-    if not host:
+def _normalize_host(hostname: Optional[str]) -> str:
+    return (hostname or "").strip().lower().rstrip(".")
+
+
+def _resolve_and_validate_ips(host: str, port: int, *, allow_loopback: bool) -> List[str]:
+    clean_host = _normalize_host(host)
+    if not clean_host:
         raise ValueError("缺少媒体主机名")
-    if host in ("localhost", "localhost.localdomain") or host.endswith(".local") or host.endswith(".internal"):
-        if not (allow_loopback and host == "localhost"):
-            raise ValueError(f"禁止访问内网域名: {host}")
+    is_local_alias = (
+        clean_host == "localhost"
+        or clean_host.endswith(".localhost")
+        or clean_host == "localhost.localdomain"
+        or clean_host.endswith(".local")
+        or clean_host.endswith(".internal")
+    )
+    if is_local_alias:
+        if not (allow_loopback and (clean_host == "localhost" or clean_host.endswith(".localhost"))):
+            raise ValueError(f"禁止访问内网域名: {clean_host}")
 
     try:
-        ip_literal = ipaddress.ip_address(host)
+        ip_literal = ipaddress.ip_address(clean_host)
     except ValueError:
         ip_literal = None
 
     if ip_literal is not None:
         if _is_forbidden_ip(ip_literal, allow_loopback=allow_loopback):
-            raise ValueError(f"禁止访问受限 IP: {host}")
-        return raw
-
-    if allow_loopback and host == "localhost":
-        return raw
+            raise ValueError(f"禁止访问受限 IP: {clean_host}")
+        return [str(ip_literal)]
 
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)
-    except OSError:
-        # Offline environments cannot resolve DNS; let downstream urllib raise cleanly without leaking local details.
-        return raw
+        infos = socket.getaddrinfo(clean_host, int(port), type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"无法解析媒体域名: {clean_host}") from exc
 
+    ips: List[str] = []
     for info in infos:
-        addr = info[4][0].split("%", 1)[0]
+        addr = str(info[4][0]).split("%", 1)[0]
         try:
             ip_obj = ipaddress.ip_address(addr)
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError(f"媒体域名解析返回非法 IP: {addr}") from exc
         if _is_forbidden_ip(ip_obj, allow_loopback=allow_loopback):
-            raise ValueError(f"禁止访问解析为内网或保留段的域名: {host}")
+            raise ValueError(f"禁止访问解析为内网或保留段的域名: {clean_host}")
+        if addr not in ips:
+            ips.append(addr)
+    if not ips:
+        raise ValueError(f"未能解析出可用媒体 IP: {clean_host}")
+    return ips
+
+
+def validate_media_url(url: str, *, allow_loopback: bool = False) -> str:
+    """Ensure external URL uses `http(s)://` and does not target forbidden internal/CGNAT/metadata IPs."""
+    raw = str(url or "").strip()
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError(f"仅支持 http/https 媒体地址: {parsed.scheme or 'empty'}")
+    host = _normalize_host(parsed.hostname)
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    _resolve_and_validate_ips(host, port, allow_loopback=allow_loopback)
     return raw
 
 
@@ -140,6 +166,46 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, joined)
 
 
+def _make_pinned_http_handlers(*, allow_loopback: bool) -> Tuple[urllib.request.HTTPHandler, urllib.request.HTTPSHandler]:
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self) -> None:
+            ips = _resolve_and_validate_ips(self.host, int(self.port), allow_loopback=allow_loopback)
+            last_exc: Optional[OSError] = None
+            for ip_addr in ips:
+                try:
+                    self.sock = socket.create_connection((ip_addr, int(self.port)), self.timeout, self.source_address)
+                    return
+                except OSError as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                raise last_exc
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            ips = _resolve_and_validate_ips(self.host, int(self.port), allow_loopback=allow_loopback)
+            sni_host = _normalize_host(self.host)
+            last_exc: Optional[OSError] = None
+            for ip_addr in ips:
+                try:
+                    raw_sock = socket.create_connection((ip_addr, int(self.port)), self.timeout, self.source_address)
+                    self.sock = self._context.wrap_socket(raw_sock, server_hostname=sni_host)
+                    return
+                except OSError as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                raise last_exc
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):  # type: ignore[override]
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):  # type: ignore[override]
+            return self.do_open(_PinnedHTTPSConnection, req)
+
+    return _PinnedHTTPHandler(), _PinnedHTTPSHandler()
+
+
 def fetch_media_bytes(
     url: str,
     *,
@@ -148,13 +214,19 @@ def fetch_media_bytes(
     allow_loopback: bool = False,
     headers: Optional[dict[str, str]] = None,
 ) -> Tuple[str, bytes]:
-    """Safely download bounded bytes from an `http(s)` URL with redirect validation."""
+    """Safely download bounded bytes from an `http(s)` URL with DNS-rebinding pinning and redirect validation."""
     safe_url = validate_media_url(url, allow_loopback=allow_loopback)
     req_headers = {"User-Agent": "ai-house-kit/0.3 (+https://github.com/Gengetau/ai-house-kit)"}
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(safe_url, headers=req_headers, method="GET")
-    opener = urllib.request.build_opener(_SafeRedirectHandler(allow_loopback=allow_loopback))
+    http_h, https_h = _make_pinned_http_handlers(allow_loopback=allow_loopback)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        http_h,
+        https_h,
+        _SafeRedirectHandler(allow_loopback=allow_loopback),
+    )
     with opener.open(req, timeout=float(timeout_s)) as resp:
         raw = resp.read(max_bytes + 1)
         if len(raw) > max_bytes:
@@ -174,4 +246,51 @@ def resolve_runtime_media_path(runtime_dir: Path | str, ref: str) -> Path:
     cand = (media_root / clean_ref).resolve()
     if not cand.is_relative_to(media_root) or cand == media_root:
         raise ValueError("媒体路径越界")
+    return cand
+
+
+def resolve_scoped_media_path(
+    runtime_dir: Path | str,
+    ref: str,
+    *,
+    scope: str = "private",
+    actor: str = "",
+    channel: str = "",
+    album: Any = None,
+) -> Path:
+    """Resolve a local `media/` path enforcing strict `(scope, actor, channel)` isolation."""
+    cand = resolve_runtime_media_path(runtime_dir, ref)
+    media_root = (Path(runtime_dir).resolve() / "media").resolve()
+    rel_parts = cand.relative_to(media_root).parts
+    if not rel_parts:
+        raise PermissionError("非法的媒体相对路径")
+    eff_scope = str(scope or "group").strip().lower()
+    top = rel_parts[0].lower()
+
+    if eff_scope != "private":
+        if "private" in {p.lower() for p in rel_parts}:
+            raise PermissionError("非私聊上下文禁止访问 private 作用域媒体")
+        if top in ("generated", "tts"):
+            if len(rel_parts) < 3 or rel_parts[1].lower() not in ("world", "group"):
+                raise PermissionError("非私聊上下文只能访问明确标记为 world/group 的生成媒体")
+
+    if top == "album":
+        if album is not None:
+            media_rel = "media/" + "/".join(rel_parts)
+            item = album.get_by_media_rel(media_rel, include_data_uri=False)
+            if item is None:
+                raise PermissionError("未知相册媒体路径拒绝访问")
+            item_scope = str(item.get("scope") or "").lower()
+            if item_scope == "private":
+                if eff_scope != "private":
+                    raise PermissionError("非私聊上下文禁止访问私密相册")
+                if actor and item.get("actor") and item.get("actor") != actor:
+                    raise PermissionError("禁止读取其他住客的私密相册媒体")
+            elif item_scope == "group":
+                if eff_scope not in ("group", "private"):
+                    raise PermissionError("不允许读取群相册媒体")
+                if eff_scope == "group" and channel and item.get("channel") and item.get("channel") != channel:
+                    raise PermissionError("禁止跨群访问相册媒体")
+        elif len(rel_parts) >= 2 and rel_parts[1].lower() == "private" and eff_scope != "private":
+            raise PermissionError("非私聊上下文禁止访问私密相册")
     return cand

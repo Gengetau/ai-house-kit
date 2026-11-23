@@ -36,7 +36,7 @@ from .backup import create_backup, list_backups
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, RoommateChatAgent, mask_secrets, openai_compatible_chat
 from .chat_guard import ReplyGuard
-from .chat_identity import Speaker, one_line, owner_speaker
+from .chat_identity import Speaker, member_speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
@@ -818,20 +818,37 @@ class HouseDaemon:
         *,
         external_id: str = "",
         attachments: Optional[Mapping[str, Any]] = None,
+        is_owner_token: bool = True,
     ) -> Dict[str, Any]:
-        """Web studio / MCP entry. The caller already passed the token tier check, so default speaker is the owner."""
+        """Web studio / MCP entry. Only an `owner`-tier token can default to the owner identity."""
         self._require_world()
-        channel = str(channel or "group")
-        if channel != "group":
-            aid = channel.split(":", 1)[1] if channel.startswith("private:") else channel
+        raw_ch = str(channel or "group").strip()
+        if raw_ch.lower() == "group":
+            channel = "group"
+        else:
+            aid = (
+                raw_ch.split(":", 1)[1].strip().lower()
+                if ":" in raw_ch and raw_ch.split(":", 1)[0].strip().lower() == "private"
+                else raw_ch.lower()
+            )
             if aid not in self.vocab.ROSTER:
                 raise ValueError(f"未知室友: {aid}")
             channel = f"private:{aid}"
         ext = str(external_id or "").strip()
-        if ext and getattr(self, "identity_store", None) is not None:
+        if not is_owner_token:
+            if channel != "group":
+                raise PermissionError("私聊仅限房主身份")
+            if ext and getattr(self, "identity_store", None) is not None:
+                spk = self.identity_store.resolve_speaker("web", ext, fallback_name=sender_name, default_owner=False)
+                if spk.is_owner:
+                    raise PermissionError("非房主令牌禁止使用房主绑定身份")
+            else:
+                guest_label = sender_name if (sender_name and sender_name != "房主") else "访客"
+                spk = member_speaker(guest_label, uid="web:guest", identity_id="visitor:web:guest")
+        elif ext and getattr(self, "identity_store", None) is not None:
             spk = self.identity_store.resolve_speaker("web", ext, fallback_name=sender_name, default_owner=False)
             if channel != "group" and not spk.is_owner:
-                raise ValueError("私聊仅限房主身份")
+                raise PermissionError("私聊仅限房主身份")
         elif getattr(self, "identity_store", None) is not None:
             spk = self.identity_store.resolve_speaker("web", "owner", fallback_name=sender_name, default_owner=True)
         else:
@@ -1192,6 +1209,8 @@ class HouseDaemon:
                         list(attachments.get("images") or ()),
                         daemon=self,
                         actor=targets[0] if targets else "",
+                        scope=scope,
+                        channel=channel,
                         cfg=vision_cfg,
                     ))
                 except Exception:  # noqa: BLE001
@@ -1203,6 +1222,9 @@ class HouseDaemon:
                     media_notes.extend(enrich_chat_records(
                         list(attachments.get("records") or ()),
                         daemon=self,
+                        actor=targets[0] if targets else "",
+                        scope=scope,
+                        channel=channel,
                         cfg=voice_cfg,
                     ))
                 except Exception:  # noqa: BLE001
@@ -2114,7 +2136,7 @@ class HouseDaemon:
         res = route.handler(ctx)
         return dict(res) if isinstance(res, Mapping) else {"ok": True, "result": res}
 
-    def handle_mcp_rpc(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_mcp_rpc(self, body: Dict[str, Any], *, is_owner_token: bool = True) -> Dict[str, Any]:
         req_id = body.get("id")
         method = body.get("method", "")
         params = body.get("params") or {}
@@ -2191,7 +2213,11 @@ class HouseDaemon:
                 st = self.get_state()
                 data = st["residents"].get(aid) or {"error": f"Unknown actor_id: {aid}"}
             elif tname == "chat_with_resident":
-                data = self.send_chat(str(args.get("channel") or "group"), str(args.get("text") or ""))
+                data = self.send_chat(
+                    str(args.get("channel") or "group"),
+                    str(args.get("text") or ""),
+                    is_owner_token=is_owner_token,
+                )
             elif tname == "owner_avatar_act":
                 data = self.avatar_action(
                     op=str(args.get("op") or "enter"),
@@ -2464,19 +2490,23 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 return
             if parsed.path == "/api/chat":
                 qs = parse_qs(parsed.query)
-                ch = (qs.get("channel") or ["group"])[0]
+                ch = (qs.get("channel") or ["group"])[0].strip()
                 if not self._need(parsed, tier_for_channel(ch, write=False)):
                     return
+                if ch.lower() == "group":
+                    ch = "group"
+                elif ":" in ch and ch.split(":", 1)[0].strip().lower() == "private":
+                    ch = "private:" + ch.split(":", 1)[1].strip().lower()
                 self._send_json({"channel": ch, "messages": daemon.list_chat(ch)})
                 return
             if parsed.path == "/api/memories":
                 qs = parse_qs(parsed.query)
-                sc = (qs.get("scope") or ["world"])[0]
+                sc = (qs.get("scope") or ["world"])[0].strip().lower()
                 act = (qs.get("actor") or [None])[0]
-                ch = (qs.get("channel") or [""])[0]
+                ch = (qs.get("channel") or [""])[0].strip()
                 kind = (qs.get("kind") or [None])[0]
                 lim = int((qs.get("limit") or ["50"])[0])
-                need_tier = "private" if sc == "private" else "read"
+                need_tier = "read" if (sc in ("world", "group") and ch.lower() in ("", "group")) else "private"
                 if not self._need(parsed, need_tier):
                     return
                 try:
@@ -2501,7 +2531,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 sc = (qs.get("scope") or ["world"])[0].strip().lower()
                 act = (qs.get("actor") or [None])[0]
                 lim = int((qs.get("limit") or ["24"])[0])
-                need_tier = "private" if sc == "private" else "read"
+                need_tier = "read" if sc == "world" else "private"
                 if not self._need(parsed, need_tier):
                     return
                 if daemon.needs_onboarding:
@@ -2621,8 +2651,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 if parsed.path == "/api/intents/cancel":
                     tier = "private"
                 else:
-                    sc = str(body.get("scope") or "private")
-                    tier = "private" if sc == "private" else "write"
+                    sc = str(body.get("scope") or "private").strip().lower()
+                    ch = str(body.get("channel") or "").strip().lower()
+                    tier = "write" if (sc in ("world", "group") and ch in ("", "group")) else "private"
             elif parsed.path == "/api/chat" and isinstance(body, dict):
                 tier = tier_for_channel(str(body.get("channel") or "group"), write=True)
             elif parsed.path == "/mcp":
@@ -2699,6 +2730,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                         sender_name=str(body.get("sender_name") or "房主"),
                         external_id=str(body.get("external_id") or ""),
                         attachments=raw_att,
+                        is_owner_token=policy.is_owner(self._token(parsed)),
                     )
                     self._send_json(res)
                     return
@@ -2736,7 +2768,7 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json(res)
                     return
                 if parsed.path == "/mcp":
-                    self._send_json(daemon.handle_mcp_rpc(body))
+                    self._send_json(daemon.handle_mcp_rpc(body, is_owner_token=policy.is_owner(self._token(parsed))))
                     return
                 if parsed.path == "/api/city/return":
                     res = daemon.return_city_outing(
@@ -2757,6 +2789,8 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json({"ok": True, "memory": res})
                     return
                 self._send_json({"error": "not_found"}, status=404)
+            except PermissionError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=403)
             except Exception as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
 

@@ -121,20 +121,38 @@ class IdentityStore:
 
     def sync_onebot_owners(self, owner_qqs: Iterable[str]) -> None:
         now = self._now()
+        wanted = {str(raw_qq or "").strip() for raw_qq in owner_qqs if str(raw_qq or "").strip()}
         with self._lock, self._connect() as c:
             c.execute(
                 "INSERT OR IGNORE INTO identities(identity_id, kind, display_name, notes, created_at, updated_at) "
                 "VALUES(?, 'owner', '房主', 'Primary owner identity', ?, ?)",
                 (OWNER_IDENTITY_ID, now, now),
             )
-            for raw_qq in owner_qqs:
-                qq = str(raw_qq or "").strip()
-                if not qq:
+            existing_rows = c.execute(
+                "SELECT external_id, identity_id, meta_json FROM identity_bindings WHERE platform='onebot'"
+            ).fetchall()
+            existing_by_qq: Dict[str, Dict[str, Any]] = {}
+            for r in existing_rows:
+                try:
+                    meta = json.loads(r["meta_json"] or "{}")
+                except ValueError:
+                    meta = {}
+                existing_by_qq[str(r["external_id"])] = {"identity_id": str(r["identity_id"]), "meta": meta}
+
+            for ext_qq, info in existing_by_qq.items():
+                if info["meta"].get("source") == "config" and ext_qq not in wanted:
+                    c.execute("DELETE FROM identity_bindings WHERE platform='onebot' AND external_id=?", (ext_qq,))
+
+            for qq in wanted:
+                cur = existing_by_qq.get(qq)
+                if cur is not None and cur["meta"].get("source") != "config":
+                    # Preserve explicit manual bindings instead of overwriting them to owner
                     continue
                 c.execute(
                     "INSERT INTO identity_bindings(platform, external_id, identity_id, meta_json, created_at, updated_at) "
                     "VALUES('onebot', ?, ?, '{\"source\":\"config\"}', ?, ?) "
-                    "ON CONFLICT(platform, external_id) DO UPDATE SET identity_id=excluded.identity_id, updated_at=excluded.updated_at",
+                    "ON CONFLICT(platform, external_id) DO UPDATE SET identity_id=excluded.identity_id, "
+                    "meta_json=excluded.meta_json, updated_at=excluded.updated_at",
                     (qq, OWNER_IDENTITY_ID, now, now),
                 )
 

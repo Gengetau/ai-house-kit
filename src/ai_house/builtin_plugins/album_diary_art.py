@@ -215,8 +215,27 @@ def _tool_browse_album(
         return {"ok": False, "status": "forbidden", "error": "非私聊上下文禁止读取私密相册", "items": []}
     if req_scope not in ("world", "group", "private"):
         req_scope = "world"
-    eff_actor = actor or (ctx.actor if ctx is not None and req_scope == "private" else None)
-    items = daemon.album.list_items(scope=req_scope, actor=eff_actor, limit=8, include_data_uri=False)
+
+    eff_actor: Optional[str] = actor or None
+    eff_channel = ""
+    if req_scope == "private":
+        # Strictly bind private album lookups to the conversing resident in ctx.actor
+        eff_actor = (ctx.actor if ctx is not None and ctx.actor else eff_actor) or None
+    elif req_scope == "group" and ctx is not None and ctx.channel:
+        eff_channel = str(ctx.channel).strip()
+
+    items = daemon.album.list_items(
+        scope=req_scope,
+        actor=eff_actor,
+        channel=eff_channel,
+        limit=8,
+        include_data_uri=False,
+    )
+    if req_scope == "private":
+        items = [
+            {k: v for k, v in it.items() if k != "media_rel"}
+            for it in items
+        ]
     return {"ok": True, "scope": req_scope, "items": items}
 
 
@@ -225,22 +244,25 @@ def _route_public_items(rctx: PluginRequestContext) -> Dict[str, Any]:
     if daemon is None or getattr(daemon, "album", None) is None:
         return {"ok": False, "degraded": True, "status": "unconfigured", "items": []}
     sc = (rctx.query.get("scope") or ["world"])[0].strip().lower()
-    if sc not in ("world", "group"):
-        raise ValueError("公开接口仅支持 scope=world 或 scope=group")
+    if sc != "world":
+        raise ValueError("公开接口仅支持 scope=world（群聊与私密相册请访问 private 权限端点）")
     act = (rctx.query.get("actor") or [""])[0].strip() or None
     lim = int((rctx.query.get("limit") or [rctx.plugin_config.get("max_items") or 24])[0])
-    items = daemon.album.list_items(scope=sc, actor=act, limit=lim, include_data_uri=True)
-    return {"ok": True, "scope": sc, "items": items}
+    items = daemon.album.list_items(scope="world", actor=act, limit=lim, include_data_uri=True)
+    return {"ok": True, "scope": "world", "items": items}
 
 
 def _route_private_items(rctx: PluginRequestContext) -> Dict[str, Any]:
     daemon = rctx.daemon
     if daemon is None or getattr(daemon, "album", None) is None:
         return {"ok": False, "degraded": True, "status": "unconfigured", "items": []}
+    sc = (rctx.query.get("scope") or ["private"])[0].strip().lower()
+    if sc not in ("private", "group"):
+        sc = "private"
     act = (rctx.query.get("actor") or [""])[0].strip() or None
     lim = int((rctx.query.get("limit") or [rctx.plugin_config.get("max_items") or 24])[0])
-    items = daemon.album.list_items(scope="private", actor=act, limit=lim, include_data_uri=True)
-    return {"ok": True, "scope": "private", "items": items}
+    items = daemon.album.list_items(scope=sc, actor=act, limit=lim, include_data_uri=True)
+    return {"ok": True, "scope": sc, "items": items}
 
 
 PLUGIN_DEF = PluginDefinition(
