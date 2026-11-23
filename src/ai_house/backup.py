@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import datetime as dt
 import hashlib
 import io
@@ -12,6 +13,7 @@ import sqlite3
 import tarfile
 import tempfile
 import time
+import uuid
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -107,20 +109,67 @@ def _sqlite_hot_backup(src_db: Path, dst_db: Path) -> None:
             raise RuntimeError(f"SQLite 完整性校验失败 ({src_db.name}): {row[0] if row else 'empty'}")
 
 
+def is_pid_alive(pid: int) -> bool:
+    """Best-effort OS check whether `pid` currently refers to a live process."""
+    try:
+        ip = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if ip <= 0:
+        return False
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, ip)
+        if not handle:
+            return ctypes.windll.kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED => alive
+        try:
+            code = ctypes.c_ulong(0)
+            if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(ip, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def check_daemon_lock(runtime_dir: Path | str) -> Optional[int]:
+    """Return live daemon PID if `<runtime_dir>/.daemon.lock` points to a running process, else `None`."""
+    rt = Path(runtime_dir)
+    for cand in (rt / ".daemon.lock", rt / "runtime" / ".daemon.lock"):
+        if not cand.is_file():
+            continue
+        try:
+            doc = json.loads(cand.read_text(encoding="utf-8"))
+            pid = int(doc.get("pid") or 0)
+        except (OSError, ValueError, TypeError):
+            pid = 0
+        if pid > 0 and is_pid_alive(pid):
+            return pid
+    return None
+
+
 def _prune_backups(
     backups_dir: Path,
     *,
     keep_count: int,
     keep_days: int,
     protect_path: Optional[Path] = None,
-    now: float,
+    wall_now: Optional[float] = None,
 ) -> List[str]:
     archives = sorted(
         backups_dir.glob("ai-house-backup-*.tar.gz"),
         key=lambda p: (p.stat().st_mtime, p.name),
         reverse=True,
     )
-    cutoff = float(now) - max(1, int(keep_days)) * 86400.0
+    # D1: Archive file mtimes live on the OS wall clock, never on virtual simulation clock time.
+    cutoff = float(wall_now if wall_now is not None else time.time()) - max(1, int(keep_days)) * 86400.0
     max_keep = max(1, int(keep_count))
     pruned: List[str] = []
     for idx, arc in enumerate(archives):
@@ -166,6 +215,7 @@ def create_backup(
     keep_count: int = DEFAULT_KEEP_COUNT,
     keep_days: int = DEFAULT_KEEP_DAYS,
     now: Optional[float] = None,
+    wall_now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create a verified hot SQLite + redacted runtime config `.tar.gz` backup (excluding `.env` and plaintext keys)."""
     rt = Path(runtime_dir).resolve()
@@ -235,6 +285,23 @@ def create_backup(
                     "sha256": _sha256_file(dst_fp),
                 })
 
+        # 4) Generated / album / TTS media assets (`runtime/media/**`)
+        media_dir = rt / "media"
+        if media_dir.is_dir():
+            for fp in sorted(media_dir.rglob("*")):
+                if not fp.is_file() or _is_sensitive_name(fp.name):
+                    continue
+                rel = fp.relative_to(rt).as_posix()
+                dst_fp = stage_root / rel
+                dst_fp.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(fp, dst_fp)
+                manifest_files.append({
+                    "path": rel,
+                    "kind": "media",
+                    "size": int(dst_fp.stat().st_size),
+                    "sha256": _sha256_file(dst_fp),
+                })
+
         manifest = {
             "version": __version__,
             "created_at": ts,
@@ -259,7 +326,7 @@ def create_backup(
         keep_count=keep_count,
         keep_days=keep_days,
         protect_path=archive_path,
-        now=ts,
+        wall_now=wall_now,
     )
     return {
         "ok": True,
@@ -348,26 +415,86 @@ def restore_backup(
     *,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
-    """Verify and restore a verified backup archive into `target_runtime_dir`."""
-    verified = verify_backup(archive_path)
+    """Verify live daemon lock, stage + checksum-verify archive, and atomically restore into `target_runtime_dir`."""
     target = Path(target_runtime_dir).resolve()
+    live_pid = check_daemon_lock(target)
+    if live_pid is not None:
+        raise RuntimeError(f"目标运行目录正被 ai-house 守护进程 (PID {live_pid}) 使用，请先停止服务再执行恢复")
+
     if target.exists() and not overwrite and any(target.glob("*.db")):
         raise FileExistsError(f"目标运行目录已存在数据库文件：{target}（如确需覆盖请传 overwrite=True）")
-    target.mkdir(parents=True, exist_ok=True)
 
+    verified = verify_backup(archive_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage_dir = Path(tempfile.mkdtemp(dir=str(target.parent), prefix=f".{target.name}.restore_stage_{uuid.uuid4().hex[:6]}_"))
+    rollback_dir = Path(tempfile.mkdtemp(dir=str(target.parent), prefix=f".{target.name}.restore_prev_{uuid.uuid4().hex[:6]}_"))
     restored: List[str] = []
-    with tarfile.open(Path(archive_path).resolve(), "r:gz") as tf:
-        members = _safe_tar_members(tf)
-        for entry in verified["manifest"]["files"]:
-            rel = str(entry.get("path") or "").replace("\\", "/").lstrip("./")
-            dst = (target / rel).resolve()
-            if not dst.is_relative_to(target):
-                raise ValueError(f"恢复路径越界：{rel}")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            data = tf.extractfile(members[rel]).read()
-            dst.write_bytes(data)
-            _safe_chmod(dst, 0o600)
-            restored.append(rel)
+    moved_back: List[tuple[Path, Path]] = []
+    try:
+        # 1) Extract & verify inside staging directory before mutating target.
+        with tarfile.open(Path(archive_path).resolve(), "r:gz") as tf:
+            members = _safe_tar_members(tf)
+            for entry in verified["manifest"]["files"]:
+                rel = str(entry.get("path") or "").replace("\\", "/").lstrip("./")
+                staged = (stage_dir / rel).resolve()
+                if not staged.is_relative_to(stage_dir):
+                    raise ValueError(f"恢复路径越界：{rel}")
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                data = tf.extractfile(members[rel]).read()
+                if len(data) != int(entry.get("size", -1)) or hashlib.sha256(data).hexdigest() != str(entry.get("sha256") or ""):
+                    raise ValueError(f"恢复校验失败：{rel}")
+                staged.write_bytes(data)
+                _safe_chmod(staged, 0o600)
+                if entry.get("kind") == "db" or rel.endswith(".db"):
+                    with contextlib.closing(sqlite3.connect(str(staged), timeout=5.0)) as chk:
+                        row = chk.execute("PRAGMA integrity_check").fetchone()
+                        if not row or str(row[0]).strip().lower() != "ok":
+                            raise ValueError(f"恢复 SQLite 校验失败：{rel}")
+
+        target.mkdir(parents=True, exist_ok=True)
+        # 2) Move aside existing runtime state (preserving `backups/` & `.env*`) and drop stale SQLite -wal/-shm.
+        for pattern in ("*.db", "*.db-wal", "*.db-shm", "*.json"):
+            for cur_p in sorted(target.glob(pattern)):
+                if _is_sensitive_name(cur_p.name) or cur_p.name == ".daemon.lock":
+                    continue
+                if cur_p.name.endswith(("-wal", "-shm")):
+                    cur_p.unlink(missing_ok=True)
+                    continue
+                rb_p = rollback_dir / cur_p.name
+                shutil.move(str(cur_p), str(rb_p))
+                moved_back.append((cur_p, rb_p))
+        for dir_name in ("custom-pack", "media"):
+            cur_d = target / dir_name
+            if cur_d.exists():
+                rb_d = rollback_dir / dir_name
+                shutil.move(str(cur_d), str(rb_d))
+                moved_back.append((cur_d, rb_d))
+
+        # 3) Move verified files into target cleanly.
+        try:
+            for entry in verified["manifest"]["files"]:
+                rel = str(entry.get("path") or "").replace("\\", "/").lstrip("./")
+                src = (stage_dir / rel).resolve()
+                dst = (target / rel).resolve()
+                if not dst.is_relative_to(target):
+                    raise ValueError(f"恢复路径越界：{rel}")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                _safe_chmod(dst, 0o600)
+                restored.append(rel)
+        except Exception:
+            for orig_p, rb_p in reversed(moved_back):
+                if orig_p.is_dir():
+                    shutil.rmtree(orig_p, ignore_errors=True)
+                elif orig_p.exists():
+                    orig_p.unlink(missing_ok=True)
+                if rb_p.exists():
+                    shutil.move(str(rb_p), str(orig_p))
+            raise
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        shutil.rmtree(rollback_dir, ignore_errors=True)
+
     return {
         "ok": True,
         "target_dir": str(target),
@@ -379,7 +506,9 @@ def restore_backup(
 __all__ = [
     "DEFAULT_KEEP_COUNT",
     "DEFAULT_KEEP_DAYS",
+    "check_daemon_lock",
     "create_backup",
+    "is_pid_alive",
     "list_backups",
     "restore_backup",
     "verify_backup",

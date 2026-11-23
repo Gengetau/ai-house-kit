@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from worldkernel import vocab_life1
 
 from .auth import BindRefused, check_bind
-from .backup import create_backup, verify_backup
+from .backup import create_backup, restore_backup, verify_backup
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import LLMAPIError, mask_secrets, openai_compatible_chat
 from .daemon import HouseDaemon, make_http_server
@@ -445,6 +445,24 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_restore(args: argparse.Namespace) -> int:
+    _load_dotenv(args.env_file)
+    data_dir = args.data_dir or os.environ.get("AI_HOUSE_DATA_DIR") or "./runtime"
+    try:
+        res = restore_backup(args.archive, data_dir, overwrite=bool(args.overwrite))
+    except Exception as exc:  # noqa: BLE001
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"[ai-house] 恢复失败：{exc}", file=sys.stderr, flush=True)
+        return 2
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    else:
+        print(f"✅ 备份恢复完成：{res['target_dir']}（已恢复 {res['restored_files']} 个文件，{len(res['dbs'])} 个数据库）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="ai-house", description="Turnkey AI roommate sharehouse engine & studio")
     sub = ap.add_subparsers(dest="cmd")
@@ -499,6 +517,14 @@ def main(argv: list[str] | None = None) -> int:
     p_bk.add_argument("--verify", default=None, help="校验指定备份归档 (.tar.gz) 而不创建新备份")
     p_bk.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
     p_bk.set_defaults(func=cmd_backup)
+
+    p_rs = sub.add_parser("restore", help="在停止守护进程后，校验并原子恢复备份归档到运行目录")
+    p_rs.add_argument("archive", help="待恢复的备份归档路径 (.tar.gz)")
+    p_rs.add_argument("--env-file", default=".env", help="启动配置 .env 路径（用于读取 AI_HOUSE_DATA_DIR）")
+    p_rs.add_argument("--data-dir", default=None, help="目标运行时数据目录（默认读取 AI_HOUSE_DATA_DIR 或 ./runtime）")
+    p_rs.add_argument("--overwrite", action="store_true", help="覆盖目标运行目录中已有的数据库与状态文件")
+    p_rs.add_argument("--json", action="store_true", help="以 JSON 格式输出结果")
+    p_rs.set_defaults(func=cmd_restore)
 
     ns = ap.parse_args(argv)
     if not getattr(ns, "cmd", None):

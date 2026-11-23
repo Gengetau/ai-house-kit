@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .onboarding import atomic_write_private_text, mask_secret, upsert_dotenv_vars
-from .plugin_api import PluginDefinition, PluginManifest, is_plugin_enabled, resolve_plugin_config
+from .plugin_api import PluginDefinition, PluginManifest, is_plugin_enabled, resolve_plugin_config, safe_resolve_plugin_config
 
 
 class SettingsStore:
@@ -171,7 +171,7 @@ class SettingsStore:
         plugins_map = self.get_plugins_map()
         entry = plugins_map.get(defn.plugin_id) or {}
         stored_vals = entry.get("values") if isinstance(entry.get("values"), dict) else {}
-        resolved = resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
+        resolved, cfg_warnings = safe_resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
         enabled = is_plugin_enabled(defn, env=env, stored_plugins=plugins_map)
 
         fields_out: List[Dict[str, Any]] = []
@@ -205,5 +205,6 @@ class SettingsStore:
             "active": bool(active),
             "missing_packages": defn.manifest.missing_packages(),
             "error": runtime_error,
+            "config_warnings": cfg_warnings,
             "fields": fields_out,
         }
