@@ -1550,3 +1550,72 @@ table.usage-table tbody th[scope="row"]{
   table.usage-table td:nth-child(6)::before{content:var(--label-6) ": ";font-weight:600;color:var(--ink-2);}
   table.usage-table td:nth-child(7)::before{content:var(--label-7) ": ";font-weight:600;color:var(--ink-2);}
 }
+
+/* 日记配图与分域相册 (#/keep/diary, #/keep/album) */
+.diary-art{
+  margin:0 0 12px;
+  overflow:clip;
+  border-radius:10px;
+}
+.diary-art img{
+  display:block;
+  inline-size:100%;
+  block-size:auto;
+  aspect-ratio:4 / 3;
+  object-fit:cover;
+}
+.album-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  gap:14px;
+  inline-size:100%;
+}
+.album-card{
+  grid-row:span 2;
+  display:grid;
+  grid-template-rows:auto 1fr;
+  grid-template-rows:subgrid;
+  padding:0;
+  overflow:clip;
+  margin:0;
+}
+.album-thumb{
+  display:grid;
+  place-items:center;
+  border:0;
+  padding:0;
+  background:var(--card-2);
+  cursor:pointer;
+  inline-size:100%;
+  overflow:clip;
+}
+.album-thumb img{
+  display:block;
+  inline-size:100%;
+  block-size:auto;
+  aspect-ratio:4 / 3;
+  object-fit:cover;
+}
+.album-meta{
+  padding:12px 14px 14px;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.album-cap{
+  margin:0;
+  line-height:1.55;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+  line-clamp:2;
+  overflow:clip;
+}
+.album-full img{
+  display:block;
+  inline-size:100%;
+  max-block-size:70dvh;
+  block-size:auto;
+  object-fit:contain;
+  border-radius:10px;
+}

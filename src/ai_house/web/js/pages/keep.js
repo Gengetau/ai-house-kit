@@ -1,10 +1,10 @@
-// 珍藏页 (#/keep/<tab>): 精装日记书架与翻页器 / 长期记忆筛选与遗忘 / 书架便签。
+// 珍藏页 (#/keep/<tab>): 精装日记书架与翻页器 / 小屋相册 / 长期记忆筛选与遗忘 / 书架便签。
 import {el, put, api, icon, ava, go, setCurrentActor, pageHead, pageTabs, residentFilter,
-  emptyState, errState, ownerOnly, loading, confirmBox, fmtTime, jstDate, hasTier, isOnboarding, toast, LoginNeeded} from '../core.js';
+  emptyState, errState, ownerOnly, loading, confirmBox, dialog, fmtTime, jstDate, hasTier, isOnboarding, toast, LoginNeeded} from '../core.js';
 import {RESIDENTS, byActor, nameOf, toneStyle} from '../residents.js';
 import {MEM_SCOPES, MEM_KINDS} from '../vocab.js';
 
-const TABS = [['diary', '日记书架'], ['memory', '长期记忆'], ['nook', '书架便签']];
+const TABS = [['diary', '日记书架'], ['album', '小屋相册'], ['memory', '长期记忆'], ['nook', '书架便签']];
 
 export async function render(view, route){
   if (isOnboarding()){
@@ -14,11 +14,12 @@ export async function render(view, route){
   const tab = TABS.some(([k]) => k === route.parts[1]) ? route.parts[1] : 'diary';
   const slot = el('div');
   view.append(
-    pageHead('珍藏与手记', '每晚写下的日记、可检索遗忘的分域记忆，以及书架旁贴着的便签。'),
+    pageHead('珍藏与手记', '每晚写下的日记配图、分域隔离的小屋相册、长期记忆与书架便签。'),
     pageTabs(TABS.map(([k, l]) => [k, l, `#/keep/${k}`]), tab),
     slot);
 
   if (tab === 'diary') return renderDiary(slot, route.parts[2] || '');
+  if (tab === 'album') return renderAlbum(slot, route.q || {});
   if (tab === 'memory') return renderMemory(slot, route.q || {});
   return renderNook(slot);
 }
@@ -95,12 +96,26 @@ async function diaryReader(view, R){
       const renderPage = (item, pno, cornerSide) => {
         if (!item) return el('div', {class: 'page blank'}, el('div', {class: 'flow'}, '— 翻至最新一页 —'));
         const paras = String(item.text || '').replace(/\r\n/g, '\n').split(/\n+/).map(s => s.trim()).filter(Boolean);
+        const isHeroArt = Boolean(item === e && (single || cornerSide === 'r'));
+        const artAttrs = {
+          src: item.image_data_uri || '',
+          alt: item.image_title || `${item.day} 日记配图`,
+          class: 'dimg',
+          width: 480,
+          height: 360,
+        };
+        if (isHeroArt) artAttrs.fetchpriority = 'high';
+        else artAttrs.loading = 'lazy';
+        const artNode = item.image_data_uri
+          ? el('figure', {class: 'diary-art'}, el('img', artAttrs))
+          : null;
         return el('div', {class: 'page'},
           el('div', {class: 'flow'},
             el('h3', {}, item.day + ' 的日记'),
             el('div', {class: 'dmeta'},
               fmtTime(item.created_at, true),
               el('span', {class: 'tag'}, item.mode === 'live_api' ? 'LLM 亲笔' : '内置模板')),
+            artNode,
             paras.map(p => el('p', {}, p))),
           el('div', {class: 'pno'}, `P.${pno}`),
           cornerSide === 'l' && idx > 0 ? el('button', {class: 'corner l', 'aria-label': '上一篇', onclick: () => { idx--; drawBook(); }}) : null,
@@ -146,6 +161,127 @@ async function diaryReader(view, R){
 
   await load();
   return {};
+}
+
+/* ---------------------------------------------------------------- 小屋相册 */
+async function renderAlbum(view, q){
+  let scope = 'world', actor = (q.who && byActor(q.who)) ? q.who : '', alive = true;
+  const filterCard = el('div', {class: 'card', style: 'margin-bottom:14px'});
+  const stage = el('div', {}, loading());
+  view.append(filterCard, stage);
+
+  function drawFilters(){
+    const canPriv = hasTier('private');
+    const scSeg = el('div', {class: 'seg'},
+      [['world', '公共生活'], ['group', '群聊相册'], ['private', '私密相册']].map(([k, lb]) =>
+        el('button', {
+          type: 'button',
+          class: scope === k ? 'on' : '',
+          onclick: () => {
+            scope = k;
+            if (scope === 'private' && !actor) actor = RESIDENTS[0]?.actor || '';
+            load();
+          },
+        }, k === 'private' && !canPriv ? [icon('lock'), ' ' + lb] : lb)));
+
+    put(filterCard,
+      residentFilter(actor, a => {
+        actor = a;
+        load();
+      }, {allLabel: scope === 'private' ? false : '全部住客'}),
+      el('div', {class: 'row wrap', style: 'gap:10px'}, scSeg));
+  }
+
+  function previewItem(it){
+    const res = byActor(it.actor);
+    const body = el('div', {class: 'stack'},
+      it.data_uri
+        ? el('div', {class: 'album-full'},
+            el('img', {src: it.data_uri, alt: it.title || '相册照片'}))
+        : null,
+      el('div', {class: 'row wrap', style: 'gap:8px'},
+        el('span', {class: 'tag'}, MEM_SCOPES[it.scope] || it.scope),
+        it.actor ? el('span', {class: 'tag'}, nameOf(it.actor)) : null,
+        it.diary_day ? el('span', {class: 'tag'}, it.diary_day) : null,
+        el('span', {class: 'tiny muted'}, fmtTime(it.created_at, true))),
+      it.caption ? el('p', {class: 'small', style: 'margin:0;line-height:1.7'}, it.caption) : null);
+    dialog({
+      title: (res ? nameOf(res.actor) + ' · ' : '') + (it.title || '相册记录'),
+      body,
+      buttons: [['关闭', true, 'primary']],
+      wide: true,
+    });
+  }
+
+  async function load(){
+    drawFilters();
+    if (!alive) return;
+    if (scope === 'private' && !hasTier('private')){
+      put(stage, ownerOnly('房主私密相册', '私聊分享的照片仅存放在私密作用域，需要 Owner 或 Private 令牌才能查看。'));
+      return;
+    }
+    put(stage, loading());
+    const qs = new URLSearchParams({scope, limit: '24'});
+    if (actor) qs.set('actor', actor);
+    try {
+      const d = await api('/api/album?' + qs.toString());
+      if (!alive) return;
+      if (!d.enabled){
+        put(stage, emptyState({
+          kind: 'empty',
+          title: '相册与日记配图插件尚未开启',
+          hint: '此功能默认关闭，可在插件配置中心按需开启；私聊照片与公开相册完全分域隔离。',
+          actionLabel: hasTier('owner') ? '前往插件设置' : '',
+          onAction: hasTier('owner') ? () => go('#/settings') : null,
+          iconName: 'image',
+        }));
+        return;
+      }
+      const items = d.items || [];
+      put(stage, items.length
+        ? el('div', {class: 'album-grid'}, items.map((it, idx) => {
+            const res = byActor(it.actor);
+            const imgAttrs = {
+              src: it.data_uri || '',
+              alt: it.title || '小屋照片',
+              width: 480,
+              height: 360,
+            };
+            if (idx === 0) imgAttrs.fetchpriority = 'high';
+            else imgAttrs.loading = 'lazy';
+            return el('article', {class: 'card album-card', style: res ? toneStyle(res) : ''},
+              el('button', {
+                type: 'button',
+                class: 'album-thumb',
+                'aria-label': `查看大图：${it.title || '小屋照片'}`,
+                onclick: () => previewItem(it),
+              }, it.data_uri ? el('img', imgAttrs) : icon('image')),
+              el('div', {class: 'album-meta'},
+                el('div', {class: 'row between wrap', style: 'gap:6px'},
+                  el('b', {}, it.title || '瞬间留念'),
+                  el('span', {class: 'tag'}, MEM_SCOPES[it.scope] || it.scope)),
+                el('div', {class: 'row wrap', style: 'gap:6px'},
+                  res ? ava(res, 'xs') : null,
+                  el('span', {class: 'tiny muted'}, it.actor ? nameOf(it.actor) : '合租屋'),
+                  el('span', {class: 'tiny muted'}, fmtTime(it.created_at, true))),
+                it.caption ? el('p', {class: 'small muted album-cap'}, it.caption) : null));
+          }))
+        : emptyState({
+            kind: 'empty',
+            title: '这个分域下还没有照片',
+            hint: scope === 'private'
+              ? '房主私聊分享的照片会自动归入这里，绝不流出到群聊或公开相册。'
+              : '开启文生图并在每晚生成日记后，公开插画会按天保存在这里。',
+            iconName: 'image',
+          }));
+    } catch (e){
+      if (e instanceof LoginNeeded) throw e;
+      put(stage, errState(e, {onRetry: load}));
+    }
+  }
+
+  await load();
+  return {refresh: load, cleanup: () => { alive = false; }};
 }
 
 /* ---------------------------------------------------------------- 长期记忆 */

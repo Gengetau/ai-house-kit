@@ -30,6 +30,7 @@ from worldkernel.outbox import Dispatcher, enqueue_outbound as _kernel_enqueue_o
 from worldkernel.store import VirtualClock, WallClock
 
 from . import __version__
+from .album import AlbumStore
 from .auth import AuthPolicy, check_bind, host_is_loopback, mcp_tier, origin_is_loopback, tier_for_channel
 from .backup import create_backup, list_backups
 from .builtin_plugins.onebot_ws import ChannelConfigError
@@ -187,6 +188,7 @@ class HouseDaemon:
             self.clock = OffsetWallClock(self.runtime_dir / "clock_offset.json")
 
         self.settings_store = SettingsStore(self.runtime_dir)
+        self.album = AlbumStore(self.runtime_dir)
         self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
         self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
         self.send_gate = SendGate(self)
@@ -472,6 +474,14 @@ class HouseDaemon:
                 self.log(f"memory extract error: {type(exc).__name__}: {exc}")
             if due_diary_day(now) is not None:
                 try:
+                    stored_pl = self.settings_store.get_plugins_map()
+                    active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_pl)}
+                    album_enabled = "album_diary_art" in active_pids
+                    album_cfg = (
+                        self.registry.resolve_config("album_diary_art", env=self.env, stored_plugins=stored_pl)
+                        if album_enabled
+                        else {}
+                    )
                     diary_fn = (
                         self.model_router.chat_fn(purpose="diary")
                         if (self._llm_fn is None and self.model_router.has_live_endpoint(purpose="diary"))
@@ -479,7 +489,14 @@ class HouseDaemon:
                     )
                     for job in self.diary.collect_due_jobs(now):
                         text, mode = self.diary.generate_text(job, llm_fn=diary_fn)
-                        self.diary.save_generated(job, text, mode, now)
+                        saved = self.diary.save_generated(job, text, mode, now)
+                        if saved and album_enabled:
+                            try:
+                                from .builtin_plugins.album_diary_art import maybe_illustrate_diary
+
+                                maybe_illustrate_diary(self, saved, job, now, cfg=album_cfg)
+                            except Exception as art_exc:  # noqa: BLE001
+                                self.log(f"diary art skipped: {type(art_exc).__name__}: {art_exc}")
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
             self._run_plugin_tasks(now)
@@ -725,6 +742,38 @@ class HouseDaemon:
                 (channel, int(limit)),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def list_diaries_view(self, actor: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        if self.needs_onboarding or self.diary is None:
+            return []
+        rows = self.diary.list_diaries(actor=actor, limit=limit)
+        if getattr(self, "album", None) is not None:
+            for item in rows:
+                alb_id = str(item.get("image_album_id") or "").strip()
+                if alb_id:
+                    art = self.album.get_item(alb_id, expected_scope="world", include_data_uri=True)
+                    if art and art.get("data_uri"):
+                        item["image_data_uri"] = art["data_uri"]
+                        item["image_title"] = art.get("title") or ""
+        return rows
+
+    def list_album_view(
+        self,
+        *,
+        scope: str = "world",
+        actor: Optional[str] = None,
+        limit: int = 24,
+    ) -> Dict[str, Any]:
+        stored_pl = self.settings_store.get_plugins_map()
+        active_pids = {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored_pl)}
+        enabled = "album_diary_art" in active_pids
+        sc = str(scope or "world").strip().lower()
+        if sc not in ("world", "group", "private"):
+            raise ValueError(f"非法的相册作用域: {scope!r}")
+        if not enabled or getattr(self, "album", None) is None:
+            return {"ok": True, "enabled": enabled, "scope": sc, "items": []}
+        items = self.album.list_items(scope=sc, actor=actor, limit=limit, include_data_uri=True)
+        return {"ok": True, "enabled": True, "scope": sc, "items": items}
 
     def list_memories(
         self,
@@ -1106,6 +1155,11 @@ class HouseDaemon:
                 if voice_enabled
                 else {}
             )
+            album_save_cfg = (
+                self.registry.resolve_config("album_diary_art", env=self.env, stored_plugins=stored_plugins)
+                if "album_diary_art" in active_pids
+                else None
+            )
 
         # Release `self._lock` before attachment analysis, memory recall, and model HTTP calls.
         scope = "private" if is_private else "group"
@@ -1115,6 +1169,21 @@ class HouseDaemon:
         model_user_text = text
         if isinstance(attachments, Mapping):
             media_notes: List[str] = []
+            if attachments.get("images") and album_save_cfg is not None:
+                try:
+                    from .builtin_plugins.album_diary_art import archive_chat_images
+
+                    archive_chat_images(
+                        list(attachments.get("images") or ()),
+                        scope=scope,
+                        channel=channel,
+                        actor=targets[0] if len(targets) == 1 else "",
+                        daemon=self,
+                        now=now,
+                        cfg=album_save_cfg,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             if attachments.get("images") and vision_enabled:
                 try:
                     from .builtin_plugins.vision_understand import enrich_chat_images
@@ -1994,10 +2063,15 @@ class HouseDaemon:
                 self.group_behavior.reset()
             if getattr(self, "proactive", None) is not None:
                 self.proactive.reset()
+            if getattr(self, "album", None) is not None:
+                self.album.reset()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():
                 shutil.rmtree(custom_dir, ignore_errors=True)
+            media_dir = self.runtime_dir / "media"
+            if media_dir.exists():
+                shutil.rmtree(media_dir, ignore_errors=True)
 
             self.needs_onboarding = True
             self.vocab = vocab_life1.load_pack()
@@ -2420,7 +2494,23 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 qs = parse_qs(parsed.query)
                 act = (qs.get("actor") or [None])[0]
                 lim = int((qs.get("limit") or ["20"])[0])
-                self._send_json({"ok": True, "diaries": daemon.diary.list_diaries(actor=act, limit=lim)})
+                self._send_json({"ok": True, "diaries": daemon.list_diaries_view(actor=act, limit=lim)})
+                return
+            if parsed.path == "/api/album":
+                qs = parse_qs(parsed.query)
+                sc = (qs.get("scope") or ["world"])[0].strip().lower()
+                act = (qs.get("actor") or [None])[0]
+                lim = int((qs.get("limit") or ["24"])[0])
+                need_tier = "private" if sc == "private" else "read"
+                if not self._need(parsed, need_tier):
+                    return
+                if daemon.needs_onboarding:
+                    self._send_json({"ok": True, "enabled": False, "scope": sc, "items": []})
+                    return
+                try:
+                    self._send_json(daemon.list_album_view(scope=sc, actor=act, limit=lim))
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
             if parsed.path == "/api/intents":
                 if not self._need(parsed, "private"):

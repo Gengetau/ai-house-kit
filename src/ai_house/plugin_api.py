@@ -659,6 +659,7 @@ class PluginRegistry:
         """Discover built-in plugins, filesystem packs, and third-party entry points safely."""
         # 1) Built-in declarative plugins
         from .builtin_plugins import (
+            album_diary_art,
             book_nook,
             city_mcp_outing,
             dice_tabletop,
@@ -692,6 +693,7 @@ class PluginRegistry:
             image_gen,
             web_search,
             meme_library,
+            album_diary_art,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 

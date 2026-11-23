@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS house_diaries (
     mem_id INTEGER,
     text TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'demo',
+    image_album_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     PRIMARY KEY (day, actor)
 );
@@ -124,19 +125,31 @@ class DiaryService:
         with contextlib.closing(self._conn()) as c:
             with c:
                 c.executescript(DIARY_SCHEMA)
+                cols = {r[1] for r in c.execute("PRAGMA table_info(house_diaries)").fetchall()}
+                if "image_album_id" not in cols:
+                    c.execute("ALTER TABLE house_diaries ADD COLUMN image_album_id TEXT NOT NULL DEFAULT ''")
+
+    def set_diary_image(self, day: str, actor: str, album_id: str) -> None:
+        self.init_schema()
+        with contextlib.closing(self._conn()) as c:
+            with c:
+                c.execute(
+                    "UPDATE house_diaries SET image_album_id=? WHERE day=? AND actor=?",
+                    (str(album_id or "").strip(), str(day), str(actor)),
+                )
 
     def list_diaries(self, actor: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
         self.init_schema()
         with contextlib.closing(self._conn()) as c:
             if actor:
                 rows = c.execute(
-                    "SELECT day, actor, mem_id, text, mode, created_at FROM house_diaries "
+                    "SELECT day, actor, mem_id, text, mode, image_album_id, created_at FROM house_diaries "
                     "WHERE actor=? ORDER BY day DESC, created_at DESC LIMIT ?",
                     (actor, int(limit)),
                 ).fetchall()
             else:
                 rows = c.execute(
-                    "SELECT day, actor, mem_id, text, mode, created_at FROM house_diaries "
+                    "SELECT day, actor, mem_id, text, mode, image_album_id, created_at FROM house_diaries "
                     "ORDER BY day DESC, created_at DESC LIMIT ?",
                     (int(limit),),
                 ).fetchall()

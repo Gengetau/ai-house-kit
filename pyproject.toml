@@ -38,5 +38,7 @@ ai_house = [
   "web/img/house/chars/*",
   "bundled_packs/*/*.json",
   "bundled_packs/*/people/*.json",
+  "bundled_stickers/*.json",
+  "bundled_stickers/*.svg",
 ]
 worldcatalog = ["*.json", "life1/*.json", "life1/people/*.json", "life1/garment_images/*.png", "profiles/*.json"]
