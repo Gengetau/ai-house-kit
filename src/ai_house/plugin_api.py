@@ -670,6 +670,7 @@ class PluginRegistry:
             sticker_pack,
             svg_wardrobe_studio,
             vision_understand,
+            voice_io,
         )
 
         for mod in (
@@ -684,6 +685,7 @@ class PluginRegistry:
             reminders,
             mini_games,
             vision_understand,
+            voice_io,
         ):
             self.register_definition(mod.PLUGIN_DEF)
 

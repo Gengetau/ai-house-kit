@@ -1100,6 +1100,12 @@ class HouseDaemon:
                 if vision_enabled
                 else {}
             )
+            voice_enabled = "voice_io" in active_pids
+            voice_cfg = (
+                self.registry.resolve_config("voice_io", env=self.env, stored_plugins=stored_plugins)
+                if voice_enabled
+                else {}
+            )
 
         # Release `self._lock` before attachment analysis, memory recall, and model HTTP calls.
         scope = "private" if is_private else "group"
@@ -1107,20 +1113,33 @@ class HouseDaemon:
         speaker_role = "owner" if speaker.is_owner else "member"
         extra_tools = [t["spec"] for t in self._active_tools.values()]
         model_user_text = text
-        if isinstance(attachments, Mapping) and attachments.get("images") and vision_enabled:
-            try:
-                from .builtin_plugins.vision_understand import enrich_chat_images
+        if isinstance(attachments, Mapping):
+            media_notes: List[str] = []
+            if attachments.get("images") and vision_enabled:
+                try:
+                    from .builtin_plugins.vision_understand import enrich_chat_images
 
-                img_notes = enrich_chat_images(
-                    list(attachments.get("images") or ()),
-                    daemon=self,
-                    actor=targets[0] if targets else "",
-                    cfg=vision_cfg,
-                )
-                if img_notes:
-                    model_user_text = f"{text}\n" + "\n".join(img_notes)
-            except Exception:  # noqa: BLE001
-                pass
+                    media_notes.extend(enrich_chat_images(
+                        list(attachments.get("images") or ()),
+                        daemon=self,
+                        actor=targets[0] if targets else "",
+                        cfg=vision_cfg,
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
+            if attachments.get("records") and voice_enabled:
+                try:
+                    from .builtin_plugins.voice_io import enrich_chat_records
+
+                    media_notes.extend(enrich_chat_records(
+                        list(attachments.get("records") or ()),
+                        daemon=self,
+                        cfg=voice_cfg,
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
+            if media_notes:
+                model_user_text = f"{text}\n" + "\n".join(media_notes)
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
