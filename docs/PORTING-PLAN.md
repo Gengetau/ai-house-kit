@@ -580,3 +580,12 @@ A1 里必须自己补上的东西（否则换了大脑就少了保护）：
 | agent 三组（`test_agent_1/2/3`） | 3.11 与 3.13 各连跑 3 次 | 85 项，全过（3.11 上真外壳 11 项跳过） |
 | world-catalog | Python 3.13 | 22 项通过 |
 | world-contract-tests | Python 3.13 | 11 项通过 |
+
+**之后的修复和复测**（提交 `32176e4`）。合并后又用 `gpt-6.1-terra`、`gemini-4-hydrogen` 和两者混住各跑了一遍同样的剧本（住客走直连，agent 大脑没有参与），核对出的问题分三批修掉，清单和根因在 `LONGRUN-2026-11-23.md` 第 5 节。修完后：
+
+| 范围 | 环境 | 结果 |
+|---|---|---|
+| world-kernel 全量 | Python 3.13，装了 `claude-agent-sdk` | 1306 项通过，0 失败，0 跳过（517 秒） |
+| world-catalog / world-contract-tests | Python 3.13 | 22 / 11 项通过 |
+
+这三批修复之后没有再用真实模型重跑；Gemini 相关的两项（日记失败重试、被输出上限截断的回复）只用本地假接口复现和验证过。
