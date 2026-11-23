@@ -41,7 +41,7 @@ from .chat_identity import Speaker, member_speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
-from .intents import CommitmentStore
+from .intents import CommitmentStore, diet_memo_blocked
 from .llm import ModelRouter, deadline_scope, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
@@ -640,9 +640,53 @@ class HouseDaemon:
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
             self._run_plugin_tasks(now)
             try:
+                self._notify_expired_promises(now)
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"promise expiry notice error: {type(exc).__name__}: {exc}")
+            try:
                 self.flush_outbox()
             except Exception as exc:  # noqa: BLE001
                 self.log(f"outbox flush error: {type(exc).__name__}: {exc}")
+
+    def _unbuyable_item(self, owner_text: str, rep: Mapping[str, Any]) -> str:
+        """The out-of-catalog thing this reply just got recorded as an errand for, or ""."""
+        tool_intents = [i for i in (rep.get("tool_intents") or ()) if isinstance(i, Mapping)]
+        for i in tool_intents:
+            if i.get("kind") == "errand" and not i.get("item") and str(i.get("raw_item") or "").strip():
+                return str(i["raw_item"]).strip()
+        if tool_intents or self.intents is None or self.intents._detect_errand_item(owner_text)[0]:
+            return ""
+        from worldkernel.intents_lite import extract_buy_request_noun
+
+        noun = extract_buy_request_noun(owner_text, str(rep.get("text") or ""))
+        return "" if not noun or self.intents._resolve_item_id(noun) else noun
+
+    def _notify_expired_promises(self, now: float) -> None:
+        """Tell the owner (private chat, once per promise) about promises that expired unfulfilled."""
+        if self.needs_onboarding or self.authority is None or self.intents is None:
+            return
+        ingredients = getattr(self.vocab, "INGREDIENTS", None) or {}
+        for r in self.intents.list_intents(state="expired", limit=50):
+            if r["kind"] == "memo" or str(r["summary"]).startswith("和房主聊到") or float(r.get("updated_at") or 0) < now - 2 * 86400.0:
+                continue
+            if r["kind"] == "errand" and (r.get("item") or r.get("raw_item")):
+                label = str((ingredients.get(r.get("item")) or {}).get("label") or r.get("raw_item") or r.get("item"))
+                text = f"之前答应你买的{label.split('（', 1)[0]}，一直没买成，已经过期了。还要的话再跟我说一声。"
+            else:
+                text = f"之前答应你的「{str(r['summary'])[:30]}」没能办成，已经过期了。还要的话再跟我说一声。"
+            self.enqueue_outbound(
+                channel="webchat",
+                payload={
+                    "actor": r["actor"],
+                    "kind": "private",
+                    "scope": "private",
+                    "text": text,
+                    "source": "promise_expired",
+                    "target_channel": f"private:{r['actor']}",
+                    "to_identity": "user:owner",
+                },
+                delivery_id=f"promise-expired-{r['intent_id']}",
+            )
 
     def _run_plugin_tasks(self, now: float) -> None:
         stored_plugins = self.settings_store.get_plugins_map()
@@ -1455,6 +1499,8 @@ class HouseDaemon:
                     if not speaker.is_owner:
                         return {"recorded": False, "error": "owner_only"}
                     summary = str(targs.get("summary") or text)[:80]
+                    if diet_memo_blocked(text):
+                        return {"recorded": False, "error": "question_not_memo", "note": "房主是在提问，不是在交代饮食禁忌，不要记备忘"}
                     kind = str(targs.get("kind") or "chat_promise")
                     if kind == "cook" and any(w in f"{summary} {text}" for w in ("过敏", "忌口")) and not any(
                         w in summary for w in ("做", "下厨", "煮", "餐", "饭")
@@ -1469,22 +1515,23 @@ class HouseDaemon:
                     if targs.get("qty") is not None:
                         intent_obj["qty"] = qty_val
                     raw_item_arg = str(targs.get("item") or "").strip()
-                    combined_buy = f"{summary}\n{text}"
                     is_buy_req = bool(raw_item_arg) or kind in ("errand", "buy", "shopping")
                     if is_buy_req:
                         intent_obj["qty"] = qty_val
                         intent_obj["kind"] = "errand"
                         resolved_sku = self.intents._resolve_item_id(raw_item_arg) if raw_item_arg else None
                         if not resolved_sku and not raw_item_arg:
-                            resolved_sku, det_qty = self.intents._detect_errand_item(combined_buy)
+                            resolved_sku, det_qty = self.intents._detect_errand_item(text)
                             if resolved_sku and targs.get("qty") is None:
                                 intent_obj["qty"] = det_qty
                         if resolved_sku:
                             intent_obj["item"] = resolved_sku
                             return {"recorded": True, "in_catalog": True, "intent": intent_obj}
-                        from worldkernel.intents_lite import extract_raw_buy_noun
+                        from worldkernel.intents_lite import extract_buy_request_noun, extract_raw_buy_noun
 
-                        raw_noun = raw_item_arg or extract_raw_buy_noun(combined_buy) or summary[:24]
+                        raw_noun = raw_item_arg or extract_buy_request_noun(text) or extract_raw_buy_noun(text)
+                        if not raw_noun:
+                            return {"recorded": False, "error": "no_concrete_item", "note": "房主这句话里没有明确要买的东西，不要记采购约定"}
                         intent_obj["raw_item"] = raw_noun[:24]
                         return {
                             "recorded": True,
@@ -1559,6 +1606,10 @@ class HouseDaemon:
                     rep = {**rep, "text": "（这条回复含有不该说出去的内容，已被拦下）", "mode": "blocked", "media": []}
                 elif turn_media:
                     rep = {**rep, "media": list(turn_media)}
+                if rep["mode"] != "blocked" and speaker.is_owner:
+                    cant_buy = self._unbuyable_item(text, rep)
+                    if cant_buy:
+                        rep = {**rep, "text": f"{rep['text']} 不过「{cant_buy}」我这边买不了，没法替你带回来，只先记个提醒。"}
             raw_replies.append((aid, rep))
 
         replies: List[Dict[str, Any]] = []

@@ -73,6 +73,10 @@ _DEFAULT_ITEM_ALIASES = {
 }
 
 _ALLERGY_MEMO_WORDS = ("过敏", "忌口", "不吃", "不能吃", "少糖", "少盐", "少辣", "别放")
+# A clause that asks rather than tells ("你记得我对什么过敏吗？") is never a dietary instruction.
+_QUESTION_CLAUSE_RE = re.compile(
+    r"[？?]\s*$|吗|呢|(?:什么|啥)(?!都|也|的)|谁知道|是不是|是否|有没有|记不记得|哪(?:些|个|种)|怎么|多少|为什么|为啥"
+)
 _COOK_COMMIT_WORDS = ("做饭", "下厨", "我来做", "我煮", "给你做", "帮做", "做顿", "做一顿", "做晚饭", "煮晚饭", "做早饭", "做午饭")
 _OUTING_WORDS = ("出门", "晴空都", "逛", "图书馆", "咖啡店", "喫茶", "超市", "车站", "公园", "书店", "便利店")
 _TOGETHER_WORDS = ("一起", "约好", "约了", "大扫除", "桌游", "看电影", "开黑", "联机")
@@ -176,6 +180,15 @@ def _clauses(text: str) -> List[str]:
     parts = re.split(r"(?<=[，,。.！!？?；;\n…~～])", str(text or ""))
     return [p.strip() for p in parts if p and p.strip()]
 
+
+
+def diet_memo_blocked(text: str) -> bool:
+    """True when every clause naming a dietary restriction is a question, so no "remember this" memo is due.
+
+    「我对花生过敏，你记得吗？」 still has a telling clause and is not blocked.
+    """
+    diet = [c for c in _clauses(text) if any(w in c for w in _ALLERGY_MEMO_WORDS)]
+    return bool(diet) and all(_QUESTION_CLAUSE_RE.search(c) for c in diet)
 
 def _clause_blocked(clause: str) -> bool:
     """Past tense, questions and negations never form a purchase errand."""
@@ -755,7 +768,11 @@ class CommitmentStore:
         if has_item or has_raw:
             return "errand"
         combined = f"{owner_text}\n{summary}"
-        if any(w in combined for w in _ALLERGY_MEMO_WORDS) and not any(w in combined for w in _COOK_COMMIT_WORDS):
+        if (
+            any(w in combined for w in _ALLERGY_MEMO_WORDS)
+            and not any(w in combined for w in _COOK_COMMIT_WORDS)
+            and not diet_memo_blocked(owner_text)
+        ):
             return "memo"
         rk = str(raw_kind or "").strip().lower()
         if rk in _VALID_KINDS and rk != "chat_promise":
@@ -869,7 +886,11 @@ class CommitmentStore:
                         "raw_item": raw_buy,
                         "答应了的": list(base_agreed),
                     })
-            if any(w in clean_owner for w in _ALLERGY_MEMO_WORDS) and not any(w in clean_owner for w in _COOK_COMMIT_WORDS):
+            if (
+                any(w in clean_owner for w in _ALLERGY_MEMO_WORDS)
+                and not any(w in clean_owner for w in _COOK_COMMIT_WORDS)
+                and not diet_memo_blocked(clean_owner)
+            ):
                 extracted.append({
                     "text": f"记住房主饮食禁忌：{clean_owner[:80]}",
                     "kind": "memo",
