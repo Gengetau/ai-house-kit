@@ -12,6 +12,7 @@
     - `--virtual-clock` 重启后从小屋上次到达的时间继续，不再回到固定起点。
     - `restore` 的提示改为真正的命令行参数 `--overwrite`。
   - **行为变化**：
+    - **小屋的时间只由内核推进**。按真实时钟运行时，`POST /api/step` 对任何令牌都返回 409，网页不再显示“+1 步”和快进按钮；只有 `--virtual-clock` 演示小屋可以手动推进，且只认房主令牌（以前写档令牌也可以）。依赖快进做演示的，请改用 `ai-house up --virtual-clock`。
     - 模型连不上时，网页“测试连接”和 `doctor --live-ping` 先给中文原因和该检查什么，再附原文；聊天里回退到演示回复时只显示一句短的中文原因，不再贴接口返回的英文原文。
     - `doctor --onebot-ping`：经 `host.docker.internal` 超时时提示防火墙和宿主网络；401/403 提示可能连到了协议端的 HTTP 接口端口。
   - **新增**：`deploy/onebot/compose.host-network.yaml`（Linux 上让小屋走宿主网络去连同机的协议端，固定监听 `127.0.0.1:8780`）；一条用 Node 解析全部页面脚本的测试（没有 Node 时跳过）。

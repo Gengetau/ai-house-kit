@@ -81,7 +81,7 @@ async function diaryReader(view, R){
     if (!rows.length){
       put(stage, el('div', {class: 'dread'},
         el('div', {class: 'toc'}, el('div', {class: 'mon'}, el('b', {}, R.name + '的目录')),
-          el('p', {class: 'small muted', style: 'padding:8px'}, '还没有日记记录，把管家时钟快进到 22:30 后再推进 1 步即可生成。')),
+          el('p', {class: 'small muted', style: 'padding:8px'}, '还没有日记记录。住客每晚 22:30 之后会写当天的日记。')),
         el('div', {class: 'book single', style: toneStyle(R)},
           el('div', {class: 'pages'},
             el('div', {class: 'page blank'}, el('div', {class: 'flow'},

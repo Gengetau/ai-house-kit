@@ -18,7 +18,7 @@ export async function render(view, route, ctx){
     return {};
   }
   const box = el('div');
-  view.append(pageHead('小屋管家与运行态', '推进世界时间、管理住客与大模型接入、查看插件运行态或复制 MCP 配置。'), box);
+  view.append(pageHead('小屋管家与运行态', '查看小屋时间、管理住客与大模型接入、查看插件运行态或复制 MCP 配置。'), box);
   let state = null, setupDoc = null, alive = true;
 
   async function load(){
@@ -292,14 +292,18 @@ export async function render(view, route, ctx){
       el('div', {class: 'g2'},
         el('section', {class: 'card'},
           el('div', {class: 'chead'},
-            el('h2', {}, icon('clock'), '世界步进控制'),
+            el('h2', {}, icon('clock'), '小屋时间'),
             el('span', {class: 'chip info'}, `${state.now_jst || '—'} 周${state.weekday || ''}`)),
-          el('p', {class: 'small muted'}, '手动推进一轮生活决策、消化房主投喂/化身队列或快进昼夜时段（用于演示、跑测日夜作息与晚间日记生成）。'),
-          el('div', {class: 'row wrap', style: 'gap:8px;margin-top:12px'},
-            el('button', {type: 'button', class: 'btn primary', disabled: !hasTier('write'), onclick: () => step(0)}, icon('play'), '推进 1 步'),
-            el('button', {type: 'button', class: 'btn', disabled: !hasTier('write'), onclick: () => step(15)}, '+15 分钟'),
-            el('button', {type: 'button', class: 'btn', disabled: !hasTier('write'), onclick: () => step(60)}, '+60 分钟')),
-          !hasTier('write') ? el('p', {class: 'tiny muted mt'}, '当前令牌没有写入权限（仅 Owner/Write 令牌可推进时间）。') : null),
+          ...(state.manual_time_control ? [
+            el('p', {class: 'small muted'}, '这是一栋用 --virtual-clock 启动的演示小屋：时间只在这里手动推进时才前进（用于演示、跑测日夜作息与晚间日记生成）。'),
+            el('div', {class: 'row wrap', style: 'gap:8px;margin-top:12px'},
+              el('button', {type: 'button', class: 'btn primary', disabled: !hasTier('owner'), onclick: () => step(0)}, icon('play'), '推进 1 步'),
+              el('button', {type: 'button', class: 'btn', disabled: !hasTier('owner'), onclick: () => step(15)}, '+15 分钟'),
+              el('button', {type: 'button', class: 'btn', disabled: !hasTier('owner'), onclick: () => step(60)}, '+60 分钟')),
+            !hasTier('owner') ? el('p', {class: 'tiny muted mt'}, '只有房主令牌可以推进演示小屋的时间。') : null,
+          ] : [
+            el('p', {class: 'small muted'}, '小屋的时间由内核按真实时钟推进，这里不能补步或快进。想快速看完一天的作息，请另起一栋演示小屋：ai-house up --virtual-clock'),
+          ])),
 
         el('section', {class: 'card'},
           el('div', {class: 'chead'},

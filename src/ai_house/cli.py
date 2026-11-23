@@ -528,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
     p_up.add_argument("--packs-root", default="./packs", help="自定义 WorldPack 扫描根目录（默认 ./packs）")
     p_up.add_argument("--env-file", default=".env", help="启动前加载的 .env 配置文件路径（默认 .env）")
     p_up.add_argument("--step-seconds", type=float, default=60.0, help="后台时钟推进步长（秒，默认 60.0）")
-    p_up.add_argument("--virtual-clock", action="store_true", help="使用可倍速的虚拟时钟：时间只在快进时前进；重启后从小屋上次到达的时间继续（首次启动为 2026-11-21 09:00）")
+    p_up.add_argument("--virtual-clock", action="store_true", help="演示用的虚拟时钟：时间只在房主手动推进时前进（网页“小屋管家”页或 POST /api/step）；重启后从小屋上次到达的时间继续（首次启动为 2026-11-21 09:00）。不加这个参数时，时间由内核按真实时钟推进，外部不能干预")
     p_up.set_defaults(func=cmd_up)
 
     p_in = sub.add_parser("init", help="生成带强随机令牌的 .env 配置与 runtime 目录")

@@ -107,6 +107,12 @@ CREATE INDEX IF NOT EXISTS idx_send_gate_log_ts ON send_gate_log(sent_at, day_js
 """
 
 
+KERNEL_OWNS_TIME_MSG = (
+    "小屋的时间由内核按真实时钟推进，外部不能补步或快进。"
+    "想快速看完一天的作息，请另起一栋演示小屋：ai-house up --virtual-clock"
+)
+
+
 class OffsetWallClock:
     """Wall clock with a persisted fast-forward offset so simulated advances survive restarts."""
 
@@ -573,6 +579,15 @@ class HouseDaemon:
                 self.log(f"plugin {plugin_id} config warning: {msg}")
         return cfg
 
+    @property
+    def manual_time_control(self) -> bool:
+        """Whether anything outside the kernel may step or fast-forward house time.
+
+        On the real clock the kernel alone moves time; only a house started as a `--virtual-clock`
+        sandbox (where time has no other source) accepts manual steps.
+        """
+        return bool(self._virtual_clock)
+
     def start_background_loop(self) -> threading.Thread:
         def _loop() -> None:
             while not self._stop.wait(self.step_interval_s):
@@ -792,6 +807,7 @@ class HouseDaemon:
                     "roster": [],
                     "weather": {"temp_c": 16.0, "rain": False},
                     "llm_mode": "live_api" if self.chat_agent.live_llm_enabled else "zero_key_demo",
+                    "manual_time_control": self.manual_time_control,
                     "model_name": self.chat_agent.model if self.chat_agent.live_llm_enabled else "内置人设演示引擎",
                     "house_wallet_yen": 0,
                     "owner_presence": None,
@@ -881,6 +897,7 @@ class HouseDaemon:
                 "roster": list(self.vocab.ROSTER),
                 "weather": weather_val,
                 "llm_mode": "live_api" if self.chat_agent.live_llm_enabled else "zero_key_demo",
+                "manual_time_control": self.manual_time_control,
                 "model_name": self.chat_agent.model if self.chat_agent.live_llm_enabled else "内置人设演示引擎",
                 "house_wallet_yen": wallets.get("house", 0),
                 "owner_presence": dict(owner_row) if owner_row else None,
@@ -3043,9 +3060,10 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 "/api/residents/update",
                 "/api/setup/reset",
                 "/api/backup",
+                "/api/step",
             ):
                 tier = "owner"
-            elif parsed.path in ("/api/step", "/api/avatar", "/api/house/avatar", "/api/stock", "/api/city/depart", "/api/city/return"):
+            elif parsed.path in ("/api/avatar", "/api/house/avatar", "/api/stock", "/api/city/depart", "/api/city/return"):
                 tier = "write"
             elif parsed.path in ("/api/memories/forget", "/api/intents/cancel") and isinstance(body, dict):
                 if parsed.path == "/api/intents/cancel":
@@ -3118,6 +3136,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json({"ok": True, "intent": cancelled, "intents": daemon.intents.list_intents()})
                     return
                 if parsed.path == "/api/step":
+                    if not daemon.manual_time_control:
+                        self._send_json({"ok": False, "error": KERNEL_OWNS_TIME_MSG, "code": "kernel_owns_time"}, 409)
+                        return
                     mins = int(body.get("minutes") or 0)
                     res = daemon.fast_forward(mins) if mins > 0 else daemon.step_once()
                     self._send_json({"ok": True, "state": res})
