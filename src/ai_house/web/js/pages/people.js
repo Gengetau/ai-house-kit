@@ -1,6 +1,6 @@
 // 住客详情 (#/people/<actor>/<tab>): 此刻 / 衣柜 / 档案 / 对话（支持多世界包与私密/只读档位）。
 import {el, put, api, icon, ava, glyph, go, pickActor, setCurrentActor, pageTabs, tabs, whoStrip,
-  emptyState, errState, ownerOnly, loading, fmtTime, num, hasTier, isPrivateOnly, isOnboarding, toast, store, LoginNeeded} from '../core.js';
+  emptyState, errState, ownerOnly, loading, fmtTime, num, hasTier, isPrivateOnly, isOnboarding, toast, store, LoginNeeded, chatMediaNodes} from '../core.js';
 import {RESIDENTS, byActor, nameOf, toneStyle} from '../residents.js';
 import {ACTIVITIES, MOODS, feelOf, moodWord, moodTone, lifeState, roomLabel} from '../vocab.js';
 
@@ -355,7 +355,8 @@ async function renderChat(view, R){
           el('b', {}, m.sender_name || nameOf(m.sender)),
           m.badge ? el('span', {class: 'tag'}, m.badge) : null,
           el('span', {class: 'tiny muted'}, fmtTime(m.created_at))),
-        el('div', {class: 'txt'}, m.text)))
+        el('div', {class: 'txt'}, m.text),
+        chatMediaNodes(m.media)))
       : emptyState({title: mode === 'private' ? `还没有和 ${R.name} 私聊过` : '群聊里还安静着', iconName: 'msg'}));
     listEl.scrollTop = listEl.scrollHeight;
   }

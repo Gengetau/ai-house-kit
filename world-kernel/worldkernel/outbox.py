@@ -117,6 +117,7 @@ class Dispatcher:
                 if not cur.rowcount:
                     continue
             reason_ref = None
+            err_status = "blocked"
             try:
                 ref = ch.send(r["delivery_id"], json.loads(r["payload"]))
                 state = "sent"
@@ -126,13 +127,19 @@ class Dispatcher:
                 ref, state = None, "pending"
             except TimeoutError:
                 ref, state = None, "unknown"
+            except Exception as exc:
+                err_tag = f"error:{type(exc).__name__}"[:64]
+                if getattr(ch, "idempotent", False) and int(r["attempts"]) < 3:
+                    ref, state, reason_ref = None, "pending", None
+                else:
+                    ref, state, reason_ref, err_status = None, "unknown", err_tag, "error"
             with self.s.tx() as db:
                 db.execute("UPDATE outbox SET state=?, external_ref=COALESCE(?,external_ref), updated_at=?"
                            " WHERE delivery_id=?", (state, ref, self.s.clock.now(), r["delivery_id"]))
                 if ref:
                     self._receipt(db, r["delivery_id"], "delivered", ref, self.s.epoch or 0)
                 elif reason_ref:
-                    self._receipt(db, r["delivery_id"], "blocked", reason_ref, self.s.epoch or 0)
+                    self._receipt(db, r["delivery_id"], err_status, reason_ref, self.s.epoch or 0)
             out[r["delivery_id"]] = state
         return out
 

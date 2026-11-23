@@ -42,6 +42,7 @@ from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .intents import CommitmentStore
 from .llm import ModelRouter
+from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
 from .proactive import ProactiveEngine
 from .send_gate import SendGate
@@ -81,6 +82,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     text TEXT NOT NULL,
     badge TEXT NOT NULL DEFAULT '',
     mode TEXT NOT NULL DEFAULT 'demo',
+    media_json TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS owner_avatar_queue (cmd_id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL, receipt TEXT, created_at REAL NOT NULL);
@@ -176,6 +178,7 @@ class HouseDaemon:
         self.env_file = Path(env_file) if env_file else None
         self._lock = threading.RLock()
         self._async_job_lock = threading.Lock()
+        self._outbox_send_lock = threading.Lock()
         self._stop = threading.Event()
         self._sse_clients: List[queue.Queue[str]] = []
 
@@ -315,6 +318,9 @@ class HouseDaemon:
             with contextlib.closing(sqlite3.connect(self.world_db)) as c:
                 with c:
                     c.executescript(HOST_EXTRA_SCHEMA)
+                    cm_cols = {r[1] for r in c.execute("PRAGMA table_info(chat_messages)").fetchall()}
+                    if "media_json" not in cm_cols:
+                        c.execute("ALTER TABLE chat_messages ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'")
                     for aid in self.vocab.ROSTER:
                         c.execute(
                             "INSERT OR IGNORE INTO reality VALUES(?, 'room', '卧室', 'sleeping', '睡觉', '平静', 60, 30, 70,"
@@ -737,11 +743,21 @@ class HouseDaemon:
         with contextlib.closing(sqlite3.connect(self.world_db)) as c:
             c.row_factory = sqlite3.Row
             rows = c.execute(
-                "SELECT id, channel, sender, sender_name, actor_target, text, badge, mode, created_at "
+                "SELECT id, channel, sender, sender_name, actor_target, text, badge, mode, media_json, created_at "
                 "FROM chat_messages WHERE channel=? ORDER BY id DESC LIMIT ?",
                 (channel, int(limit)),
             ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        out: List[Dict[str, Any]] = []
+        for r in reversed(rows):
+            d = dict(r)
+            raw_m = d.pop("media_json", "[]") or "[]"
+            try:
+                parsed_m = json.loads(raw_m)
+                d["media"] = parsed_m if isinstance(parsed_m, list) else []
+            except ValueError:
+                d["media"] = []
+            out.append(d)
+        return out
 
     def list_diaries_view(self, actor: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
         if self.needs_onboarding or self.diary is None:
@@ -975,9 +991,10 @@ class HouseDaemon:
                     with self._store.tx(control=control) as db:
                         yield db
 
-        disp = Dispatcher(_LockedStoreProxy(self._lock, self.authority.store), self.send_gate.channel_map())
-        dispatched = disp.run_once()
-        reconciled = disp.reconcile() if reconcile else {}
+        with self._outbox_send_lock:
+            disp = Dispatcher(_LockedStoreProxy(self._lock, self.authority.store), self.send_gate.channel_map())
+            dispatched = disp.run_once()
+            reconciled = disp.reconcile() if reconcile else {}
         return {
             "ok": True,
             "dispatched": dispatched,
@@ -1234,12 +1251,14 @@ class HouseDaemon:
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
+            turn_media: List[Dict[str, Any]] = []
 
             def _run_tool(
                 tname: str,
                 targs: Dict[str, Any],
                 *,
                 _aid: str = aid,
+                _turn_media: List[Dict[str, Any]] = turn_media,
             ) -> Dict[str, Any]:
                 if tname == "inspect_house":
                     return {
@@ -1326,6 +1345,7 @@ class HouseDaemon:
                                 now=now,
                                 plugin_config=plug_cfg,
                                 daemon=self,
+                                pending_media=_turn_media,
                             )
                             return invoke_tool_handler(reg, targs, tctx)
                         except Exception as exc:  # noqa: BLE001
@@ -1358,18 +1378,41 @@ class HouseDaemon:
                         why = "memory_leak:private_to_public"
                 if why:
                     self.log(f"reply held back ({why}) channel={'private' if is_private else 'group'} actor={aid}")
-                    rep = {**rep, "text": "（这条回复含有不该说出去的内容，已被拦下）", "mode": "blocked"}
+                    turn_media.clear()
+                    rep = {**rep, "text": "（这条回复含有不该说出去的内容，已被拦下）", "mode": "blocked", "media": []}
+                elif turn_media:
+                    rep = {**rep, "media": list(turn_media)}
             raw_replies.append((aid, rep))
 
         replies: List[Dict[str, Any]] = []
         with self._lock:
             for aid, rep in raw_replies:
+                stored_media = [
+                    {
+                        k: m[k]
+                        for k in ("kind", "media_rel", "mime", "title", "meme_id")
+                        if m.get(k)
+                    }
+                    | ({"data_uri": m["data_uri"]} if m.get("kind") == "sticker" and m.get("data_uri") else {})
+                    for m in (rep.get("media") or ())
+                    if isinstance(m, Mapping)
+                ]
                 with contextlib.closing(sqlite3.connect(self.world_db)) as c:
                     with c:
                         c.execute(
-                            "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, created_at) "
-                            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                            (channel, aid, rep["name"], sender_key if speaker.is_owner else speaker.name, rep["text"], rep["context_badge"], rep["mode"], now),
+                            "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, media_json, created_at) "
+                            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                channel,
+                                aid,
+                                rep["name"],
+                                sender_key if speaker.is_owner else speaker.name,
+                                rep["text"],
+                                rep["context_badge"],
+                                rep["mode"],
+                                json.dumps(stored_media, ensure_ascii=False),
+                                now,
+                            ),
                         )
                 if speaker.is_owner and rep["mode"] != "blocked":
                     self.intents.enqueue_chat(
@@ -2563,6 +2606,47 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json(daemon.list_album_view(scope=sc, actor=act, limit=lim))
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            if parsed.path == "/api/album/media":
+                qs = parse_qs(parsed.query)
+                rel = (qs.get("path") or [""])[0].strip().replace("\\", "/")
+                parts = [p for p in rel.split("/") if p]
+                if parts and parts[0] == "media":
+                    parts = parts[1:]
+                if len(parts) < 3 or ".." in parts:
+                    self._deny(403, "forbidden")
+                    return
+                top_dir, m_scope = parts[0].lower(), parts[1].lower()
+                if top_dir not in ("album", "generated", "tts") or m_scope not in ("world", "group", "private"):
+                    self._deny(403, "forbidden")
+                    return
+                need_tier = "private" if (m_scope == "private" or (top_dir == "album" and m_scope == "group")) else "read"
+                if not self._need(parsed, need_tier):
+                    return
+                if daemon.needs_onboarding:
+                    self._send_json({"error": "not_ready"}, status=404)
+                    return
+                try:
+                    cand = resolve_scoped_media_path(
+                        daemon.runtime_dir,
+                        rel,
+                        scope=("private" if m_scope == "private" else m_scope),
+                        album=daemon.album,
+                    )
+                except (PermissionError, ValueError):
+                    self._deny(403, "forbidden")
+                    return
+                if not cand.is_file():
+                    self._send_json({"error": "not_found"}, status=404)
+                    return
+                raw_bytes = cand.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", mime_for_path(cand))
+                self.send_header("Content-Length", str(len(raw_bytes)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                self.wfile.write(raw_bytes)
                 return
             if parsed.path == "/api/intents":
                 if not self._need(parsed, "private"):

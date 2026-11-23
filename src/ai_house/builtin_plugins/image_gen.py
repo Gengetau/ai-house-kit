@@ -307,6 +307,14 @@ def _tool_generate_image(
     actor = ctx.actor if ctx is not None else ""
     res = generate_image_asset(prompt, size=size, scope=scope, actor=actor, cfg=cfg, daemon=daemon)
     if res.get("ok"):
+        if ctx is not None and isinstance(ctx.pending_media, list):
+            ctx.pending_media.append({
+                "kind": "image",
+                "media_rel": str(res.get("media_rel") or ""),
+                "mime": str(res.get("mime") or "image/png"),
+                "title": str(prompt or "生成插图")[:40],
+                "image_base64": str(res.get("image_base64") or ""),
+            })
         return {
             "ok": True,
             "media_rel": res.get("media_rel"),

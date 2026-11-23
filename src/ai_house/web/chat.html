@@ -83,6 +83,40 @@
       body.className = "body";
       body.textContent = m.text;
       row.append(who, body);
+      if (Array.isArray(m.media) && m.media.length) {
+        const mediaWrap = document.createElement("div");
+        mediaWrap.className = "msg-media";
+        for (const item of m.media) {
+          if (!item || typeof item !== "object") continue;
+          if (item.kind === "audio" && item.media_rel) {
+            const aud = document.createElement("audio");
+            aud.controls = true;
+            aud.preload = "none";
+            aud.setAttribute("loading", "lazy");
+            const hdrs = tok() ? { Authorization: "Bearer " + tok() } : {};
+            fetch("/api/album/media?path=" + encodeURIComponent(item.media_rel), { headers: hdrs })
+              .then((r) => (r.ok ? r.blob() : null))
+              .then((b) => { if (b) aud.src = URL.createObjectURL(b); })
+              .catch(() => {});
+            mediaWrap.append(aud);
+          } else if (item.data_uri || item.media_rel) {
+            const img = document.createElement("img");
+            img.alt = item.title || "媒体";
+            img.loading = "lazy";
+            if (item.data_uri) {
+              img.src = item.data_uri;
+            } else {
+              const hdrs = tok() ? { Authorization: "Bearer " + tok() } : {};
+              fetch("/api/album/media?path=" + encodeURIComponent(item.media_rel), { headers: hdrs })
+                .then((r) => (r.ok ? r.blob() : null))
+                .then((b) => { if (b) img.src = URL.createObjectURL(b); })
+                .catch(() => {});
+            }
+            mediaWrap.append(img);
+          }
+        }
+        if (mediaWrap.childElementCount) row.append(mediaWrap);
+      }
       log.append(row);
     }
     if (stick) log.scrollTop = log.scrollHeight;

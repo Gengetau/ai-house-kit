@@ -92,6 +92,14 @@ PLUGIN_DEF = PluginDefinition(
                 env_var="AI_HOUSE_PROACTIVE_SCOPE",
                 description="主动发言投递到群聊（group）或房主私聊（private）。",
             ),
+            ConfigField(
+                key="target_group_id",
+                label="目标 QQ 群号",
+                field_type="string",
+                default="",
+                env_var="AI_HOUSE_PROACTIVE_GROUP_ID",
+                description="当投递通道为 onebot_v11 且范围为群聊时的目标 QQ 群号（仅配置单个白名单群时可自动推断）。",
+            ),
         ),
     ),
     routes=(

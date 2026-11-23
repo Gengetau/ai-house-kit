@@ -360,6 +360,41 @@ class ProactiveEngine:
         if target_scope not in ("group", "private"):
             target_scope = "group"
 
+        target_group_id = str(
+            eff_cfg.get("target_group_id")
+            or (getattr(daemon, "env", None) or {}).get("AI_HOUSE_PROACTIVE_GROUP_ID")
+            or ""
+        ).strip()
+        if target_scope == "group" and target_channel in ("onebot_v11", "onebot"):
+            whitelisted_groups: List[str] = []
+            for ch_obj in getattr(daemon, "channels", ()):
+                if str(getattr(ch_obj, "channel_id", "") or "") == "onebot_v11":
+                    cfg_obj = getattr(ch_obj, "cfg", None)
+                    if cfg_obj is not None and getattr(cfg_obj, "groups", None):
+                        whitelisted_groups = sorted(str(g) for g in cfg_obj.groups if str(g).strip())
+                    break
+            if not whitelisted_groups:
+                raw_env_g = str((getattr(daemon, "env", None) or {}).get("ONEBOT_GROUPS") or "").strip()
+                if raw_env_g:
+                    whitelisted_groups = [x.strip() for x in re.split(r"[,;\s]+", raw_env_g) if x.strip()]
+            if not target_group_id:
+                if len(whitelisted_groups) == 1:
+                    target_group_id = whitelisted_groups[0]
+                else:
+                    return {"ok": True, "triggered": False, "reason": "missing_target_group"}
+            if whitelisted_groups and target_group_id not in whitelisted_groups:
+                return {"ok": True, "triggered": False, "reason": "group_not_whitelisted"}
+            eff_group_channel = f"qq-group:{target_group_id}"
+        else:
+            eff_group_channel = "group"
+
+        if target_scope == "group" and getattr(daemon, "group_behavior", None) is not None:
+            gb = daemon.group_behavior
+            if gb.is_muted(eff_group_channel, now=ts) or (
+                eff_group_channel != "group" and gb.is_muted("group", now=ts)
+            ):
+                return {"ok": True, "triggered": False, "reason": "group_muted"}
+
         with self._lock:
             st = self._load_locked(ts)
             if not st["initialized"]:
@@ -423,7 +458,11 @@ class ProactiveEngine:
         if not text:
             return {"ok": True, "triggered": False, "reason": gen_mode}
 
-        check_ch = f"private:{chosen.actor}" if target_scope == "private" else target_channel
+        check_ch = (
+            f"private:{chosen.actor}"
+            if target_scope == "private"
+            else (eff_group_channel if target_channel in ("onebot_v11", "onebot") else target_channel)
+        )
         if getattr(daemon, "guard", None) is not None:
             why = daemon.guard.check(check_ch, text)
             if why:
@@ -439,11 +478,6 @@ class ProactiveEngine:
             cur_actor_cnt = int(st["actor_counts"].get(chosen.actor, 0))
             if actor_cap <= 0 or cur_actor_cnt >= actor_cap:
                 return {"ok": True, "triggered": False, "reason": "actor_daily_cap"}
-            st["house_count"] = int(st["house_count"]) + 1
-            st["actor_counts"][chosen.actor] = cur_actor_cnt + 1
-            st["last_sent_at"] = ts
-            st["actor_last_sent"][chosen.actor] = ts
-            self._save_locked(st)
 
         payload: Dict[str, Any] = {
             "actor": chosen.actor,
@@ -453,9 +487,13 @@ class ProactiveEngine:
             "source": "proactive",
             "mode": gen_mode,
             "event_id": chosen.event_id,
+            "created_ts": ts,
         }
         if target_channel == "webchat":
             payload["target_channel"] = f"private:{chosen.actor}" if target_scope == "private" else "group"
+        elif target_channel in ("onebot_v11", "onebot") and target_scope == "group" and target_group_id:
+            payload["group_id"] = target_group_id
+            payload["target"] = target_group_id
         if target_scope == "private":
             payload["to_identity"] = "owner"
 
@@ -465,6 +503,25 @@ class ProactiveEngine:
             event_id=chosen.event_id,
         )
         flush_res = daemon.flush_outbox(reconcile=False)
+        disp_state = str((flush_res.get("dispatched") or {}).get(delivery_id) or "")
+        if disp_state == "blocked":
+            return {
+                "ok": True,
+                "triggered": False,
+                "reason": "outbox_blocked",
+                "delivery_id": delivery_id,
+                "flush": flush_res,
+            }
+
+        with self._lock:
+            st = self._load_locked(ts)
+            cur_actor_cnt = int(st["actor_counts"].get(chosen.actor, 0))
+            st["house_count"] = int(st["house_count"]) + 1
+            st["actor_counts"][chosen.actor] = cur_actor_cnt + 1
+            st["last_sent_at"] = ts
+            st["actor_last_sent"][chosen.actor] = ts
+            self._save_locked(st)
+
         return {
             "ok": True,
             "triggered": True,

@@ -311,19 +311,20 @@ class OneBotChannel(ChannelPlugin):
                 with self._dedup_lock:
                     self._inflight_spool_ids.discard(sid)
 
-    def _check_standalone_dedup(self, mid: str) -> bool:
+    def _check_standalone_dedup(self, mid: str, scope_key: str = "") -> bool:
         if not mid:
             return False
+        key = f"{scope_key}:{mid}" if scope_key else mid
         now = time.monotonic()
         with self._dedup_lock:
             cutoff = now - 3600.0
             for k in [k for k, t in self._mem_dedup.items() if t < cutoff]:
                 self._mem_dedup.pop(k, None)
-            if mid in self._mem_dedup:
+            if key in self._mem_dedup:
                 return True
             if len(self._mem_dedup) > 512:
                 self._mem_dedup.clear()
-            self._mem_dedup[mid] = now
+            self._mem_dedup[key] = now
             return False
 
     # ---- connection (reader thread) ------------------------------------------------------------------------------
@@ -406,6 +407,7 @@ class OneBotChannel(ChannelPlugin):
                         data,
                         message_id=mid,
                         session_key=f"{kind}:{tgt}",
+                        scope_key=f"{kind}:{tgt}",
                         kind=kind,
                         target=tgt,
                         uid=info["uid"],
@@ -418,9 +420,12 @@ class OneBotChannel(ChannelPlugin):
                     with self._dedup_lock:
                         self._inflight_spool_ids.add(spool_id)
                     ev_item["_spool_id"] = spool_id
-                elif mid and self._check_standalone_dedup(mid):
-                    self._bump("duplicates")
-                    continue
+                elif mid:
+                    s_kind = info["kind"]
+                    s_tgt = info["gid"] if s_kind == "group" else info["uid"]
+                    if self._check_standalone_dedup(mid, scope_key=f"{s_kind}:{s_tgt}"):
+                        self._bump("duplicates")
+                        continue
                 try:
                     target_q.put_nowait(ev_item)
                 except queue.Full:
@@ -622,10 +627,13 @@ class OneBotChannel(ChannelPlugin):
             if not spool_ids:
                 mid = str(ev.get("message_id") or "").strip()
                 if mid:
+                    s_kind = info["kind"]
+                    s_tgt = info["gid"] if s_kind == "group" else info["uid"]
+                    skey = f"{s_kind}:{s_tgt}"
                     is_dup = (
-                        self._spool.check_and_mark_dedup("onebot_v11", mid)
+                        self._spool.check_and_mark_dedup("onebot_v11", mid, scope_key=skey)
                         if self._spool is not None
-                        else self._check_standalone_dedup(mid)
+                        else self._check_standalone_dedup(mid, scope_key=skey)
                     )
                     if is_dup:
                         self._bump("duplicates")
@@ -688,7 +696,7 @@ class OneBotChannel(ChannelPlugin):
                     pass
             res = self._host.converse(channel, text, speaker, **converse_kw)
             sent = 0
-            send_groups: List[List[str]] = []
+            send_groups: List[Tuple[List[str], List[Dict[str, Any]]]] = []
             for rep in res.get("replies") or ():
                 if rep.get("mode") == "blocked":
                     self._bump("blocked")
@@ -699,16 +707,17 @@ class OneBotChannel(ChannelPlugin):
                 if rep.get("mode") == "sleeping" or not str(rep.get("text") or "").strip():
                     continue  # asleep: stay quiet on QQ
                 parts = self._split(str(rep["text"]))
+                media_list = [dict(m) for m in (rep.get("media") or ()) if isinstance(m, Mapping)]
                 if parts:
-                    send_groups.append(parts)
+                    send_groups.append((parts, media_list))
             if not send_groups:
                 if self._spool is not None and spool_ids:
                     self._spool.ack(spool_ids, state="skipped")
                 return "no_reply"
             at_uid = uid if kind == "group" else None
-            for idx, parts in enumerate(send_groups):
+            for idx, (parts, media_list) in enumerate(send_groups):
                 attach_ids = spool_ids if idx == len(send_groups) - 1 else ()
-                if self._send_bubbles(kind, target, parts, at=at_uid, spool_ids=attach_ids):
+                if self._send_bubbles(kind, target, parts, at=at_uid, spool_ids=attach_ids, media=media_list):
                     sent += 1
             if sent:
                 self._bump("replied")
@@ -733,13 +742,40 @@ class OneBotChannel(ChannelPlugin):
         start_idx: int = 0,
         spool_ids: Sequence[int] = (),
         save_plan: bool = True,
+        media: Sequence[Mapping[str, Any]] = (),
     ) -> bool:
-        """Deliver bubble chunks, retrying only pre-wire `not_connected` failures cleanly."""
+        """Deliver bubble chunks through `SendGate`, retrying only pre-wire failures and keeping `reply_ready`."""
         parts = [str(p).strip() for p in bubbles if str(p).strip()]
         if not parts:
             if self._spool is not None and spool_ids:
                 self._spool.ack(spool_ids, state="done")
             return False
+
+        gate = getattr(self._host, "send_gate", None) if self._host is not None else None
+        if start_idx == 0 and gate is not None:
+            try:
+                gate.authorize_direct_send(
+                    "onebot_v11",
+                    self,
+                    kind=kind,
+                    target=str(target),
+                    actor=self.actor,
+                    text="\n".join(parts),
+                    delivery_id=(f"ob-spool-{spool_ids[-1]}" if spool_ids else ""),
+                )
+            except BlockedDelivery as exc:
+                self._bump("blocked")
+                self._log(f"send blocked by SendGate ({exc.reason})")
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="blocked")
+                return False
+            except NotSent as exc:
+                self._bump("rate_limited")
+                self._log(f"send limited by SendGate ({exc.reason})")
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped")
+                return False
+
         if save_plan and self._spool is not None and spool_ids:
             self._spool.save_reply_plan(spool_ids, parts, target=target, kind=kind, at=at or "")
 
@@ -760,14 +796,14 @@ class OneBotChannel(ChannelPlugin):
                 ok, code, _, left_wire = self._call_detailed(action, params)
                 if ok:
                     break
-                # Retry ONLY when nothing touched the wire yet (`not_connected`); never retry post-wire/retcode errors.
-                if left_wire or code != "not_connected" or attempt + 1 >= max_attempts or self._stop.is_set():
+                # Retry ONLY when nothing touched the wire yet and not a server retcode rejection.
+                if left_wire or code.startswith("retcode_") or attempt + 1 >= max_attempts or self._stop.is_set():
                     break
                 self._stop.wait(self.cfg.retry_backoff_s * (attempt + 1))
 
             if not ok:
-                if code == "not_connected" and self._spool is not None and spool_ids:
-                    # Leave `reply_ready` pending in spool so `_enqueue_recovered` resumes once WS reconnects.
+                # PR-C4: Preserve `reply_ready` for reconnect resume whenever the frame never left the wire!
+                if (not left_wire) and (not code.startswith("retcode_")) and self._spool is not None and spool_ids:
                     return sent_any
                 self._bump("send_failed")
                 self._log(f"send failed ({code}); dropped, not retried")
@@ -778,6 +814,23 @@ class OneBotChannel(ChannelPlugin):
             sent_any = True
             if self._spool is not None and spool_ids:
                 self._spool.record_part_sent(spool_ids, i + 1)
+
+        action_m = "send_group_msg" if kind == "group" else "send_private_msg"
+        param_key_m = "group_id" if kind == "group" else "user_id"
+        for m in media or ():
+            mkind = str(m.get("kind") or "")
+            img_b64 = str(m.get("image_base64") or "").strip()
+            aud_b64 = str(m.get("audio_base64") or "").strip()
+            if mkind in ("image", "sticker") and img_b64:
+                self._call_detailed(
+                    action_m,
+                    {param_key_m: int(target), "message": [{"type": "image", "data": {"file": f"base64://{img_b64}"}}]},
+                )
+            elif mkind == "audio" and aud_b64:
+                self._call_detailed(
+                    action_m,
+                    {param_key_m: int(target), "message": [{"type": "record", "data": {"file": f"base64://{aud_b64}"}}]},
+                )
 
         if self._spool is not None and spool_ids:
             self._spool.ack(spool_ids, state="done")
@@ -805,8 +858,16 @@ class OneBotChannel(ChannelPlugin):
         except concurrent.futures.TimeoutError:
             return False, "timeout", "", True
         except ConnectionError:
+            if not left_wire:
+                with self._ws_lock:
+                    if self._ws is ws:
+                        self._ws = None
             return False, "disconnected", "", left_wire
         except Exception:
+            if not left_wire:
+                with self._ws_lock:
+                    if self._ws is ws:
+                        self._ws = None
             return False, "send_error", "", left_wire
         finally:
             with self._pending_lock:
