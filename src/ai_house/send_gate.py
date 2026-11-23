@@ -233,9 +233,21 @@ class SendGate:
 
         if is_webchat:
             if eff_kind == "group":
-                if raw_tch and raw_tch != "group" and not raw_tch.startswith("qq-group:"):
+                grp_cands = {
+                    c for c in (
+                        raw_tch,
+                        raw_target,
+                        f"qq-group:{raw_gid}" if raw_gid else "",
+                    )
+                    if c
+                }
+                if len(grp_cands) > 1:
+                    raise BlockedDelivery("inconsistent_target")
+                eff_target = next(iter(grp_cands), "group")
+                if eff_target.startswith("private:"):
+                    raise BlockedDelivery("inconsistent_scope")
+                if eff_target != "group" and not re.fullmatch(r"qq-group:\d+|[A-Za-z0-9_.:-]{1,64}", eff_target):
                     raise BlockedDelivery("unsupported_target_channel")
-                eff_target = raw_tch if raw_tch.startswith("qq-group:") else "group"
                 out["kind"] = "group"
                 out["scope"] = "group"
                 out["target"] = eff_target

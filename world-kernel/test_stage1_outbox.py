@@ -379,6 +379,59 @@ class Stage1OutboxAndSendGateTests(unittest.TestCase):
                 1,
             )
 
+    def test_webchat_explicit_group_target_preserves_destination_and_rejects_conflict(self) -> None:
+        import contextlib
+        import sqlite3
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rt = Path(tmp.name) / "rt"
+        day_ts = dt.datetime(2026, 11, 22, 15, 0, tzinfo=JST).timestamp()
+        d = HouseDaemon(
+            rt,
+            pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
+            env={"AI_HOUSE_QUIET_HOURS": "23:30-07:00"},
+            start_ts=day_ts,
+            virtual_clock=True,
+            allow_onboarding=False,
+        )
+        self.addCleanup(d.close)
+
+        # Plugin specifying target='qq-group:9001' (without target_channel) MUST route to 'qq-group:9001', NOT 'group'
+        did_specific = d.enqueue_outbound(
+            channel="webchat",
+            payload={"actor": "sora", "kind": "group", "target": "qq-group:9001", "text": "仅发往指定群房间提醒"},
+        )
+        # Conflicting target and target_channel MUST be rejected cleanly
+        did_conflict = d.enqueue_outbound(
+            channel="webchat",
+            payload={
+                "actor": "sora",
+                "kind": "group",
+                "target": "qq-group:9001",
+                "target_channel": "qq-group:9002",
+                "text": "冲突群目标",
+            },
+        )
+        res = d.flush_outbox()
+        self.assertEqual(res["dispatched"][did_specific], "sent")
+        self.assertEqual(res["dispatched"][did_conflict], "blocked")
+
+        with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
+            rows_spec = wc.execute(
+                "SELECT channel, text FROM chat_messages WHERE channel='qq-group:9001'"
+            ).fetchall()
+            rows_pub = wc.execute(
+                "SELECT channel, text FROM chat_messages WHERE channel='group'"
+            ).fetchall()
+            rows_conf = wc.execute(
+                "SELECT channel, text FROM chat_messages WHERE text='冲突群目标'"
+            ).fetchall()
+        self.assertEqual(len(rows_spec), 1)
+        self.assertEqual(rows_spec[0][1], "仅发往指定群房间提醒")
+        self.assertEqual(rows_pub, [])
+        self.assertEqual(rows_conf, [])
+
 
 if __name__ == "__main__":
     unittest.main()
