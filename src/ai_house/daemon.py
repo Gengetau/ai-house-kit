@@ -16,6 +16,7 @@ import queue
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -168,6 +169,15 @@ class HouseDaemon:
         self.env = dict(os.environ if env is None else env)
         self.runtime_dir = Path(runtime_dir)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_file = self.runtime_dir / ".daemon.lock"
+        try:
+            self._lock_file.write_text(
+                json.dumps({"pid": os.getpid(), "started_at": time.time()}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        self._world_epoch = 0
         self.life_db = str(self.runtime_dir / "life1.db")
         self.world_db = str(self.runtime_dir / "world.db")
         self.step_interval_s = float(step_interval_s)
@@ -286,6 +296,7 @@ class HouseDaemon:
                 self.authority.city_bridge.selves = self.vocab.SELVES
 
     def _teardown_world(self) -> None:
+        self._world_epoch = getattr(self, "_world_epoch", 0) + 1
         if getattr(self, "authority", None) is not None:
             try:
                 self.authority.close()
@@ -467,6 +478,14 @@ class HouseDaemon:
             self.model_router.close()
         if getattr(self, "identity_store", None) is not None:
             self.identity_store.close()
+        lock_fp = getattr(self, "_lock_file", None)
+        if lock_fp is not None and lock_fp.is_file():
+            try:
+                doc = json.loads(lock_fp.read_text(encoding="utf-8"))
+                if int(doc.get("pid") or 0) == os.getpid():
+                    lock_fp.unlink(missing_ok=True)
+            except (OSError, ValueError, TypeError):
+                pass
 
     def _run_post_step_jobs(self) -> None:
         """Run slow periodic memory/diary LLM jobs outside `self._lock` so `/api/state` never stalls."""
@@ -520,15 +539,19 @@ class HouseDaemon:
             if last is not None and (now - last) < float(task.interval_s):
                 continue
             self._plugin_task_last_run[key] = now
-            cfg = self.registry.resolve_config(defn.plugin_id, env=self.env, stored_plugins=stored_plugins)
-            tctx = PluginTaskContext(
-                plugin_id=defn.plugin_id,
-                task_id=task.task_id,
-                now=now,
-                plugin_config=cfg,
-                daemon=self,
-            )
             try:
+                cfg, cfg_warns = self.registry.safe_resolve_config(
+                    defn.plugin_id, env=self.env, stored_plugins=stored_plugins
+                )
+                for w in cfg_warns:
+                    self.log(f"plugin {defn.plugin_id} config warning: {mask_secrets(w)}")
+                tctx = PluginTaskContext(
+                    plugin_id=defn.plugin_id,
+                    task_id=task.task_id,
+                    now=now,
+                    plugin_config=cfg,
+                    daemon=self,
+                )
                 if task.run_outside_lock:
                     task.handler(tctx)
                 else:
@@ -1104,6 +1127,7 @@ class HouseDaemon:
             text = one_line(text)  # a member's message stays one line of its own in every later prompt
         with self._lock:
             self._require_world()
+            turn_epoch = self._world_epoch
             now = self.clock.now()
             state = self.get_state()
             residents = state["residents"]
@@ -1250,6 +1274,8 @@ class HouseDaemon:
                 model_user_text = f"{text}\n" + "\n".join(media_notes)
         raw_replies: List[tuple[str, Dict[str, Any]]] = []
         for aid in targets:
+            if self._world_epoch != turn_epoch or self.memory is None:
+                break
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
             turn_media: List[Dict[str, Any]] = []
 
@@ -1260,6 +1286,8 @@ class HouseDaemon:
                 _aid: str = aid,
                 _turn_media: List[Dict[str, Any]] = turn_media,
             ) -> Dict[str, Any]:
+                if self._world_epoch != turn_epoch or self.memory is None or self.intents is None:
+                    return {"error": "world_reset_during_turn"}
                 if tname == "inspect_house":
                     return {
                         "now_jst": state["now_jst"],
@@ -1374,6 +1402,8 @@ class HouseDaemon:
             if rep["mode"] != "sleeping":
                 why = self.guard.check(channel, rep["text"])
                 if not why and not is_private:
+                    if self._world_epoch != turn_epoch or self.memory is None:
+                        break
                     if self.memory.check_outbound_leak(aid, scope, rep["text"], now=now):
                         why = "memory_leak:private_to_public"
                 if why:
@@ -1386,6 +1416,14 @@ class HouseDaemon:
 
         replies: List[Dict[str, Any]] = []
         with self._lock:
+            if self._world_epoch != turn_epoch or self.needs_onboarding or self.authority is None or self.intents is None or self.memory is None:
+                return {
+                    "ok": False,
+                    "channel": channel,
+                    "replies": [],
+                    "ignored": "world_reset_during_turn",
+                    "messages": [],
+                }
             for aid, rep in raw_replies:
                 stored_media = [
                     {
@@ -2111,6 +2149,17 @@ class HouseDaemon:
     def reset_house(self) -> Dict[str, Any]:
         with self._async_job_lock, self._lock:
             self._teardown_world()
+            if getattr(self, "model_router", None) is not None:
+                self.model_router.close()
+            if getattr(self, "identity_store", None) is not None:
+                self.identity_store.close()
+            for ch in getattr(self, "channels", ()):
+                sp = getattr(ch, "_spool", None)
+                if sp is not None and hasattr(sp, "close"):
+                    try:
+                        sp.close()
+                    except Exception:
+                        pass
             targets = [
                 Path(self.life_db),
                 Path(self.life_db + "-wal"),
@@ -2124,8 +2173,22 @@ class HouseDaemon:
                 self.runtime_dir / "reminders.db",
                 self.runtime_dir / "reminders.db-wal",
                 self.runtime_dir / "reminders.db-shm",
+                self.runtime_dir / "album.db",
+                self.runtime_dir / "album.db-wal",
+                self.runtime_dir / "album.db-shm",
+                self.runtime_dir / "usage.db",
+                self.runtime_dir / "usage.db-wal",
+                self.runtime_dir / "usage.db-shm",
+                self.runtime_dir / "identity.db",
+                self.runtime_dir / "identity.db-wal",
+                self.runtime_dir / "identity.db-shm",
+                self.runtime_dir / "channel_spool.db",
+                self.runtime_dir / "channel_spool.db-wal",
+                self.runtime_dir / "channel_spool.db-shm",
                 self.runtime_dir / "clock_offset.json",
                 self.runtime_dir / "house_setup.json",
+                self.runtime_dir / "proactive_state.json",
+                self.runtime_dir / "group_behavior.json",
             ]
             wait_ev = threading.Event()
             for fp in targets:
@@ -2144,14 +2207,15 @@ class HouseDaemon:
             if hasattr(self.clock, "reset"):
                 self.clock.reset()
             self._plugin_task_last_run.clear()
+            self.album = AlbumStore(self.runtime_dir)
+            self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
+            self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
             if getattr(self, "send_gate", None) is not None:
                 self.send_gate.reset()
             if getattr(self, "group_behavior", None) is not None:
                 self.group_behavior.reset()
             if getattr(self, "proactive", None) is not None:
                 self.proactive.reset()
-            if getattr(self, "album", None) is not None:
-                self.album.reset()
 
             custom_dir = self.runtime_dir / "custom-pack"
             if custom_dir.exists():

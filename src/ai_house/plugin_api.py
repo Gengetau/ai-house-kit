@@ -411,6 +411,38 @@ class PluginDefinition:
         return self.manifest.plugin_id
 
 
+def safe_resolve_plugin_config(
+    manifest: PluginManifest,
+    env: Optional[Mapping[str, str]] = None,
+    stored_values: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Fault-tolerant config resolver: falls back per-field to `field.default` on invalid env/stored values."""
+    eff = os.environ if env is None else env
+    stored = stored_values if isinstance(stored_values, Mapping) else {}
+    resolved: Dict[str, Any] = {}
+    warnings: List[str] = []
+    for fld in manifest.config_fields:
+        has_stored = fld.key in stored and stored[fld.key] not in (None, "")
+        if has_stored:
+            raw = stored[fld.key]
+            src_label = f"配置项 {fld.key}"
+        elif fld.env_var and (eff.get(fld.env_var) or "").strip():
+            raw = eff.get(fld.env_var)
+            src_label = f"环境变量 {fld.env_var}"
+        else:
+            raw = fld.default
+            src_label = f"默认值 {fld.key}"
+        try:
+            resolved[fld.key] = fld.coerce(raw)
+        except (ValueError, TypeError) as exc:
+            warnings.append(f"{src_label} 无效 ({exc})，已回退默认值")
+            try:
+                resolved[fld.key] = fld.coerce(fld.default)
+            except (ValueError, TypeError):
+                resolved[fld.key] = fld.default
+    return resolved, warnings
+
+
 def resolve_plugin_config(
     manifest: PluginManifest,
     env: Optional[Mapping[str, str]] = None,
@@ -760,6 +792,22 @@ class PluginRegistry:
             else None
         )
         return resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
+
+    def safe_resolve_config(
+        self,
+        plugin_id: str,
+        env: Optional[Mapping[str, str]] = None,
+        stored_plugins: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        defn = self.definitions.get(plugin_id)
+        if defn is None:
+            raise KeyError(f"Unknown plugin: {plugin_id}")
+        stored_vals = (
+            stored_plugins.get(plugin_id, {}).get("values")
+            if isinstance(stored_plugins, Mapping) and isinstance(stored_plugins.get(plugin_id), Mapping)
+            else None
+        )
+        return safe_resolve_plugin_config(defn.manifest, env=env, stored_values=stored_vals)
 
     def active_extension_specs(
         self,
