@@ -860,6 +860,21 @@ class OneBotChannel(ChannelPlugin):
                 raise TimeoutError(code)
             sent_any = True
             last_ref = ext_ref
+        audio_b64 = str(payload.get("audio_base64") or "").strip()
+        if audio_b64:
+            action = "send_group_msg" if kind == "group" else "send_private_msg"
+            param_key = "group_id" if kind == "group" else "user_id"
+            ok_a, code_a, ext_a, lw_a = self._call_detailed(
+                action,
+                {param_key: int(target), "message": [{"type": "record", "data": {"file": f"base64://{audio_b64}"}}]},
+            )
+            if ok_a:
+                sent_any = True
+                last_ref = ext_a
+            elif not sent_any and not lw_a:
+                raise NotSent(code_a)
+            else:
+                raise TimeoutError(code_a)
         with self._ref_lock:
             self._delivered_refs[delivery_id] = last_ref
         return last_ref
