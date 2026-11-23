@@ -164,8 +164,9 @@ class _LimitServer:
     """
 
     def __init__(self, *, need: int, partial: str = CUT, full: str = FULL, tool_calls: Optional[List[Dict[str, Any]]] = None,
-                 script: Optional[List[str]] = None) -> None:
+                 script: Optional[List[str]] = None, refuse_above: int = 0) -> None:
         self.need, self.partial, self.full, self.tool_calls, self.script = need, partial, full, tool_calls, script
+        self.refuse_above = refuse_above  # a strict server: a limit above this is answered with HTTP 400
         self.requests: List[Dict[str, Any]] = []
         outer = self
 
@@ -178,6 +179,14 @@ class _LimitServer:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
                 outer.requests.append(body)
                 lim = int(body.get("max_completion_tokens") or body.get("max_tokens") or 0)
+                if outer.refuse_above and lim > outer.refuse_above:
+                    raw = json.dumps({"error": {"message": "max_tokens is too large"}}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
                 cut = lim < outer.need
                 text = outer.partial if cut else outer.full
                 if outer.script is not None:
@@ -259,6 +268,30 @@ class TruncatedPartialTextIsRetriedWithMoreRoom(_RouterCase):
         res = r.complete_messages([{"role": "user", "content": "u"}], purpose="chat")
         self.assertEqual(res.content, CUT_TRIMMED)
         self.assertTrue(res.truncated)
+
+    def test_the_bigger_request_changes_the_limit_and_nothing_else(self) -> None:
+        # the endpoint accepted this request shape and answered with text: the second try must not rename the limit
+        # parameter or drop the temperature (a strict server would refuse it, and the resident would sound different)
+        srv = _LimitServer(need=1000)
+        r = self.router_for(srv)
+        r.complete_text("s", "u", purpose="chat")
+        first, second = srv.requests
+        self.assertEqual({k for k in first if k != "max_tokens"}, {k for k in second if k != "max_tokens"})
+        self.assertIn("max_tokens", second)
+        self.assertEqual(first.get("temperature"), second.get("temperature"))
+        self.assertEqual(first["messages"], second["messages"])
+
+    def test_a_bigger_request_that_is_refused_keeps_the_first_partial_text(self) -> None:
+        # a server that will not give more room: the owner still gets the complete sentences of the first answer
+        srv = _LimitServer(need=10 ** 9, refuse_above=2000)
+        r = self.router_for(srv)
+        res = r.complete_messages([{"role": "user", "content": "u"}], purpose="chat")
+        self.assertEqual(res.content, CUT_TRIMMED)
+        self.assertTrue(res.truncated)
+        self.assertEqual(len(srv.requests), 2)
+        # nothing was learned, so the next call starts from the profile's limit again
+        r.complete_messages([{"role": "user", "content": "u2"}], purpose="chat")
+        self.assertEqual(srv.limits()[2], 400)
 
 
 class StillTruncatedFallsBackToTheLastCompleteSentence(_RouterCase):

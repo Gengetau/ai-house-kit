@@ -474,8 +474,18 @@ def _send_with_length_retry(
         cur_limit = _safe_int(payload.get("max_completion_tokens") or payload.get("max_tokens"), 2048)
         if first_empty or cur_limit < _MAX_REMEMBERED_LIMIT:
             new_limit = max(cur_limit * 2, 4096)
-            cur_payload = _adapt_reasoning_payload(payload, min_tokens=new_limit)
-            doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
+            if first_empty:
+                cur_payload = _adapt_reasoning_payload(payload, min_tokens=new_limit)
+                doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
+            else:
+                # The endpoint took this request shape and answered with text: ask again with more room and nothing else
+                # changed (same parameter name, same temperature). If the second try cannot be had at all (refused, timed
+                # out, out of budget), the fragment we already hold is still better than no answer.
+                cur_payload = _raise_output_limit(payload, new_limit)
+                try:
+                    doc = _send_chat_request(url, api_key, cur_payload, timeout_s, deadline)
+                except Exception:
+                    return first_doc
             if _is_empty_reasoning_length(doc):
                 if first_empty:
                     err = LLMAPIError(
