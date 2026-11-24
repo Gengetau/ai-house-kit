@@ -185,12 +185,13 @@ def collect_actor_facts(
         k_uri = Path(life_db).resolve().as_uri() + "?mode=ro"
         with contextlib.closing(sqlite3.connect(k_uri, uri=True, timeout=5)) as k_ro:
             k_ro.row_factory = sqlite3.Row
-            for ent in daylog.entries(k_ro, start, start + 86400.0, now, names=names):
-                if ent.get("actor") == actor and ent.get("ts", 0) < end:
-                    hm = dt.datetime.fromtimestamp(float(ent["ts"]), JST).strftime("%H:%M")
-                    others = [names.get(a, a) for a in ent.get("with") or () if a != actor]
-                    with_s = f"（和{'、'.join(others)}一起）" if others else ""
-                    lines.append((float(ent["ts"]), f"{hm} {ent.get('text', '')}{with_s}", _bare_walk(ent)))
+            everyone = daylog.entries(k_ro, start, start + 86400.0, now, names=names)
+            mine = [e for e in everyone if e.get("actor") == actor and e.get("ts", 0) < end]
+            stay = daylog._presence(k_ro, sorted(names), start, start + 86400.0) if any(e.get("with") for e in mine) else {}
+            for ent in mine:
+                hm = dt.datetime.fromtimestamp(float(ent["ts"]), JST).strftime("%H:%M")
+                lines.append((float(ent["ts"]), f"{hm} {ent.get('text', '')}{_company(ent, everyone, stay, now, names)}",
+                              _bare_walk(ent)))
 
     if Path(world_db).exists():
         w_uri = Path(world_db).resolve().as_uri() + "?mode=ro"
@@ -217,6 +218,63 @@ def collect_actor_facts(
             seen.add(row[1])
             rows.append(row)
     return [text for _, text, _ in _within_limit(rows, MAX_FACTS)]
+
+
+def _span(ent: Mapping[str, Any], now: float) -> Tuple[float, float]:
+    return float(ent["began"]), float(ent.get("end") or now)
+
+
+def _overlap(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def _stayed_s(rows: Sequence[Tuple[float, str]], loc: str, s: float, f: float) -> float:
+    """Seconds of [s, f] that someone, whose arrivals are `rows` [(since, where)], spent at `loc`."""
+    got = 0.0
+    for i, (since, where) in enumerate(rows):
+        until = rows[i + 1][0] if i + 1 < len(rows) else float("inf")
+        if where == loc:
+            got += max(0.0, min(until, f) - max(since, s))
+    return got
+
+
+def _company(ent: Mapping[str, Any], everyone: Sequence[Mapping[str, Any]], stay: Mapping[str, Sequence[Any]],
+             now: float, names: Mapping[str, str]) -> str:
+    """The 「（和X一起）」 tail of one of her lines.
+
+    「一起」 is the same thing in the same place at the same time, as for a meal (only the same dish: b815dda). The week page
+    lists everyone who shared the room (「同在」), which is a fact about the room, not about what she did: the model wrote
+    「我和凯、奈尔在客厅做花艺」 when 凯 was listening to music and 奈尔 had come in for the last eight minutes. So:
+    - an activity or a snack is 「和X一起」 only for someone who did the same activity (the same snack) in the same place over
+      at least min(5 minutes, half of it), the page's own rule for being there;
+    - the others who were in the room for at least half of it are 「同屋还有X，各做各的」; shorter than that is not told;
+    - walks, outfits, shopping, sleep and rest carry nobody: who happened to stand there is not part of them."""
+    kind = ent.get("kind")
+    if kind not in ("activity", "snack") or not ent.get("with"):
+        return ""
+    key = ent.get("act") if kind == "activity" else ent.get("item")
+    mine = _span(ent, now)
+    need = min(daylog.WITH_MIN_S, (mine[1] - mine[0]) / 2)
+    together, present = [], []
+    for other in ent["with"]:
+        if other == ent.get("actor"):
+            continue
+        same = any(
+            e.get("actor") == other and e.get("kind") == kind and e.get("loc") == ent.get("loc")
+            and (e.get("act") if kind == "activity" else e.get("item")) == key
+            and _overlap(mine, _span(e, now)) >= need
+            for e in everyone
+        )
+        if same:
+            together.append(other)
+        elif _stayed_s(stay.get(other, ()), str(ent.get("loc")), mine[0], mine[1]) >= (mine[1] - mine[0]) / 2:
+            present.append(other)
+    parts = []
+    if together:
+        parts.append(f"和{'、'.join(names.get(a, a) for a in together)}一起")
+    if present:
+        parts.append(f"同屋还有{'、'.join(names.get(a, a) for a in present)}，各做各的")
+    return f"（{'；'.join(parts)}）" if parts else ""
 
 
 def _bare_walk(ent: Mapping[str, Any]) -> bool:

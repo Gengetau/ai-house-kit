@@ -378,9 +378,20 @@ class HouseDaemon:
                 else self.chat_agent.kernel_chat_fn()
             )
             self.authority.life.model = LiveLifeModel(life_chat, self.vocab.SELVES) if life_chat else FakeLifeModel(vocab=self.vocab)
+            if self.authority.note is not None:
+                self.authority.note.chat = self._day_note_chat(router, life_chat)
             if self.authority.city_bridge is not None and hasattr(self.authority.city_bridge, "chat"):
                 self.authority.city_bridge.chat = life_chat
                 self.authority.city_bridge.selves = self.vocab.SELVES
+
+    def _day_note_chat(self, router: Any, life_chat: Any) -> Any:
+        """The model route for the night's 「今天的小屋」 note. It is one long writing job over the whole day's fact list,
+        like a diary, not one of her quick decisions: it goes through the `diary` route (60 s a request, 90 s in all, its
+        failures do not feed the breaker chat shares) instead of `life` (25 s / 45 s). With a test hook or no live model
+        route it stays on whatever her decisions use."""
+        if self._llm_fn is None and router is not None and router.has_live_endpoint(purpose="diary"):
+            return router.chat_fn(purpose="diary")
+        return life_chat
 
     def _schedule_post_reply(self, turn_epoch: int, job: Any) -> None:
         """Run `job` in the background under the same lock as the periodic post-step jobs (never inside a turn)."""
@@ -553,6 +564,8 @@ class HouseDaemon:
             vocab=self.vocab,
             extra_extensions=ext_factories,
             intents_mod=self.intents,
+            note_chat=self._day_note_chat(self.model_router, life_chat),
+            day_note_retries=2,
         )
         self._managed_plugin_extensions = managed_exts
         self._managed_plugin_ext_map = managed_map
@@ -1731,10 +1744,13 @@ class HouseDaemon:
                             ),
                         )
                 if speaker.is_owner and rep["mode"] != "blocked":
+                    # asleep: the "reply" is a placeholder, she did not agree to anything (nothing is recorded as her
+                    # promise), and the placeholder is not what she "said" back; the owner's line still reaches her
+                    asleep = rep["mode"] == "sleeping"
                     self.intents.enqueue_chat(
                         aid,
                         text,
-                        rep["text"],
+                        "" if asleep else rep["text"],
                         where=where,
                         intents=rep.get("tool_intents") or None,
                         now=now,
@@ -1742,6 +1758,7 @@ class HouseDaemon:
                         speaker_role=speaker_role,
                         proposer_id=speaker.identity_id or "user:owner",
                         party=list(targets),
+                        record_intents=not asleep,
                     )
                 self.memory.observe(
                     aid,

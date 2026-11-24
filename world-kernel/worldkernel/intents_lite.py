@@ -1206,10 +1206,13 @@ class CommitmentStore:
         proposer_id: str = "user:owner",
         party: Optional[Sequence[str]] = None,
         agreed: Optional[Sequence[str]] = None,
+        record_intents: bool = True,
     ) -> Optional[int]:
         """Record an owner chat turn into `world.db` (`owner_chat_queue` + `house_intents`).
 
         Non-owner speakers (`speaker_role != 'owner'`) can never create commitments or wake ChatLink.
+        `record_intents=False`: she did not really answer (she was asleep: the reply is a placeholder), so what the owner
+        said still reaches her through the queue but nothing is recorded as promised or as a memo for her.
         """
         if not self.world_db:
             return None
@@ -1313,7 +1316,7 @@ class CommitmentStore:
 
         declined = reply_declines(clean_reply)
         enriched_intents: List[Dict[str, Any]] = []
-        for it in extracted:
+        for it in (extracted if record_intents else ()):
             item_party = _clean_actors(it.get("party") or base_party, fallback=actor)
             item_agreed = _clean_actors(it.get("agreed") or it.get("答应了的") or base_agreed, fallback=actor)
             summary = str(it.get("text") or "")[:180]

@@ -364,10 +364,14 @@ class Outings:
             k._emit('luggage_packed',me,action['action_id'],location,{'garments':step['packing'],'plan_id':j['plan_id']},
                     scope=f'self:{me}',occurred=action['due_at'],observers=(),source_ref=f'event:{eid}')
         if step.get('unpack') or (action['action_type'] == 'move' and location == 'living'):
+            # Walking in with the bags and the unpacking step both come here while the goods are still hers: a purchase
+            # is brought home once (the first of the two), not once per step (real run: every item twice, 5 min apart).
+            told = j.setdefault('brought_home', [])
             for rid in j.get('purchases', []):
                 resource = k.resource(rid)
-                if not resource or resource['holder'] != me or resource['qty'] <= 0:
+                if not resource or resource['holder'] != me or resource['qty'] <= 0 or rid in told:
                     continue
+                told.append(rid)
                 purchase = db.execute("SELECT payload,action_id FROM events WHERE kind='purchased' AND event_id=?",
                                       (int(resource['source'].split(':')[-1]),)).fetchone()
                 if purchase:

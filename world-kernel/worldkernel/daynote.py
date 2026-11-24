@@ -4,14 +4,17 @@ From 23:30 JST (and until 03:00 the next morning, for a night the house was down
 per day, 150~300 characters about that day for the owner's week page. The only input is that day's timeline as the
 console shows it: world.db's script lines the kernel projector wrote (source='kernel': cooked, ate with whom,
 together, went where, invites) and daylog.entries (activities, walks, outfits, shopping, sleep, rest, with who else
-was there). One call through the kernel's own model route, counted first in its own budget pool (2 a day).
+was there). One call through the kernel's own model route, counted first in its own budget pool (3 a day: the call and two tries).
 
 The answer is kept only if it passes check(): a JSON text of the right length, no quotes, no roommate / 房主 / place of
 the house or town the facts do not name (the kitchen counts as named on a day with cooking or a meal: those script
 lines carry no room), no word for a feeling, a mood or talk the facts do not have. check() is a backstop for the prompt,
-not a proof: an invented happening in words the facts also use still passes. A failed call or a refused answer leaves the
-day without a note and is not retried: the attempt is remembered in life_runtime (day_note:<date>) before the call,
-its outcome in day_note:<date>:result (no text, for the operator). Stored in life1.db summaries: summary_id
+not a proof: an invented happening in words the facts also use still passes. A refused answer leaves the day without a
+note and is not retried; so does a failed call, unless the owner of the DayNote asked for `retries` (the daemon does: a slow
+model timing out twice in a row, as in the gemini real run, is not a reason to go without): then a failed call (the model
+did not answer, nothing to judge) is asked again RETRY_GAP_S later, at most `retries` more times and not after 02:30. The
+attempt is remembered in life_runtime (day_note:<date>) before the call, the tries in day_note:<date>:retry, its outcome
+in day_note:<date>:result (no text, for the operator). Stored in life1.db summaries: summary_id
 'day:<date>', scene 'day', audience 'owner'; one row a day, write(day, force=True) rewrites it in place.
 
 Off unless WORLD_KERNEL_DAY_NOTE=1 (authority.py). Never sends anything anywhere, never writes world.db.
@@ -36,7 +39,10 @@ MIN_FACTS = 3            # a day with fewer lines has nothing to tell
 MAX_FACTS = 220          # the prompt carries at most this many lines (a full day was 87 on 11-07); walks go first
 LO, HI = 130, 330        # characters (no whitespace) accepted; the model is asked for 150~300
 POOL = "world-kernel/day-note"
-LIMITS = {"total": 10 ** 9, "per_hour": 2, "per_day": 2}
+# the first call and two more tries within the hour (a failed call keeps counting: its cost is unknown); a day is 3 too
+LIMITS = {"total": 10 ** 9, "per_hour": 3, "per_day": 3}
+RETRY_GAP_S = 600        # a failed call is asked again after 10 minutes (the diary's gap)
+RETRY_UNTIL = (2, 30)    # JST on the morning after: no new try from here (the diary's cut-off)
 QUOTES = "「」『』“”\"‘’"
 # feelings, moods, motives and guesses: refused unless the day's facts themselves have the word
 FEELINGS = ("开心", "高兴", "快乐", "难过", "伤心", "生气", "心情", "情绪", "兴奋", "失落", "寂寞", "孤单", "幸福", "烦躁",
@@ -197,8 +203,9 @@ def check(text, lines, names=None, vocab=None):
 
 
 class DayNote:
-    def __init__(self, life, world_db, chat, log=print):
+    def __init__(self, life, world_db, chat, log=print, retries=0):
         self.life, self.s, self.world_db, self.chat, self.log = life, life.s, world_db, chat, log
+        self.retries = max(0, int(retries or 0))  # more tries after a call that failed (0: one call a night)
         self.budget = Budget(self.s, pool=POOL, limits=LIMITS)
         self.names = dict(getattr(life, "names", NAMES))
         self.vocab = getattr(life, "V", V)
@@ -214,9 +221,28 @@ class DayNote:
 
     def step(self):
         day = self.due()
-        if day is None or not self.life.once(f"day_note:{day.isoformat()}"):
+        if day is None:
             return None
+        if not self.life.once(f"day_note:{day.isoformat()}"):
+            return self._retry(day)
         return self.write(day, trigger="nightly")
+
+    def _retry_key(self, day):
+        return f"day_note:{day.isoformat()}:retry"
+
+    def _retry(self, day):
+        """Another call for a night whose call failed (see the module note); None when it is not time or not allowed."""
+        state = self.life.get(self._retry_key(day)) if self.retries else None
+        now = self.s.clock.now()
+        cutoff = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time(*RETRY_UNTIL), JST).timestamp()
+        if not state or state["tries"] >= self.retries or now < state["next"] or now >= cutoff:
+            return None
+        # counted before the call: a crash in it never gives a night more tries than it is allowed
+        self.life.put(self._retry_key(day), dict(state, tries=state["tries"] + 1, next=now + RETRY_GAP_S))
+        outcome = self.write(day, trigger="nightly")
+        if outcome != "model_error":  # written, refused, no budget...: an answer (or a stop) is the end of the tries
+            self.life.put(self._retry_key(day), dict(state, tries=self.retries, next=now))
+        return outcome
 
     def _result(self, day, outcome, **kw):
         self.life.put(f"day_note:{day.isoformat()}:result", dict(kw, outcome=outcome, at=self.s.clock.now()))
@@ -243,8 +269,10 @@ class DayNote:
         system, user = prompt(day, lines, names=self.names)
         try:  # outside any transaction
             answer, tokens = self.chat(system, user)
-        except Exception as e:  # unknown cost: keep counting it, never ask again for this day
+        except Exception as e:  # unknown cost: keep counting it; asked again only if `retries` allows it
             self.budget.unknown(rid, type(e).__name__)
+            if self.retries and self.life.get(self._retry_key(day)) is None:
+                self.life.put(self._retry_key(day), {"tries": 0, "next": self.s.clock.now() + RETRY_GAP_S})
             return self._result(day, "model_error", error=type(e).__name__, facts=len(lines))
         self.budget.settle(rid, tokens)
         text = read(answer)
