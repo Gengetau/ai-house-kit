@@ -34,6 +34,7 @@ from ai_house import llm as llm_mod
 from ai_house.daemon import HouseDaemon
 from ai_house.diary import DiaryService, finish_diary_text
 from ai_house.llm import LLMAPIError, ModelRouter
+from ai_house.memory import MemoryStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
 NAMES = {"nell": "奈尔", "kai": "凯", "elsa": "艾莎", "yuki": "由纪", "sora": "空", "rin": "凛", "mio": "澪"}
@@ -199,8 +200,6 @@ class RetryBeforeTemplate(_Base):
         self.assertEqual(len(svc.list_diaries(limit=50)), 1)
 
     def test_memory_gets_the_diary_once(self) -> None:
-        from ai_house.memory import MemoryStore
-
         svc = self.service(["nell"])
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -211,7 +210,9 @@ class RetryBeforeTemplate(_Base):
         t = at(22, 40)
         for i in range(4):
             svc.run_due(t + i * (diary_mod.RETRY_DELAY_S + 1), model)
-        self.assertEqual(len(mem.list_entries("nell", "world", kind="diary")), 1)
+        rows = mem.list_entries("nell", "world", kind="diary")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("特别踏实", rows[0]["text"])  # the real diary of the retry, not the template
 
     def test_one_residents_failure_does_not_hold_up_the_others(self) -> None:
         svc = self.service(["nell", "kai", "elsa"])

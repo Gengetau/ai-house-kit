@@ -23,9 +23,8 @@ services:
       AI_HOUSE_FALLBACK_BASE_URL: ${AI_HOUSE_FALLBACK_BASE_URL:-}
       AI_HOUSE_FALLBACK_MODEL: ${AI_HOUSE_FALLBACK_MODEL:-}
       AI_HOUSE_PACK_DIR: ${AI_HOUSE_PACK_DIR:-}
-      # 记忆：用哪一套记忆库（不写就是原来的）；向量服务默认指向下面的 embedding 容器，只有新记忆库（common）会用它。
+      # 记忆：向量服务默认指向下面的 embedding 容器（没起来、还在载入模型时，小屋照常按关键词回想）。
       # 想换成自己的向量服务就写 AI_HOUSE_MEMORY_EMBED_URL；写 off 则完全不用向量（按关键词回想）。
-      AI_HOUSE_MEMORY_BACKEND: ${AI_HOUSE_MEMORY_BACKEND:-}
       AI_HOUSE_MEMORY_EMBED_URL: ${AI_HOUSE_MEMORY_EMBED_URL:-}
       AI_HOUSE_MEMORY_EMBED_URL_DEFAULT: http://embedding:7998
       # 本地双容器（--profile city）：这几个开关 README 里写了，这里真的转进容器

@@ -82,12 +82,12 @@ docker compose --profile city up -d --build
 ## 架构与插件生态
 
 - **`src/ai_house/`**：开箱即用宿主守护进程（`daemon.py`）、首位住客与大模型初始化引擎（`onboarding.py`）、受众隔离对话与轻量约定提取（`chat_agent.py`）、四轴插件 SDK（`plugin_api.py`）、暖灯像素可视化控制台（`web/` 含两层剖面/等轴房间引擎与 `#/setup` 向导）以及内置标准 MCP 端点（`POST /mcp`）。
-- **内置核心扩展**：长期记忆库（`memory.py`）、个人睡前日记（`diary.py`）、CLI 体检工具（`cli.py init/doctor`）及工具插件（`sticker_pack` / `dice_tabletop` / `book_nook`）。
+- **内置核心扩展**：长期记忆库（`common/memory.py` + `memory_common.py`）、个人睡前日记（`diary.py`）、CLI 体检工具（`cli.py init/doctor`）及工具插件（`sticker_pack` / `dice_tabletop` / `book_nook`）。
 - **聊天入口**：网页和 QQ（`builtin_plugins/onebot_ws.py`，可选依赖 `pip install -e ".[onebot]"`）共用 `HouseDaemon.converse`；发言人身份在 `chat_identity.py`，发送前过滤在 `chat_guard.py`；详见 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)。
 - **`world-kernel/`**：单写者事务、命令管线、R1/R2 视图、受众隔离材料、L0 日常、预算账本、轻量约定与履行（`intents_lite.py`）、衣柜与晴空都桥接客户端。
 - **`world-catalog/`**：统一词表、`load_pack()`、守卫校验 `guard()` 与默认樱丘六人示例世界 `life1/`。
 - **`world-contract-tests/`**：黄金契约测试与离线判定器 `oracle.py`。
-- **`src/ai_house/common/`、`memory-conformance-tests/`**：与维护者私有部署逐行共用的记忆代码及其原有测试（尚未接入运行路径，见 [docs/PORTING-PLAN.md](docs/PORTING-PLAN.md) 第 15 节）。
+- **`src/ai_house/common/`、`memory-conformance-tests/`**：与维护者私有部署逐行共用的记忆代码及其原有测试；小屋的记忆就跑在这份代码上（见 [docs/PORTING-PLAN.md](docs/PORTING-PLAN.md) 第 15 节）。
 - 插件开发与自定义世界包详见 **[docs/CUSTOM-WORLD-TUTORIAL.md](docs/CUSTOM-WORLD-TUTORIAL.md)** 与 **[docs/PLUGINS-AND-CITY.md](docs/PLUGINS-AND-CITY.md)**。
 
 ## 跑全套测试

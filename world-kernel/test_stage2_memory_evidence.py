@@ -1,4 +1,6 @@
-"""Stage 2.4 tests: memory source evidence gating, group claim downgrade & outbound leak guard."""
+"""Stage 2.4 tests: memory source evidence gating, group claim downgrade & outbound leak guard.
+
+The evidence gate and the trust levels are the shared module's (`AI_HOUSE_MEMORY_TRUST=1`; off by default)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -13,8 +15,10 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.memory import JST, MemoryStore  # noqa: E402
+from ai_house.memory import MemoryStore  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
+
+JST = dt.timezone(dt.timedelta(hours=9))
 
 
 class Stage2MemoryEvidenceTests(unittest.TestCase):
@@ -30,6 +34,7 @@ class Stage2MemoryEvidenceTests(unittest.TestCase):
             llm_fn=llm_fn,
             extract_every_s=60,
             extract_batch=10,
+            env={"AI_HOUSE_MEMORY_TRUST": "1"},
         )
         self.addCleanup(st.close)
         return st
@@ -79,6 +84,26 @@ class Stage2MemoryEvidenceTests(unittest.TestCase):
         self.assertEqual(res["rejected"], 3)
         self.assertEqual(st.list_entries("sora", "group", channel="qq-group:9001"), [])
 
+        # positive control: the same kind of op, backed by a member's statement instead of a question, is stored
+        st.observe(
+            "sora",
+            "group",
+            "我自己对花生过敏，吃了会起疹子",
+            channel="qq-group:9001",
+            speaker="群友阿晴",
+            speaker_role="member",
+            speaker_id="8002",
+        )
+        st._llm_fn = lambda _s, _u: {
+            "ops": [{"op": "add", "text": "群友阿晴对花生过敏", "about": ["阿晴"], "kind": "fact", "src": [1]}]
+        }
+        res = st.extract("sora", scope="group", channel="qq-group:9001", force=True)
+        self.assertEqual((res["added"], res["rejected"]), (1, 0))
+        self.assertEqual(
+            [(r["text"], r["trust"]) for r in st.list_entries("sora", "group", channel="qq-group:9001")],
+            [("群友阿晴对花生过敏", "group_stated")],
+        )
+
     def test_group_member_claim_downgraded_and_ranked_below_verified(self) -> None:
         def claim_llm(_sys: str, _usr: str) -> Dict[str, Any]:
             return {
@@ -121,7 +146,7 @@ class Stage2MemoryEvidenceTests(unittest.TestCase):
         recalled = st.recall("sora", "group", "周六晚上聚餐吃寿喜锅", channel="group")
         self.assertIn("[群聊陈述·未核实", recalled)
 
-    def test_owner_claim_stays_verified_and_paraphrased_private_allergy_leak_blocked(self) -> None:
+    def test_owner_claim_stays_verified_and_repeated_private_allergy_leak_blocked(self) -> None:
         st = self._make_store(
             llm_fn=lambda _s, _u: {
                 "ops": [
@@ -141,9 +166,10 @@ class Stage2MemoryEvidenceTests(unittest.TestCase):
         self.assertEqual(grp_rows[0]["kind"], "preference")
         self.assertEqual(grp_rows[0]["trust"], "verified")
 
-        # Private allergy line even paraphrased across shorter sentence triggers outbound leak check
+        # A private allergy line repeated back in a group reply triggers the outbound leak check. Differs from before:
+        # a shorter paraphrase ("an item plus an allergy word") is no longer stopped, only a repeat of most of it.
         st.observe("sora", "private", "我其实对虾仁和荞麦有点过敏，先别外传", speaker="房主", speaker_role="owner")
-        self.assertTrue(st.check_outbound_leak("sora", "group", "点菜注意别放虾仁，可能会过敏"))
+        self.assertTrue(st.check_outbound_leak("sora", "group", "你其实对虾仁和荞麦有点过敏，先别外传哦"))
         self.assertEqual(st.check_outbound_leak("sora", "group", "晚上大家要不要一起看电影"), [])
 
 

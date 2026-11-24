@@ -178,8 +178,11 @@ class Stage3WebSearchTests(unittest.TestCase):
         mock_srv.fail_mode = False
 
         # Outbound private memory leak MUST block before hitting search endpoint
+        # changed: the query repeats most of the memory (the old key-phrase rule is gone).
+        # Positive control: the memory is recalled in private.
+        self.assertIn("青苹果核桃", d.memory.recall("sora", "private", "房主暗语青苹果核桃是什么"))
         before_q = len(mock_srv.seen_paths)
-        qs_priv = urllib.parse.urlencode({"q": "青苹果核桃", "actor": "sora"})
+        qs_priv = urllib.parse.urlencode({"q": "房主暗语「青苹果核桃」不能外传", "actor": "sora"})
         _, res_priv = _http_json(f"{base}/api/plugins/web_search/query?{qs_priv}", token=owner_tok)
         self.assertEqual(res_priv["status"], "blocked")
         self.assertEqual(len(mock_srv.seen_paths), before_q)

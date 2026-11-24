@@ -137,6 +137,29 @@ def _trust_of(row: Mapping[str, Any]) -> str:
     return t if t in TRUST_RANK else "verified"
 
 
+def _old_v3_done(old: sqlite3.Connection) -> bool:
+    if not _has_table(old, "schema_migrations"):
+        return False
+    try:
+        return old.execute("select 1 from schema_migrations where version>=3").fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _demote_like_v3(rows: List[Dict[str, Any]]) -> int:
+    """An old file last opened by a version from before the old store's third schema step still calls every group
+    memory verified. That step, which the old store ran on its next start, made the ones nobody had checked against
+    the owner's words unverified claims; the old store is gone, so the same rule is applied to the rows as read."""
+    n = 0
+    for r in rows:
+        if (str(r.get("scope")) == "group" and _trust_of(r) == "verified"
+                and str(r.get("kind") or "fact") in ("fact", "preference", "person")
+                and str(r.get("source") or "") not in ("auto:owner_verified", "owner_verified", "diary")):
+            r["kind"], r["trust"] = "claim", "group_stated"
+            n += 1
+    return n
+
+
 def _trust_on(env: Optional[Mapping[str, str]]) -> bool:
     e = os.environ if env is None else env
     return str(e.get("AI_HOUSE_MEMORY_TRUST") or "").strip() == "1"
@@ -542,6 +565,7 @@ def migrate(data_dir: Union[str, Path], *, env: Optional[Mapping[str, str]] = No
                 r["expires_at"] = None if r.get("expires_at") is None else float(r["expires_at"])
             except (TypeError, ValueError):
                 r["expires_at"] = None
+        report["demoted"] = 0 if _old_v3_done(old) else _demote_like_v3(old_mem_rows)
         old_seen_rows = _read_table(old, "seen", _SEEN_COLUMNS)
         old_ver = int(old.execute("select count(*) from mem_ver").fetchone()[0]) if _has_table(old, "mem_ver") else 0
         old_src = int(old.execute("select count(*) from mem_src").fetchone()[0]) if _has_table(old, "mem_src") else 0
@@ -679,6 +703,9 @@ def describe(report: Mapping[str, Any]) -> List[str]:
         out.append(f"{v['left_empty']} 条记忆在旧库里没有向量，新库里也留空；开了向量服务后运行 backfill_vectors() 补上。")
     if v["in_old_rows"]:
         out.append(f"旧库里有向量的 {v['in_old_rows']} 条原样带过去（默认两边用同一个向量服务）。")
+    if report.get("demoted"):
+        out.append(f"旧库停在很早的版本，里面有 {report['demoted']} 条群里的记忆没有对过房主原话却标着已核实；"
+                   "按旧库下一次启动本来会做的那样，当作未核实的说法带过去。")
     t = m["trust"]
     if t["levels_below_verified"]:
         if t["switch_on"] and not t["waiting_for_the_switch"]:

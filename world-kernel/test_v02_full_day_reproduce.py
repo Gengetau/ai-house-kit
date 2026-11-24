@@ -36,7 +36,7 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
         leak_attempt = [False]
 
         def llm_fn(sys_prompt: str, user_prompt: str):
-            if "长期记忆整理员" in sys_prompt:
+            if "记忆整理员" in sys_prompt:
                 if "蓝花盆" in user_prompt:
                     return json.dumps({
                         "ops": [{
@@ -44,8 +44,6 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
                             "text": "2026年11月21日房主私下说备用钥匙藏在庭院蓝花盆底下",
                             "about": ["房主", "钥匙"],
                             "kind": "fact",
-                            "shared": False,
-                            "src": [1],
                         }]
                     }, ensure_ascii=False), 25
                 return '{"ops": []}', 10
@@ -64,7 +62,8 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
                 )[:280]
                 return json.dumps({"text": note_body}, ensure_ascii=False), 30
             if leak_attempt[0] and "花盆" in user_prompt:
-                return "备用钥匙就藏在庭院蓝花盆底下哦！", 15
+                # changed: the reply repeats most of the memory (the old key-phrase rule is gone)
+                return "房主私下说备用钥匙藏在庭院蓝花盆底下哦！", 15
             if "昨晚日记" in user_prompt:
                 return "我昨天在日记里记了去灯火吃茶馆逛街和洋馆日常的事呀。", 18
             if "备用钥匙" in user_prompt or "花盆" in user_prompt:
@@ -190,9 +189,10 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
         self.assertEqual(grp_res["replies"][0]["mode"], "blocked")
         self.assertIn("已被拦下", grp_res["replies"][0]["text"])
 
-        # Group chat recalls public evening diary (world scope) across restart
-        diary_recall = d2.memory.recall("nell", "group", "昨晚日记写了什么", now=day2)
-        self.assertIn("日记", diary_recall)
+        # Group chat recalls public evening diary (changed: the question shares content words with the diary text; recall has no vector match here) (world scope) across restart
+        diary_recall = d2.memory.recall("nell", "group", "昨天去灯火吃茶馆逛了逛，遇到小葵了吗", now=day2)
+        self.assertIn("日记", diary_recall)  # the diary line carries its kind label
+        self.assertIn("灯火吃茶馆", diary_recall)
         ok_res = d2.send_chat("group", "奈尔，昨晚日记写了什么呀？")
         self.assertEqual(ok_res["replies"][0]["mode"], "live_api")
 

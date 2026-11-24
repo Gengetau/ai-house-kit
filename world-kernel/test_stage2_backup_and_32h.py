@@ -42,7 +42,7 @@ class _StatefulStage2MockServer:
                 sys_txt = str(msgs[0].get("content") or "") if msgs else ""
                 usr_txt = str(msgs[-1].get("content") or "") if msgs else ""
 
-                if "长期记忆整理员" in sys_txt:
+                if "记忆整理员" in sys_txt:
                     parent.calls.append("memory_extract")
                     ops: List[Dict[str, Any]] = []
                     if "虾仁和腰果" in usr_txt:
@@ -85,7 +85,8 @@ class _StatefulStage2MockServer:
                 else:
                     parent.calls.append("chat")
                     if parent.leak_mode:
-                        content = "点菜时记得别放虾仁，可能会过敏哦！"
+                        # changed: the outbound check needs most of the memory repeated (the old "item + allergy word" rule is gone)
+                        content = "我记得房主私下说自己对虾仁和腰果过敏，点菜时记得避开哦！"
                     elif parent.guess_reply:
                         content = "我也不太确定，好像可能是对花生或芒果有点忌口吧？"
                     else:
@@ -171,7 +172,7 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         # 2) Verify clean archive and confirm .env is absent
         v_res = verify_backup(arc3)
         self.assertTrue(v_res["ok"])
-        self.assertIn("memory.db", v_res["dbs"])
+        self.assertIn("memory-common.db", v_res["dbs"])
         with tarfile.open(arc3, "r:gz") as tf:
             names = tf.getnames()
             self.assertFalse(any(n.endswith(".env") for n in names))
@@ -238,6 +239,7 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
                 "AI_HOUSE_API_KEY": "mock-key-32h",
                 "AI_HOUSE_BASE_URL": mock_srv.base_url,
                 "AI_HOUSE_MODEL": "mock-32h-model",
+                "AI_HOUSE_MEMORY_TRUST": "1",  # trust levels are off by default; this case is about them
             },
             start_ts=t0,
             virtual_clock=True,
@@ -320,6 +322,8 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         self.assertIn("diary", purposes)
 
         # Outbound leak guard blocks leaking private shrimp/cashew allergy into group
+        # positive control: the allergy memory exists and is recalled in private
+        self.assertIn("虾仁", d.memory.recall("sora", "private", "房主对虾仁和腰果过敏吗", now=d.clock.now()))
         mock_srv.leak_mode = True
         leaked_rep = d.converse("qq-group:9001", "晚饭买什么食材呀？", member_speaker("阿晴", "8002"), actor="sora")
         self.assertEqual(leaked_rep["replies"][0]["mode"], "blocked")

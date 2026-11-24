@@ -16,14 +16,13 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.memory import (  # noqa: E402
-    LEAK_FREE_GROUPS_ENV,
-    NO_MEMORY_NOTE,
-    PRIVATE_IN_GROUP_NOTE_FREE,
-    PRIVATE_IN_GROUP_NOTE_HUSH,
-    PRIVATE_IN_GROUPS_ENV,
-    MemoryStore,
-)
+from ai_house.memory import LEAK_FREE_GROUPS_ENV, PRIVATE_IN_GROUPS_ENV, MemoryStore  # noqa: E402
+
+# the notes the shared module writes (they are no longer exported by ai_house.memory)
+NO_MEMORY_NOTE = ("（你的记忆里没有找到和这个问题相关的内容。照实说你不记得、不知道，不要编、不要猜，"
+                  "也不要替别人回答；除非这件事就出现在你们这次对话的前文里。）")
+PRIVATE_IN_GROUP_NOTE_FREE = "标着·私密的是房主私聊里跟你说的事：这里是小屋自己的群，想提可以自然地提。"
+PRIVATE_IN_GROUP_NOTE_HUSH = "标着·私密的是房主私聊里跟你说的事：心里知道就好，别在这里说出来，也别暗示。"
 
 T0 = 1_800_000_000.0
 LINE1 = "妮娅，悄悄跟你说个事：我打算下个月辞职去开一家咖啡店，这件事先别告诉别人哦。"
@@ -53,15 +52,31 @@ class ListedGroupRecall(unittest.TestCase):
             got = self.st.recall("nia", "group", ask, channel=LISTED, now=T0 + 1200)
             self.assertIn("咖啡店", got, f"the earlier private plan is missing from the prompt for: {ask}")
             self.assertNotIn(NO_MEMORY_NOTE, got)
-            self.assertIn(PRIVATE_IN_GROUP_NOTE_FREE, got)
+            # a line not yet turned into a memory is shown with its own label, and in a listed group that label
+            # gives the same leave the note for stored memories gives (below)
+            self.assertIn("房主私聊·私密：这里是小屋自己的群，想提可以自然地提", got)
+            self.assertNotIn("别在群里说出来", got)
             self.assertNotIn(PRIVATE_IN_GROUP_NOTE_HUSH, got)
 
     def test_unlisted_group_also_knows_it_but_is_told_to_keep_quiet(self) -> None:
         for ask in ASKS:
             got = self.st.recall("nia", "group", ask, channel=UNLISTED, now=T0 + 1200)
             self.assertIn("咖啡店", got, f"the earlier private plan is missing from the prompt for: {ask}")
-            self.assertIn(PRIVATE_IN_GROUP_NOTE_HUSH, got)
+            self.assertIn("别在群里说出来", got)  # the label of a line not yet turned into a memory
             self.assertNotIn(PRIVATE_IN_GROUP_NOTE_FREE, got)
+
+    def test_a_stored_private_memory_comes_with_the_free_note_in_a_listed_group_and_the_hush_note_elsewhere(self) -> None:
+        # the same plan once it is a memory (the old test had only `seen` rows)
+        self.st.add("nia", "private", "房主打算下个月辞职去开一家咖啡店，这件事先别告诉别人。", channel="private:nia",
+                    about=["房主"], kind="event", now=T0 + 700)
+        got = self.st.recall("nia", "group", ASKS[1], channel=LISTED, now=T0 + 1200)
+        self.assertIn("咖啡店", got)
+        self.assertIn(PRIVATE_IN_GROUP_NOTE_FREE, got)
+        self.assertNotIn(PRIVATE_IN_GROUP_NOTE_HUSH, got)
+        got = self.st.recall("nia", "group", ASKS[1], channel=UNLISTED, now=T0 + 1200)
+        self.assertIn("咖啡店", got)
+        self.assertIn(PRIVATE_IN_GROUP_NOTE_HUSH, got)
+        self.assertNotIn(PRIVATE_IN_GROUP_NOTE_FREE, got)
 
     def test_a_question_about_something_never_told_still_gets_the_plain_no(self) -> None:
         # names a topic, does not say it was told in private, nothing matches: no dump of the latest private lines
@@ -78,6 +93,8 @@ class ListedGroupRecall(unittest.TestCase):
         for ask in ASKS:
             got = st.recall("nia", "group", ask, channel=LISTED, now=T0 + 1200)
             self.assertNotIn("咖啡店", got)
+        # positive control: the same lines reach the same group once the switch is on
+        self.assertIn("咖啡店", self.st.recall("nia", "group", ASKS[1], channel=LISTED, now=T0 + 1200))
 
 
 class DirectBrainPrompt(unittest.TestCase):

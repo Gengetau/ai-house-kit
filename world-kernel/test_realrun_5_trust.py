@@ -23,7 +23,10 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.memory import JST, MemoryStore, _owner_lines_support  # noqa: E402
+from ai_house.memory import MemoryStore  # noqa: E402
+
+JST = dt.timezone(dt.timedelta(hours=9))
+TRUST_ENV = {"AI_HOUSE_MEMORY_TRUST": "1"}
 from worldkernel.store import VirtualClock  # noqa: E402
 
 NAMES = {"nell": "奈尔", "yuki": "由纪", "kai": "凯"}
@@ -63,7 +66,7 @@ class _Base(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         st = MemoryStore(tmp.name, clock=VirtualClock(at), names=NAMES, llm_fn=lambda _s, _u: {"ops": [op]},
-                         extract_every_s=60, extract_batch=10)
+                         extract_every_s=60, extract_batch=10, env=TRUST_ENV)
         self.addCleanup(st.close)
         for text, speaker, role, reply in lines:
             st.observe(actor, scope, text, channel=channel, speaker=speaker, speaker_role=role, reply=reply)
@@ -93,7 +96,9 @@ class OwnerSelfStatementIsVerified(_Base):
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["trust"], "verified")
                 self.assertNotEqual(rows[0]["kind"], "claim")  # the 「推断·未核实」 header keys on kind=claim too
-                got = st.recall("nell", "private", "奈尔，还记得我对什么过敏、生日是哪天吗？", channel="private:nell", now=DAY2_20)
+                # the new recall matches on content words: ask about what the row is about
+                ask = "奈尔，还记得我对什么过敏吗？" if "花生" in text else "奈尔，还记得我的生日是哪天吗？"
+                got = st.recall("nell", "private", ask, channel="private:nell", now=DAY2_20)
                 self.assertNotIn("未核实", got)
                 self.assertIn("花生" if "花生" in text else "3月14日", got)
 
@@ -120,18 +125,28 @@ class OwnerSelfStatementIsVerified(_Base):
         self.assert_downgraded("nell", got, "房主对花生过敏")
 
 
-class MannerWordsAreNotContent(unittest.TestCase):
-    def test_support_check_directly(self) -> None:
+class MannerWordsAreNotContent(_Base):
+    """The old tests called the helper `_owner_lines_support` directly; it is no longer importable. The same rule is
+    checked through the store: a text the owner's line backs comes out verified, one it does not back is downgraded."""
+
+    def backed(self, text: str, line: str, kind: str = "event", at: float = DAY1_14) -> bool:
+        st, rows = self.private("yuki", line, text, kind, at)
+        self.assertEqual(len(rows), 1, text)
+        return rows[0]["trust"] == "verified"
+
+    def test_support_check_through_the_store(self) -> None:
         for text in (
             "房主私下告诉由纪，计划于2026年12月辞职开咖啡店，并要求保密。",
             "房主悄悄告诉由纪一个秘密：打算辞职开咖啡店，千万不要告诉别人。",
             "房主偷偷打算辞职去开咖啡店，叮嘱由纪保守秘密",
         ):
             with self.subTest(text=text):
-                self.assertTrue(_owner_lines_support(text, [YUKI_LINE], ["yuki", "由纪"], ["2026年11月21日"]))
+                self.assertTrue(self.backed(text, YUKI_LINE), text)
 
     def test_manner_words_alone_back_nothing(self) -> None:
         line = YUKI_LINE.replace("下个月", "下个月〔即2026年12月〕")
+        # positive control: the same line does back the content when the content is what the owner said
+        self.assertTrue(self.backed("房主私下告诉由纪，计划于2026年12月辞职开咖啡店，并要求保密。", line))
         for text in (
             "房主私下告诉由纪一个秘密，并要求保密。",
             "房主悄悄告诉由纪，千万别告诉别人。",
@@ -140,13 +155,40 @@ class MannerWordsAreNotContent(unittest.TestCase):
             "房主私下告诉由纪，计划于2026年10月辞职开咖啡店，并要求保密。",  # 「下个月」 is December, not October
         ):
             with self.subTest(text=text):
-                self.assertFalse(_owner_lines_support(text, [line], ["yuki", "由纪"], ["2026年11月21日"]), text)
+                self.assertFalse(self.backed(text, line), text)
 
     def test_negation_in_a_confidentiality_request_does_not_flip_the_content(self) -> None:
         # 「不要告诉别人」 contains 「不」, but it is a request, not a denial of the content
-        self.assertTrue(_owner_lines_support("房主打算辞职开咖啡店，并叮嘱保密不要告诉别人", [YUKI_LINE], ["由纪"], []))
+        self.assertTrue(self.backed("房主打算辞职开咖啡店，并叮嘱保密不要告诉别人", YUKI_LINE, kind="fact"))
         # genuinely negated content still needs a negated owner clause
-        self.assertFalse(_owner_lines_support("房主不打算辞职开咖啡店，并要求保密", [YUKI_LINE], ["由纪"], []))
+        self.assertFalse(self.backed("房主不打算辞职开咖啡店，并要求保密", YUKI_LINE, kind="fact"))
+
+
+class TrustSwitch(_Base):
+    def test_default_is_off_no_labels_and_claims_read_as_plain_memories(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        op = {"op": "add", "kind": "claim", "text": "2026年11月21日，房主说自己对虾过敏。", "about": ["房主"], "src": [1]}
+        st = MemoryStore(tmp.name, clock=VirtualClock(DAY1_9), names=NAMES, llm_fn=lambda _s, _u: {"ops": [op]},
+                         env={})
+        self.addCleanup(st.close)
+        st.observe("nell", "private", "我对虾过敏，你记一下哦。", speaker="房主", speaker_role="owner")
+        res = st.extract("nell", scope="private", force=True)
+        self.assertEqual(res["added"], 1)
+        rows = st.list_entries("nell", "private")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "fact")  # claim is not a kind while the switch is off
+        self.assertNotIn(rows[0]["trust"], ("group_stated", "hearsay"))
+        got = st.recall("nell", "private", "奈尔，还记得我对什么过敏吗？", channel="private:nell", now=DAY2_20)
+        self.assertIn("虾", got)  # positive control: it is found
+        self.assertNotIn("未核实", got)
+        self.assertNotIn("推断", got)
+
+    def test_switch_on_labels_an_unbacked_claim(self) -> None:
+        # same scenario as above with the switch on: the label appears
+        st, rows = self.private("nell", "我对虾过敏，你记一下哦。", "2026年11月21日，房主说自己对坚果过敏。", "claim", DAY1_9)
+        self.assertEqual(rows[0]["trust"], "group_stated")
+        self.assertIn("推断·未核实", st.recall("nell", "private", "奈尔，还记得我对什么过敏吗？", channel="private:nell", now=DAY2_20))
 
 
 class ContentThatDoesNotMatchIsStillDowngraded(_Base):
@@ -210,11 +252,14 @@ class OnlyTheOwnersOwnWordsAboutHimselfAreUpgraded(_Base):
         op = {"op": "add", "kind": "claim", "text": "房主对花生过敏", "about": ["房主"], "src": [2]}
         st, rows, res = self.extract_rows("nell", [owner_line], op, at=DAY1_9)
         self.assertEqual((res["added"], res["rejected"], rows), (0, 1, []))
-        # citing the owner line that does not say it only yields a downgraded claim
-        # (the extractor also refuses a new entity that only the resident's own reply introduced)
+        # citing the owner line that does not say it: the extractor refuses a new entity that only the resident's own
+        # reply introduced (before: it was kept as a downgraded claim; no verified row either way)
         op["src"] = [1]
         st, rows, res = self.extract_rows("nell", [owner_line], op, at=DAY1_9)
-        self.assertEqual([r for r in rows if r["trust"] == "verified"], [])
+        self.assertEqual((res["added"], res["rejected"], rows), (0, 1, []))
+        # positive control: when the owner's own line says it, the same text is stored and verified
+        st, rows, res = self.extract_rows("nell", [("我对花生过敏", "房主", "owner", "你是不是对花生过敏呀")], op, at=DAY1_9)
+        self.assertEqual((res["added"], [r["trust"] for r in rows]), (1, ["verified"]))
 
     def test_hearsay_about_a_third_party_is_not_verified(self) -> None:
         st, rows = self.private("nell", "小林说他对花生过敏", "小林对花生过敏", "claim", DAY1_9, about=("小林",))
@@ -251,7 +296,7 @@ class RementionUpgradePath(unittest.TestCase):
     def _store(self, embed: Any) -> MemoryStore:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        st = MemoryStore(tmp.name, names=NAMES, embed_plugin=embed)
+        st = MemoryStore(tmp.name, names=NAMES, embed_plugin=embed, env=TRUST_ENV)
         self.addCleanup(st.close)
         st.add("nell", "private", "2026年11月21日，房主说自己对花生过敏。", channel="private:nell", about=["房主"],
                kind="claim", trust="group_stated", source="auto", now=DAY1_9)

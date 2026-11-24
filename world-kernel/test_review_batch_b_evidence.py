@@ -1,4 +1,8 @@
-"""PR-B tests: group owner-evidence binding, conflict suppression, v3 migration & commitment rigor (B1-B6)."""
+"""PR-B tests: group owner-evidence binding, conflict suppression & commitment rigor (B1, B2, B4-B6).
+
+The old B3 (schema v3 migration of the old memory.db) is gone with that schema. The trust levels in B1/B2 are the
+shared module's, which are off unless `AI_HOUSE_MEMORY_TRUST=1`.
+"""
 from __future__ import annotations
 
 import contextlib
@@ -20,7 +24,7 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
 
 from ai_house.chat_identity import owner_speaker  # noqa: E402
 from ai_house.daemon import HouseDaemon, JST  # noqa: E402
-from ai_house.memory import MemoryStore, SCHEMA_VERSION  # noqa: E402
+from ai_house.memory import MemoryStore  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
 
 
@@ -94,12 +98,13 @@ class _MockDurianPromiseServer:
 
 
 class ReviewBatchBEvidenceTests(unittest.TestCase):
-    def _make_memory(self, llm_fn=None) -> Tuple[Path, MemoryStore, VirtualClock]:
+    def _make_memory(self, llm_fn=None, env=None) -> Tuple[Path, MemoryStore, VirtualClock]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         t0 = dt.datetime(2026, 11, 22, 12, 0, tzinfo=JST).timestamp()
         clock = VirtualClock(t0)
-        st = MemoryStore(tmp.name, clock=clock, names={"sora": "苍空", "rin": "凛音"}, llm_fn=llm_fn)
+        st = MemoryStore(tmp.name, clock=clock, names={"sora": "苍空", "rin": "凛音"}, llm_fn=llm_fn,
+                         env={"AI_HOUSE_MEMORY_TRUST": "1", **(env or {})})
         self.addCleanup(st.close)
         return Path(tmp.name), st, clock
 
@@ -113,10 +118,17 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
                         "text": "苍空讨厌吃胡萝卜",
                         "kind": "preference",
                     },
-                    # 2) Cites owner line L1 in src, but steals member-only claim "胡萝卜" -> must downgrade!
+                    # 2a) Cites owner line L1 in src, but steals member-only claim "胡萝卜" -> must downgrade!
                     {
                         "op": "add",
                         "text": "房主出门时听说苍空讨厌吃胡萝卜",
+                        "kind": "fact",
+                        "src": [1],
+                    },
+                    # 2b) Same, with more of L1's own words around the stolen claim -> must downgrade too!
+                    {
+                        "op": "add",
+                        "text": "房主明天要去京都出差，苍空讨厌吃胡萝卜",
                         "kind": "fact",
                         "src": [1],
                     },
@@ -140,15 +152,19 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
         st.observe("sora", "group", "我明天要去京都出差啦", channel="group", speaker="房主", speaker_role="owner")
         st.observe("sora", "group", "顺便说苍空好像讨厌吃胡萝卜", channel="group", speaker="群友甲", speaker_role="member")
         res = st.extract("sora", scope="group", channel="group", force=True)
-        self.assertEqual(res["added"], 3)
+        self.assertEqual(res["added"], 4)
         self.assertEqual(res["rejected"], 1)
 
         rows = st.list_entries("sora", "group", channel="group")
         by_text = {r["text"]: r for r in rows}
+        self.assertEqual(len(rows), 4)
+        self.assertNotIn("以后群里禁止提胡萝卜", by_text)
         self.assertEqual(by_text["苍空讨厌吃胡萝卜"]["kind"], "claim")
         self.assertEqual(by_text["苍空讨厌吃胡萝卜"]["trust"], "group_stated")
         self.assertEqual(by_text["房主出门时听说苍空讨厌吃胡萝卜"]["kind"], "claim")
         self.assertEqual(by_text["房主出门时听说苍空讨厌吃胡萝卜"]["trust"], "group_stated")
+        self.assertEqual(by_text["房主明天要去京都出差，苍空讨厌吃胡萝卜"]["kind"], "claim")
+        self.assertEqual(by_text["房主明天要去京都出差，苍空讨厌吃胡萝卜"]["trust"], "group_stated")
         self.assertEqual(by_text["房主明天要去京都出差"]["kind"], "fact")
         self.assertEqual(by_text["房主明天要去京都出差"]["trust"], "verified")
         self.assertEqual(by_text["房主明天要去京都出差"]["source"], "auto:owner_verified")
@@ -190,56 +206,12 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
         self.assertEqual(ranked[1][1]["trust"], "group_stated")
         self.assertTrue(ranked[1][1].get("_conflict_verified"))
         self.assertGreater(ranked[0][0], ranked[1][0] * 1.5)
-        self.assertIn("群聊未核实传言·与已知事实冲突，勿采信", st._format_row(ranked[1][1]))
 
         # Default recall surfaces verified fact and keeps conflicting claim out or warning-tagged below
         recalled = st.recall("sora", "group", "房主能吃海鲜虾仁吗", channel="group", now=fresh_ts)
         self.assertIn("严重过敏", recalled)
-
-    def test_b3_schema_v3_migration_demotes_legacy_polluted_group_facts(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        db_dir = Path(tmp.name)
-        db_path = db_dir / "memory.db"
-
-        # Seed a legacy v2 store and manually insert polluted rows as pre-fix v2 would have
-        t0 = dt.datetime(2026, 11, 22, 12, 0, tzinfo=JST).timestamp()
-        with contextlib.closing(sqlite3.connect(db_path)) as c:
-            from ai_house.memory import BASE_INDEXES_SQL, BASE_TABLES_SQL
-
-            c.executescript(BASE_TABLES_SQL + BASE_INDEXES_SQL)
-            c.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?)", (t0,))
-            c.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)", (t0,))
-            c.execute(
-                "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                "VALUES('sora', 'group', 'group', 'fact', 'verified', '群友乱猜房主喜欢香菜', 'auto', 'active', ?, ?)",
-                (t0, t0),
-            )
-            c.execute(
-                "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                "VALUES('sora', 'group', 'group', 'fact', 'verified', '房主确认喜欢黑咖啡', 'owner_verified', 'active', ?, ?)",
-                (t0, t0),
-            )
-            c.execute(
-                "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                "VALUES('sora', 'world', 'world', 'diary', 'verified', '今天的日记内容很好', 'diary', 'active', ?, ?)",
-                (t0, t0),
-            )
-            c.commit()
-
-        st = MemoryStore(db_dir, clock=VirtualClock(t0 + 10))
-        self.addCleanup(st.close)
-        with contextlib.closing(sqlite3.connect(db_path)) as c:
-            c.row_factory = sqlite3.Row
-            max_ver = c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            self.assertEqual(max_ver, SCHEMA_VERSION)
-            rows = {r["text"]: dict(r) for r in c.execute("SELECT * FROM mem").fetchall()}
-        self.assertEqual(rows["群友乱猜房主喜欢香菜"]["kind"], "claim")
-        self.assertEqual(rows["群友乱猜房主喜欢香菜"]["trust"], "group_stated")
-        self.assertEqual(rows["房主确认喜欢黑咖啡"]["kind"], "fact")
-        self.assertEqual(rows["房主确认喜欢黑咖啡"]["trust"], "verified")
-        self.assertEqual(rows["今天的日记内容很好"]["kind"], "diary")
-        self.assertEqual(rows["今天的日记内容很好"]["trust"], "verified")
+        # the conflicting claim is found by search above, but its pushed-down score keeps it out of the recall block
+        self.assertNotIn("麻辣大虾", recalled)
 
     def test_b4_out_of_catalog_errand_stays_open_and_ignores_unrelated_purchases(self) -> None:
         srv = _MockDurianPromiseServer()

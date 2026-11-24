@@ -1,10 +1,12 @@
-"""M1: three decisions of 2026-11-24 made in the shared memory file (src/ai_house/common/UPSTREAM.md lists them).
+"""M1: decisions of 2026-11-24 made in the shared memory file (src/ai_house/common/UPSTREAM.md lists them).
 
 N1  from the owner's private chat a public row cannot be changed, her own rows of any scope can be forgotten, only her
     private rows can be reworded (tools and extractor); a group may change what it could before.
 N5  a question that asks if she remembers but names nothing to look for (or, in a group, says it was told in private)
     and finds nothing gets the latest few private memories and private lines she may see here (MEMORY_VAGUE_FALLBACK).
 N10 the note about private rows comes only when the block shows something private.
+Also: a private line not yet tidied into a memory carries, in a leak-free chat, the same leave as the note for stored
+private memories; and the outbound check reads a reply once more with everything between its characters taken out.
 """
 
 import tempfile
@@ -203,3 +205,44 @@ class PrivateNoteTests(Case):
         self.assertIn("垃圾", got)
         self.assertIn("房主私聊·私密", got)
         self.assertIn("标着·私密的是", got)
+
+    def test_a_private_line_says_keep_quiet_only_where_the_chat_is_checked(self):
+        self.m.observe("nia", OWNER, [OWNER_LINE])
+        patcher = patch.object(self.m, "RECENT_KEYWORD", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ask = ["[路人|42] (message_id=8): 房主说要搬去海边的小镇吗"]
+        hushed = self.m.recall("nia", GROUP, ask)
+        self.assertIn("海边", hushed)
+        self.assertIn("房主私聊·私密：你知道，但别在群里说出来", hushed)
+        self.m.LEAK_FREE_CHATS = {OTHER_GROUP}
+        free = self.m.recall("nia", OTHER_GROUP, ask)
+        self.assertIn("海边", free)
+        self.assertIn("房主私聊·私密：这里是小屋自己的群，想提可以自然地提", free)
+        self.assertNotIn("别在群里说出来", free)
+        self.assertIn("别在群里说出来", self.m.recall("nia", GROUP, ask))  # the other group is still told to keep quiet
+
+
+class SpacedOutLeakTests(Case):
+    SAID = "房主下个月要辞职去开一家咖啡店哦"
+
+    def setUp(self):
+        super().setUp()
+        self.private, _ = self.m.add("nia", OWNER, PLAN, kind="event")
+
+    def test_separators_between_the_characters_do_not_get_a_repeat_through(self):
+        self.assertEqual(self.m.leak("nia", GROUP, self.SAID), [self.private])  # the plain repeat is stopped
+        for between in (" ", ".", " - ", "_", "\u3000", "\n"):
+            with self.subTest(between=between):
+                self.assertEqual(self.m.leak("nia", GROUP, between.join(self.SAID)), [self.private])
+
+    def test_spacing_does_not_turn_other_words_into_a_repeat(self):
+        for said in ("今天晚上大家要不要一起去看电影", "咖啡店新出的蛋糕还不错"):
+            with self.subTest(said=said):
+                self.assertEqual(self.m.leak("nia", GROUP, said), [])
+                self.assertEqual(self.m.leak("nia", GROUP, " ".join(said)), [])
+
+    def test_latin_words_are_still_compared_word_by_word(self):
+        row, _ = self.m.add("nia", OWNER, "the owner keeps a spare key under the blue flowerpot", kind="fact")
+        self.assertEqual(self.m.leak("nia", GROUP, "she keeps a spare key under the blue flowerpot"), [row])
+        self.assertEqual(self.m.leak("nia", GROUP, "the weather is lovely and the tea is warm today"), [])

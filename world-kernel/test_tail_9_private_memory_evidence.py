@@ -1,4 +1,7 @@
-"""Tail 9: in private scope an extracted item is `verified` only if the cited owner line(s) actually support it."""
+"""Tail 9: in private scope an extracted item is `verified` only if the cited owner line(s) actually support it.
+
+The check belongs to trust levels, which are off by default: every store here is made with `AI_HOUSE_MEMORY_TRUST=1`.
+"""
 from __future__ import annotations
 
 import datetime as dt
@@ -13,8 +16,11 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.memory import JST, MemoryStore  # noqa: E402
+from ai_house.memory_common import CommonMemoryStore as MemoryStore  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
+
+JST = dt.timezone(dt.timedelta(hours=9))
+TRUST_ON = {"AI_HOUSE_MEMORY_TRUST": "1"}  # the evidence check on what an extraction may store is part of trust levels
 
 
 class PrivateMemoryEvidenceTests(unittest.TestCase):
@@ -27,6 +33,7 @@ class PrivateMemoryEvidenceTests(unittest.TestCase):
             clock=clock,
             names={"elsa": "艾莎"},
             llm_fn=lambda _s, _u: {"ops": [op]},
+            env=TRUST_ON,
             extract_every_s=60,
             extract_batch=10,
         )
@@ -108,13 +115,21 @@ class PrivateMemoryEvidenceTests(unittest.TestCase):
             reply="那你是不是对海鲜过敏呀",
         )
         self.assertEqual((res["added"], res["rejected"], rows), (0, 1, []))
+        # control: the same text citing the owner's own line is stored
+        _st, res, rows = self._run_private(
+            ["我对海鲜过敏"],
+            {"op": "add", "kind": "fact", "text": "房主对海鲜过敏", "src": [1]},
+            reply="那你是不是对海鲜过敏呀",
+        )
+        self.assertEqual((res["added"], res["rejected"], len(rows)), (1, 0, 1))
 
     def test_group_scope_is_unchanged(self) -> None:
         def make(op: Dict[str, Any]) -> MemoryStore:
             tmp = tempfile.TemporaryDirectory()
             self.addCleanup(tmp.cleanup)
             clock = VirtualClock(dt.datetime(2026, 11, 22, 12, 0, tzinfo=JST).timestamp())
-            st = MemoryStore(tmp.name, clock=clock, llm_fn=lambda _s, _u: {"ops": [op]}, extract_every_s=60, extract_batch=10)
+            st = MemoryStore(tmp.name, clock=clock, llm_fn=lambda _s, _u: {"ops": [op]}, env=TRUST_ON,
+                             extract_every_s=60, extract_batch=10)
             self.addCleanup(st.close)
             return st
 

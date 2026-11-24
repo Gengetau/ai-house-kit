@@ -180,7 +180,8 @@ class P3P6UnitTests(unittest.TestCase):
         }
         d = HouseDaemon(runtime_dir=Path(tmp) / "rt_live", virtual_clock=True, env=env)
         self.addCleanup(d.close)
-        d.memory.add("nell", "private", "房主的私人银行卡密码提示（不能泄露）", kind="fact", source="chat")
+        # changed: the memory text is not password-like (the stricter secret filter refuses those)
+        d.memory.add("nell", "private", "房主的私人保险柜位置是个秘密（不能泄露）", kind="fact", source="chat")
         res = d.send_chat("private:nell", "帮我看看冰箱，顺便记住一会儿去买2个鸡蛋")
         rep = res["replies"][0]
         self.assertEqual(rep["mode"], "live_api")
@@ -204,7 +205,9 @@ class P3P6UnitTests(unittest.TestCase):
             if m.get("role") == "tool" and m.get("tool_call_id") == "tc_2"
         ]
         self.assertTrue(tool_payloads)
-        self.assertNotIn("银行卡", tool_payloads[-1])
+        # positive control: the same memory is found by the same tool call in the private chat
+        self.assertIn("保险柜", tool_payloads[0])
+        self.assertNotIn("保险柜", tool_payloads[-1])
 
     def test_converse_does_not_block_get_state_while_llm_stalls(self):
         entered = threading.Event()
@@ -273,6 +276,9 @@ class P3P6UnitTests(unittest.TestCase):
         d = HouseDaemon(runtime_dir=Path(tmp) / "rt", virtual_clock=True, start_ts=start, env={})
         self.addCleanup(d.close)
         d.send_chat("private:nell", "我的备用钥匙藏在庭院蓝花盆底下，千万别对别人提")
+        # changed: the private line only becomes a memory through extraction (scripted model); used as positive control below
+        d.memory.extract("nell", force=True, now=start + 60, llm_fn=lambda sys_p, usr_p: {"ops": [{
+            "op": "add", "text": "房主的备用钥匙藏在庭院蓝花盆底下，不想让别人知道", "about": ["房主"], "kind": "fact"}]})
         # Advance slightly through daytime so FakeLifeModel creates real daylog/script entries
         d.fast_forward(60)
         d.fast_forward(60)
@@ -288,8 +294,12 @@ class P3P6UnitTests(unittest.TestCase):
             self.assertNotIn("蓝花盆", item["text"])
             self.assertNotIn("备用钥匙", item["text"])
 
-        recalled = d.memory.recall("nell", "world", "昨晚日记写了什么", now=night_ts + 3600)
-        self.assertIn("日记", recalled)
+        # changed: recall matches on content words (no vector service), so the question must share them with the
+        # diary; "昨晚日记写了什么" shares only one bigram with it and finds nothing
+        recalled = d.memory.recall("nell", "world", "日记写了什么", now=night_ts + 3600)
+        self.assertIn("日记：早上", recalled)
+        # positive control for the isolation checks above: the private line itself IS recalled in the private chat
+        self.assertIn("蓝花盆", d.memory.recall("nell", "private", "备用钥匙藏在哪里", now=night_ts + 3600))
 
     def test_new_http_endpoints_and_token_tiers(self):
         tmp_dir = tempfile.TemporaryDirectory()
@@ -305,7 +315,9 @@ class P3P6UnitTests(unittest.TestCase):
         self.addCleanup(d.close)
         d.send_chat("private:nell", "记住今天帮买2个鸡蛋，还有我的秘密配方是两勺蜂蜜")
         d.memory.add("nell", "private", "房主的秘密配方是两勺蜂蜜", kind="fact", source="chat", now=start)
-        d.memory.add("nell", "world", "今天去图书馆翻到了气象手记", kind="diary", source="diary", now=start)
+        # changed: a diary must be long enough
+        d.memory.add("nell", "world", "今天去图书馆翻到了一本气象手记，下午在窗边读了很久，晚上把有趣的几页抄在了本子上。",
+                     kind="diary", source="diary", now=start)
         d.step_once()
 
         srv = make_http_server(d, host="127.0.0.1", port=0)
@@ -353,6 +365,7 @@ class P3P6UnitTests(unittest.TestCase):
         priv_mems = [m for m in doc["memories"] if "蜂蜜" in m["text"]]
         self.assertTrue(priv_mems)
         mid = priv_mems[0]["id"]
+        self.assertIn("蜂蜜", d.memory.recall("nell", "private", "蜂蜜", now=start + 10))  # positive control
 
         st, _ = req("POST", "/api/memories/forget", {"actor": "nell", "scope": "private", "id": mid}, token=READER)
         self.assertEqual(st, 403)

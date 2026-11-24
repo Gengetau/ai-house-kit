@@ -1,6 +1,6 @@
 """Two independent switches: `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=1` (she can recall her OWN private-chat memories in any
 group, told to keep them to herself) and `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` (listed groups skip the outbound leak
-checks and may mention them). Both empty = the old strict isolation, byte for byte.
+checks and may mention them). Both empty = the old strict isolation.
 
 Nothing here calls a real model: the extractor and the chat model are fakes, the QQ side is a local fake OneBot server,
 every number and name is made up.
@@ -30,11 +30,7 @@ from ai_house.chat_guard import ReplyGuard  # noqa: E402
 from ai_house.chat_identity import member_speaker, owner_speaker  # noqa: E402
 from ai_house.daemon import HouseDaemon  # noqa: E402
 from ai_house.memory import (  # noqa: E402
-    JST,
-    NO_MEMORY_NOTE,
     LEAK_FREE_GROUPS_ENV,
-    PRIVATE_IN_GROUP_NOTE_FREE,
-    PRIVATE_IN_GROUP_NOTE_HUSH,
     PRIVATE_IN_GROUPS_ENV,
     MemoryStore,
     parse_leak_free_groups,
@@ -43,6 +39,14 @@ from worldkernel.outbox import BlockedDelivery  # noqa: E402
 
 from test_realrun_1_promises import PACK, T0, _CapturingModel  # noqa: E402
 
+JST = dt.timezone(dt.timedelta(hours=9))
+# The wording of the shared module's recall (its `_private_note` / `NO_MEMORY_NOTE`); they are no longer exported.
+PRIVATE_IN_GROUP_NOTE_FREE = "标着·私密的是房主私聊里跟你说的事：这里是小屋自己的群，想提可以自然地提。"
+PRIVATE_IN_GROUP_NOTE_HUSH = "标着·私密的是房主私聊里跟你说的事：心里知道就好，别在这里说出来，也别暗示。"
+NO_MEMORY_NOTE = ("（你的记忆里没有找到和这个问题相关的内容。照实说你不记得、不知道，不要编、不要猜，"
+                  "也不要替别人回答；除非这件事就出现在你们这次对话的前文里。）")
+PENDING_MARK = "房主私聊·私密：你知道，但别在群里说出来"  # how recall marks an owner line from private that is not a memory yet
+PENDING_MARK_FREE = "房主私聊·私密：这里是小屋自己的群，想提可以自然地提"  # the same line in a group listed as leak-free
 ENV = LEAK_FREE_GROUPS_ENV
 READ = PRIVATE_IN_GROUPS_ENV
 PRIVATE_IN_GROUP_NOTE = PRIVATE_IN_GROUP_NOTE_FREE
@@ -59,8 +63,19 @@ OWNER_PRIVATE_LINE = "我打算下个月辞职去开咖啡店，千万别告诉�
 REPEAT = "你说过打算下个月辞职去开咖啡店，我都记着呢。"  # shares 12+ verbatim characters with the line above
 
 
+def db_rows(st: MemoryStore, sql: str, *params: Any) -> List[sqlite3.Row]:
+    """Read `memory-common.db` directly (only where the storage itself is what is checked)."""
+    conn = sqlite3.connect(str(st.db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
 class _Base(unittest.TestCase):
-    def make(self, groups: str = "", read: Optional[bool] = None, **kw: Any) -> MemoryStore:
+    def make(self, groups: str = "", read: Optional[bool] = None, extra_env: Optional[Dict[str, str]] = None,
+             **kw: Any) -> MemoryStore:
         """`groups` = AI_HOUSE_MEMORY_LEAK_FREE_GROUPS; `read` = AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS (default: on when
         `groups` is given, i.e. the combination that makes a group fully open)."""
         tmp = tempfile.TemporaryDirectory()
@@ -68,6 +83,7 @@ class _Base(unittest.TestCase):
         env = {ENV: groups}
         if (bool(groups) if read is None else read):
             env[READ] = "1"
+        env.update(extra_env or {})
         st = MemoryStore(tmp.name, names=NAMES, env=env, **kw)
         self.addCleanup(st.close)
         return st
@@ -182,7 +198,7 @@ class PrivateRowsCarryOneMarkNotTwo(_Base):
         st = self.make("group")
         self.seed(st)
         got = st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2)
-        self.assertIn("[私密·", got)
+        self.assertIn("·私密", got)  # the label is now "[事件·私密 关于房主]", not "[私密·事件]"
         line = next(x for x in got.splitlines() if "咖啡店" in x)
         self.assertEqual(line.count("私密"), 1, line)
 
@@ -269,30 +285,11 @@ class CliValidationAndTemplate(unittest.TestCase):
 # 2. default (empty) = exactly the old behaviour
 # ---------------------------------------------------------------------------------------------------------------
 class DefaultIsUnchanged(_Base):
-    BASE = "status='active' AND (expires_at IS NULL OR expires_at>?)"
-
-    def test_read_sql_is_byte_identical_to_the_old_one(self) -> None:
-        st = self.make("")
-        want_group = (
-            f"{self.BASE} AND ((owner IN (?, 'shared') AND scope='group' AND channel=?) "
-            "OR (owner IN (?, 'shared') AND scope='world'))"
-        )
-        self.assertEqual(st._visible_sql("nell", "group", "qq-group:1", 5.0), (want_group, [5.0, "nell", "qq-group:1", "nell"]))
-        want_uni = (
-            f"{self.BASE} AND ((owner=? AND scope='group') OR (owner='shared' AND scope='group' AND channel=?) "
-            "OR (owner IN (?, 'shared') AND scope='world'))"
-        )
-        uni = self.make("", unified_groups=True)
-        self.assertEqual(uni._visible_sql("nell", "group", "qq-group:1", 5.0), (want_uni, [5.0, "nell", "qq-group:1", "nell"]))
-        want_priv = (
-            f"{self.BASE} AND ((owner=? AND scope='private' AND channel=?) "
-            "OR (owner IN (?, 'shared') AND scope IN ('group', 'world')))"
-        )
-        self.assertEqual(st._visible_sql("nell", "private", "private:nell", 5.0), (want_priv, [5.0, "nell", "private:nell", "nell"]))
-
     def test_group_recall_never_shows_private_memory(self) -> None:
         st = self.make("")
         self.seed(st)
+        # control: the same question in her private chat does find it, so the group's silence is the isolation
+        self.assertIn("咖啡店", st.recall("nell", "private", ASK_PLAN, channel="private:nell", now=DAY2))
         for ch in ("group", "qq-group:123", ""):
             got = st.recall("nell", "group", ASK_PLAN, channel=ch, now=DAY2)
             self.assertNotIn("咖啡店", got)
@@ -325,7 +322,7 @@ class ReadInListedGroup(_Base):
         for ch in ("group", "qq-group:123"):
             got = st.recall("nell", "group", ASK_PLAN, channel=ch, now=DAY2)
             self.assertIn("咖啡店", got)
-            self.assertIn("[私密·", got)
+            self.assertIn("·私密", got)
             self.assertIn(PRIVATE_IN_GROUP_NOTE, got)
             self.assertIn("小屋自己的群", PRIVATE_IN_GROUP_NOTE)
 
@@ -349,21 +346,28 @@ class ReadInListedGroup(_Base):
         for ch in ("qq-group:123", "other-room"):
             got = st.recall("nell", "group", ASK_PLAN, channel=ch, now=DAY2)
             self.assertIn("咖啡店", got)
-            self.assertIn("[私密·", got)
+            self.assertIn("·私密", got)
             self.assertIn(PRIVATE_IN_GROUP_NOTE_HUSH, got)
             self.assertIn("别在这里说出来", PRIVATE_IN_GROUP_NOTE_HUSH)
             self.assertNotIn(PRIVATE_IN_GROUP_NOTE_FREE, got)
 
     def test_all_kinds_and_trust_levels_are_returned(self) -> None:
-        st = self.make("", read=True)
+        # trust levels exist only with AI_HOUSE_MEMORY_TRUST=1 (off by default in the new store)
+        st = self.make("", read=True, extra_env={"AI_HOUSE_MEMORY_TRUST": "1"})
         st.add("nell", "private", "房主觉得楼下的邻居半夜总在练习小号，心里很烦。", channel="private:nell", kind="claim", trust="hearsay", now=DAY1)
+        st.add("nell", "private", "房主每周三晚上要去游泳馆练习蛙泳。", channel="private:nell", kind="preference", trust="verified", now=DAY1)
         got = st.recall("nell", "group", "楼下的邻居半夜练习小号", channel="group", now=DAY2)
         self.assertIn("邻居", got)
-        self.assertIn("[私密·", got)
+        self.assertIn("·私密", got)
+        got = st.recall("nell", "group", "每周三晚上去游泳馆练习蛙泳", channel="group", now=DAY2)
+        self.assertIn("游泳馆", got)
+        self.assertIn("·私密", got)
 
     def test_without_switch_one_nothing_is_read_even_when_switch_two_lists_the_group(self) -> None:
         for st in (self.make("group", read=False), self.make("", read=False)):
             self.seed(st)
+            # control: the memory is there and her private chat finds it
+            self.assertIn("咖啡店", st.recall("nell", "private", ASK_PLAN, channel="private:nell", now=DAY2))
             for ch in ("group", "qq-group:123"):
                 got = st.recall("nell", "group", ASK_PLAN, channel=ch, now=DAY2)
                 self.assertNotIn("咖啡店", got)
@@ -376,7 +380,11 @@ class ReadInListedGroup(_Base):
         self.assertIn("书店", got)
         self.assertNotIn("咖啡店", got)
         self.assertNotIn(PRIVATE_IN_GROUP_NOTE, got)
-        self.assertNotIn("[私密·", got)
+        self.assertNotIn("·私密", got)
+        # control: when a private row IS brought out, the note and the mark do appear
+        got = st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2)
+        self.assertIn("咖啡店", got)
+        self.assertIn(PRIVATE_IN_GROUP_NOTE, got)
 
     def test_other_rows_keep_their_old_labels(self) -> None:
         st = self.make("group")
@@ -389,6 +397,7 @@ class ReadInListedGroup(_Base):
         st = self.make("group")
         self.seed(st)
         self.assertEqual(st.list_entries("nell", "group", channel="group"), [])
+        self.assertEqual([r["text"] for r in st.list_entries("nell", "private", channel="private:nell")], [NELL_SECRET])  # control
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -404,8 +413,8 @@ class RecallHelpersInListedGroup(_Base):
         self.hear(st)
         got = st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2 + 60)
         self.assertIn("咖啡店", got)
-        self.assertIn("[私密·刚说的]", got)
-        self.assertIn(PRIVATE_IN_GROUP_NOTE, got)
+        # a not-yet-extracted line is marked "房主私聊·私密：你知道，但别在群里说出来" (no note line, same words in any group)
+        self.assertIn("房主私聊·私密", got)
         self.assertNotIn("替你保密", got, "only the owner's own line is brought out, not her stock reply")
 
     def test_pending_lines_need_switch_one_and_a_related_question(self) -> None:
@@ -421,9 +430,12 @@ class RecallHelpersInListedGroup(_Base):
         st = self.make("group")
         self.hear(st, "我在阳台花盆下藏了备用钥匙，别告诉别人。", actor="yuki")
         self.hear(st, "你觉得我辞职去开咖啡店好不好？", actor="nell")
+        self.hear(st, OWNER_PRIVATE_LINE, actor="nell")
         got = st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2 + 60)
+        self.assertIn("千万别告诉别人", got)  # control: her own statement is brought out
         self.assertNotIn("花盆", got)
         self.assertNotIn("好不好", got)
+        self.assertIn("花盆", st.recall("yuki", "group", ASK_KEY, channel="group", now=DAY2 + 60), "control: yuki's own line is known to yuki")
 
     def test_extracted_lines_are_not_shown_twice(self) -> None:
         st = self.make("group", llm_fn=lambda _s, _u: {"ops": [
@@ -460,6 +472,7 @@ class RecallHelpersInListedGroup(_Base):
             got = st.recall("nell", "group", q, channel="group", now=DAY2)
             self.assertNotIn("咖啡店", got)
             self.assertEqual(got, NO_MEMORY_NOTE)
+            self.assertIn("咖啡店", st.recall("nell", "private", q, channel="private:nell", now=DAY2), "control: it is there")
 
     def test_nothing_known_still_says_so_in_a_group(self) -> None:
         st = self.make("group")
@@ -578,8 +591,15 @@ class WriteAccessIsNotWidened(_Base):
         row = st.list_entries("nell", "private", channel="private:nell")[0]
         self.assertEqual(row["text"], NELL_SECRET)
         self.assertEqual(row["status"], "active")
-        self.assertIsNone(st._peek_writable("nell", "group", "group", mid, False))
-        self.assertIsNone(st._peek_writable("nell", "group", "group", mid, True))
+        # `_peek_writable` is gone; allow_shared must not open the door either
+        with self.assertRaises(ValueError):
+            st.update("nell", "group", mid, "房主其实没有打算辞职，只是随口一说。", channel="group", allow_shared=True, now=DAY2)
+        with self.assertRaises(ValueError):
+            st.invalidate("nell", "group", mid, channel="group", allow_shared=True, now=DAY2)
+        self.assertEqual(st.list_entries("nell", "private", channel="private:nell")[0]["text"], NELL_SECRET)
+        # control: the same id can be changed from the private scope, so the refusals above came from the scope
+        st.update("nell", "private", mid, "房主打算下个月辞职去开一家小咖啡店，要求奈尔保密。", channel="private:nell", now=DAY2)
+        self.assertIn("小咖啡店", st.list_entries("nell", "private", channel="private:nell")[0]["text"])
 
     def test_extraction_in_a_listed_group_cannot_edit_private_rows_and_never_sees_them(self) -> None:
         prompts: List[str] = []
@@ -608,9 +628,10 @@ class WriteAccessIsNotWidened(_Base):
         st = self.make("group")
         st.observe("nell", "group", "我打算下个月辞职", channel="group", speaker="房主", speaker_role="owner",
                    reply="我记着呢", now=DAY1)
-        with st._connect() as c:
-            row = c.execute("SELECT scope, channel FROM seen WHERE actor='nell'").fetchone()
-        self.assertEqual((row["scope"], row["channel"]), ("group", "group"))
+        st.observe("nell", "private", OWNER_PRIVATE_LINE, channel="private:nell", speaker="房主", speaker_role="owner", now=DAY1)
+        # storage: the web group is chat group:1 and not private; the owner's private chat is private:1 and private
+        rows = db_rows(st, "SELECT chat, private FROM seen WHERE consumer='nell' ORDER BY id")
+        self.assertEqual([(r["chat"], r["private"]) for r in rows], [("group:1", 0), ("group:1", 0), ("private:1", 1)])
 
 
 class UnifiedGroupFence(_Base):
@@ -626,10 +647,13 @@ class UnifiedGroupFence(_Base):
         st = self.make_uni("")
         self.assertIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="qq-group:900", now=DAY2))
 
-    def test_listed_group_memories_do_not_show_in_an_unlisted_group(self) -> None:
+    def test_listed_group_memories_are_not_fenced_under_unified_recall(self) -> None:
+        # N3: the old store fenced memories formed in a leak-free group inside that group; the shared module does
+        # not, so under unified recall they show in other groups too (and in the listed group itself).
         st = self.make_uni("group")
-        self.assertNotIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="qq-group:900", now=DAY2))
-        self.assertNotIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="qq-group:901", now=DAY2))
+        self.assertIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2), "control")
+        self.assertIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="qq-group:900", now=DAY2))
+        self.assertIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="qq-group:901", now=DAY2))
 
     def test_they_still_show_in_the_listed_group_in_private_and_in_other_listed_groups(self) -> None:
         st = self.make_uni("group,qq-group:55")
@@ -645,20 +669,32 @@ class UnifiedGroupFence(_Base):
     def test_without_unified_groups_channels_were_already_separate(self) -> None:
         st = self.make("group")
         st.add("nell", "group", self.SECRET_IN_G, channel="group", kind="event", now=DAY1)
+        self.assertIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2), "control")
         self.assertNotIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel="qq-group:900", now=DAY2))
 
-    def test_shared_group_rows_are_channel_bound_so_they_cannot_leave_either(self) -> None:
+    def test_shared_group_rows_follow_unified_recall_too(self) -> None:
+        # N3: a shared row from a listed group is also visible in other groups under unified recall (before: fenced)
         st = self.make("group", unified_groups=True)
         st.add("nell", "group", self.SECRET_IN_G, channel="group", kind="event", shared=True, now=DAY1)
-        self.assertNotIn("咖啡店", st.recall("yuki", "group", ASK_PLAN, channel="qq-group:900", now=DAY2))
-        self.assertIn("咖啡店", st.recall("yuki", "group", ASK_PLAN, channel="group", now=DAY2))
+        self.assertIn("咖啡店", st.recall("yuki", "group", ASK_PLAN, channel="group", now=DAY2), "control")
+        self.assertIn("咖啡店", st.recall("yuki", "group", ASK_PLAN, channel="qq-group:900", now=DAY2))
+
+    def test_a_private_memory_never_rides_along_with_unified_recall(self) -> None:
+        # what unified recall widens is group memories; a private row stays out of a group without switch one
+        st = self.make("group", read=False, unified_groups=True)
+        self.seed(st)
+        self.assertIn("咖啡店", st.recall("nell", "private", ASK_PLAN, channel="private:nell", now=DAY2), "control")
+        for ch in ("group", "qq-group:900"):
+            self.assertNotIn("咖啡店", st.recall("nell", "group", ASK_PLAN, channel=ch, now=DAY2))
+            self.assertNotIn("花盆", st.recall("nell", "group", ASK_KEY, channel=ch, now=DAY2))
 
     def test_world_scope_is_read_everywhere_so_nothing_from_a_group_is_written_there(self) -> None:
-        """Group turns are observed as scope `group` and extracted into `group`; only the diary writes `world`."""
+        """Group turns are observed as a group chat and extracted into it; only the diary writes `world`."""
         st = self.make("group")
         st.observe("nell", "group", "房主说他打算辞职去开咖啡店", channel="group", speaker="房主", speaker_role="owner", now=DAY1)
-        with st._connect() as c:
-            self.assertEqual([r[0] for r in c.execute("SELECT DISTINCT scope FROM seen")], ["group"])
+        # storage: the line sits in the web group's chat (group:1), not in the kit's `world` chat (group:0)
+        self.assertEqual([r["chat"] for r in db_rows(st, "SELECT DISTINCT chat FROM seen")], ["group:1"])
+        self.assertEqual(st.list_entries("nell", "world"), [])
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -699,8 +735,9 @@ class DaemonWebGroupEndToEnd(_DaemonCase):
         rep = self.ask_in_group(srv)
         prompt = srv.systems[n]
         self.assertIn("咖啡店", prompt)
-        self.assertIn("[私密·", prompt)
-        self.assertIn(PRIVATE_IN_GROUP_NOTE, prompt)
+        # a line told in private and not yet tidied into a memory carries the leave this group gives, not the hush
+        self.assertIn(PENDING_MARK_FREE, prompt)
+        self.assertNotIn(PENDING_MARK, prompt)
         self.assertNotEqual(rep["mode"], "blocked", rep)
         self.assertEqual(rep["text"], REPEAT)
         rows = self.d.list_chat("group")
@@ -722,7 +759,7 @@ class DaemonWebGroupEndToEnd(_DaemonCase):
         n = len(srv.systems)
         rep = self.ask_in_group(srv)
         self.assertIn("咖啡店", srv.systems[n])
-        self.assertIn(PRIVATE_IN_GROUP_NOTE_HUSH, srv.systems[n])
+        self.assertIn(PENDING_MARK, srv.systems[n])
         self.assertEqual(rep["mode"], "blocked")
 
     def test_four_combinations_in_the_web_group(self) -> None:
@@ -737,10 +774,14 @@ class DaemonWebGroupEndToEnd(_DaemonCase):
             with self.subTest(groups=groups, read=read):
                 srv = self.boot(groups, read=read)
                 self.tell_in_private(srv)
+                # an extracted memory too (the note tone belongs to memories; a pending line carries a fixed mark)
+                self.d.memory.add("sora", "private", "房主打算下个月辞职去开咖啡店，要求苍空保密。", channel="private:sora",
+                                  kind="event", about=["房主"], now=T0)
                 n = len(srv.systems)
-                rep = self.ask_in_group(srv)
+                rep = self.ask_in_group(srv, "苍空，你知道我辞职开咖啡店的打算吗？")
                 prompt = srv.systems[n]
-                self.assertEqual("咖啡店" in prompt, in_prompt)
+                self.assertEqual("要求苍空保密" in prompt, in_prompt)  # the memory row (the question has no such words)
+                self.assertEqual("千万别告诉别人" in prompt, in_prompt)  # the pending line
                 for candidate in (PRIVATE_IN_GROUP_NOTE_HUSH, PRIVATE_IN_GROUP_NOTE_FREE):
                     self.assertEqual(candidate in prompt, candidate == note)
                 self.assertEqual(rep["mode"] != "blocked", delivered, rep)
@@ -768,17 +809,46 @@ class DaemonWebGroupEndToEnd(_DaemonCase):
     def test_a_reply_that_leaks_a_secret_is_still_held_back_in_a_listed_group(self) -> None:
         srv = self.boot("group")
         self.tell_in_private(srv)
-        rep = self.ask_in_group(srv, reply=REPEAT + " 配置在 /home/ubuntu/app/.env 里。")
+        why: List[str] = []
+        real_log = self.d.log
+        with patch.object(self.d, "log", side_effect=lambda m, *a, **k: (why.append(str(m)), real_log(m, *a, **k))[1]):
+            # control: in this very scenario the retelling alone goes out (the group is leak-free and she knows it)
+            n = len(srv.systems)
+            ok = self.ask_in_group(srv)
+            self.assertIn("咖啡店", srv.systems[n])
+            self.assertNotEqual(ok["mode"], "blocked", ok)
+            self.assertEqual(ok["text"], REPEAT)
+            self.assertEqual([m for m in why if "reply held back" in m], [])
+            # the same retelling plus an internal path is held back, and for the path
+            rep = self.ask_in_group(srv, reply=REPEAT + " 配置在 /home/ubuntu/app/.env 里。")
         self.assertEqual(rep["mode"], "blocked")
+        held = [m for m in why if "reply held back" in m]
+        self.assertEqual(len(held), 1, held)
+        self.assertIn("internal_path", held[0])
 
     def test_group_memories_formed_there_do_not_reach_other_rooms(self) -> None:
         srv = self.boot("group")
         self.tell_in_private(srv)
         self.ask_in_group(srv)
+        # a group memory formed in the web group, and a private one told to her
+        self.d.memory.add("sora", "group", "凯周末想去逛书店，大家都听到了。", channel="group", kind="event", now=T0)
+        self.d.memory.add("sora", "private", "房主打算下个月辞职去开咖啡店，要求苍空保密。", channel="private:sora",
+                          kind="event", about=["房主"], now=T0)
+        # controls: both are there where they belong
+        self.assertTrue(self.d.list_chat("group"), "the exchange itself was recorded in the web group")
+        self.assertEqual(len(self.d.memory.list_entries("sora", "group", channel="group")), 1)
+        self.assertIn("书店", self.d.memory.recall("sora", "group", "周末谁要去逛书店？", channel="group", now=T0 + 60))
+        self.assertIn("咖啡店", self.d.memory.recall("sora", "group", ASK_PLAN, channel="group", now=T0 + 60))
+        # and not elsewhere
         rows_other = self.d.list_chat("qq-group:99")
         self.assertEqual(rows_other, [], "recent chat is read per channel")
         self.assertEqual(self.d.memory.list_entries("sora", "group", channel="qq-group:99"), [])
+        self.assertNotIn("书店", self.d.memory.recall("sora", "group", "周末谁要去逛书店？", channel="qq-group:99", now=T0 + 60))
+        self.assertNotIn("书店", self.d.memory.recall("sora", "world", "周末谁要去逛书店？", now=T0 + 60))
         self.assertNotIn("咖啡店", self.d.memory.recall("sora", "world", ASK_PLAN, now=T0 + 60))
+        # control for the world checks: a world memory is found by the same kind of question
+        self.d.memory.add("sora", "world", "小屋的规矩是每周六晚上一起大扫除。", now=T0)
+        self.assertIn("大扫除", self.d.memory.recall("sora", "world", "每周六晚上谁来大扫除？", now=T0 + 60))
 
     def test_search_memory_tool_follows_the_same_rule(self) -> None:
         for groups, expect in (("group", True), ("", False)):
@@ -797,7 +867,9 @@ class DaemonWebGroupEndToEnd(_DaemonCase):
                     srv.reply = "嗯嗯。"
                     self.d.converse("group", "苍空，在吗", owner_speaker("房主"))
                 self.assertEqual("咖啡店" in str(seen[0]), expect, seen[0])
-                self.assertEqual("[私密·" in str(seen[0]), expect)
+                self.assertEqual("·私密" in str(seen[0]), expect)
+                # control: the memory exists, her private chat finds it
+                self.assertTrue(self.d.memory.search("sora", "private", "咖啡店 辞职", channel="private:sora", now=T0 + 60))
 
 
 class DaemonSendGateAndProactive(_DaemonCase):
@@ -925,7 +997,8 @@ class QqGroupEndToEnd(unittest.TestCase):
         self.assertTrue(ob.wait_until(lambda: h.fake.sent("send_group_msg")), "nothing was sent to the group")
         self.assertIn("咖啡店", ob.message_text(h.fake.sent("send_group_msg")[0]))
         group_prompts = [s for s, u in h.model.calls if "最近的打算" in u]
-        self.assertTrue(group_prompts and "[私密·" in group_prompts[-1])
+        self.assertTrue(group_prompts and PENDING_MARK_FREE in group_prompts[-1])
+        self.assertNotIn(PENDING_MARK, group_prompts[-1])
         rows = h.chat_rows(f"qq-group:{ob.GROUP}")
         self.assertNotIn("blocked", [r["mode"] for r in rows])
 
@@ -941,14 +1014,15 @@ class QqGroupEndToEnd(unittest.TestCase):
         self.assertTrue(ob.wait_until(lambda: any(r["mode"] == "blocked" for r in h.chat_rows(f"qq-group:{ob.GROUP}"))))
         self.assertEqual(h.fake.sent("send_group_msg"), [])
         group_prompts = [s_ for s_, u in h.model.calls if "最近的打算" in u]
-        self.assertTrue("咖啡店" in group_prompts[-1] and PRIVATE_IN_GROUP_NOTE_HUSH in group_prompts[-1])
+        self.assertTrue("咖啡店" in group_prompts[-1] and PENDING_MARK in group_prompts[-1])
 
     def test_only_switch_one_knows_but_cannot_say(self) -> None:
         h = self.run_flow("", read_only=True)
         self.assertTrue(ob.wait_until(lambda: any(r["mode"] == "blocked" for r in h.chat_rows(f"qq-group:{ob.GROUP}"))))
         self.assertEqual(h.fake.sent("send_group_msg"), [])
         group_prompts = [s_ for s_, u in h.model.calls if "最近的打算" in u]
-        self.assertIn(PRIVATE_IN_GROUP_NOTE_HUSH, group_prompts[-1])
+        self.assertIn("咖啡店", group_prompts[-1])
+        self.assertIn(PENDING_MARK, group_prompts[-1])
 
     def test_only_switch_two_exempts_but_does_not_make_her_know(self) -> None:
         h = ob.Harness(self, model=ob.Model(self.rule), extra_env={ENV: f"qq-group:{ob.GROUP}"})
@@ -958,6 +1032,9 @@ class QqGroupEndToEnd(unittest.TestCase):
         self.assertTrue(ob.wait_until(lambda: h.fake.sent("send_group_msg")))
         group_prompts = [s_ for s_, u in h.model.calls if "最近的打算" in u]
         self.assertNotIn("咖啡店", group_prompts[-1])
+        # control: the owner's private line is held in memory (so its absence above is the switch, not a missing line)
+        held = db_rows(h.daemon.memory, "SELECT line FROM seen WHERE private=1")
+        self.assertTrue(any("咖啡店" in r["line"] for r in held), [r["line"] for r in held])
 
 
 class SharedOrWorldNeverFromPrivateAwareGroups(_Base):
@@ -965,12 +1042,13 @@ class SharedOrWorldNeverFromPrivateAwareGroups(_Base):
     that can carry private content (switch one on, or leak-free) it is not allowed, whatever the caller asks."""
 
     def extract_shared(self, groups: str, read: bool, channel: str) -> List[Dict[str, Any]]:
-        op = {"op": "add", "kind": "event", "text": "房主说他打算下个月去开一家咖啡店。", "about": ["房主"], "shared": True, "src": [1]}
+        # the shared module's op for a public row is scope "public" (the old store's `shared: true` is gone)
+        op = {"op": "add", "kind": "event", "text": "房主说他打算下个月去开一家咖啡店。", "about": ["房主"], "scope": "public"}
         st = self.make(groups, read=read, llm_fn=lambda _s, _u: {"ops": [op]}, extract_every_s=1, extract_batch=1)
         st.observe("nell", "group", "我打算下个月去开一家咖啡店", channel=channel, speaker="房主", speaker_role="owner", now=DAY1)
-        st.extract("nell", scope="group", channel=channel, force=True, allow_shared=True, now=DAY1 + 60)
-        with st._connect() as c:
-            return [dict(r) for r in c.execute("SELECT owner, scope FROM mem")]
+        res = st.extract("nell", scope="group", channel=channel, force=True, allow_shared=True, now=DAY1 + 60)
+        self.assertEqual(res["added"], 1, res)  # the op was applied, so the owner column below says who may read it
+        return [{"owner": r["owner"], "scope": r["scope"]} for r in st.list_entries(scope="group", channel=channel)]
 
     def test_default_still_allows_shared_when_the_caller_asks(self) -> None:
         self.assertEqual(self.extract_shared("", False, "group"), [{"owner": "shared", "scope": "group"}])

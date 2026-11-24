@@ -640,3 +640,45 @@ class DamagedOldRowTests(unittest.TestCase):
         self.addCleanup(st.close)
         rows = st.list_entries("nia", "private", now=NOW)
         self.assertEqual([r["expires_at"] for r in rows], [None, None])  # as in the old store: it never came due
+
+
+class VeryOldFileTests(unittest.TestCase):
+    """A file last opened before the old store's third schema step: group memories nobody checked against the owner's
+    words are still marked verified there. The old store demoted them on its next start; the carry-over does the same."""
+    CLAIM = "阿甲在群里说房主其实不吃香菜。"
+    CHECKED = "房主在群里说自己周三晚上要加班。"
+    PRIVATE = "房主私下说过他对花生过敏。"
+
+    def build(self, forget_the_third_step):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = MemoryStore(tmp.name, names=NAMES, env={}, clock=Clock(T0))
+        old.add("nia", "group", self.CLAIM, channel="group", now=T0)
+        old.add("nia", "group", self.CHECKED, channel="group", source="owner_verified", now=T0)
+        old.add("nia", "private", self.PRIVATE, now=T0)
+        old.close()
+        with contextlib.closing(sqlite3.connect(Path(tmp.name) / "memory.db")) as c, c:
+            self.assertEqual({r[0] for r in c.execute("select trust from mem")}, {"verified"})  # as such a file has them
+            if forget_the_third_step:
+                c.execute("delete from schema_migrations where version>=3")
+        on = {"AI_HOUSE_MEMORY_TRUST": "1"}
+        rep = migrate(tmp.name, env=on, names=NAMES, now=NOW)
+        st = CommonMemoryStore(tmp.name, names=NAMES, env=on, clock=Clock(NOW))
+        self.addCleanup(st.close)
+        rows = st.list_entries("nia", "group", channel="group", now=NOW) + st.list_entries("nia", "private", now=NOW)
+        return rep, {r["text"]: (r["kind"], r["trust"]) for r in rows}
+
+    def test_unchecked_group_memories_come_over_as_unverified_claims(self):
+        rep, got = self.build(forget_the_third_step=True)
+        self.assertEqual(got[self.CLAIM], ("claim", "group_stated"))
+        self.assertEqual(got[self.CHECKED], ("fact", "verified"))   # checked against the owner's words: kept
+        self.assertEqual(got[self.PRIVATE], ("fact", "verified"))   # not a group memory: kept
+        self.assertEqual(rep["demoted"], 1)
+        self.assertIn("未核实", "\n".join(describe(rep)))
+
+    def test_a_file_that_already_took_that_step_is_carried_as_it_stands(self):
+        rep, got = self.build(forget_the_third_step=False)
+        self.assertEqual(got[self.CLAIM], ("fact", "verified"))  # the owner of that file had it so after the step
+        self.assertEqual(rep["demoted"], 0)
+        self.assertNotIn("停在很早的版本", "\n".join(describe(rep)))
+

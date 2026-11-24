@@ -96,9 +96,11 @@ class InFlightReplySurvivesNonResetMutations(unittest.TestCase):
         rows = d.list_chat("private:sora", limit=10)
         self.assertIn("SLOWREPLY", " ".join(r["text"] for r in rows))
         # the observation went to the live (rebuilt) memory store, not the closed one
-        with contextlib.closing(sqlite3.connect(rt / "memory.db")) as c:
-            lines = [r[0] for r in c.execute("SELECT line FROM seen WHERE actor='sora'")]
+        # changed: the new store keeps rendered lines in `seen` (column `consumer`, not `actor`)
+        with contextlib.closing(sqlite3.connect(rt / "memory-common.db")) as c:
+            lines = [r[0] for r in c.execute("SELECT line FROM seen WHERE consumer='sora'")]
         self.assertTrue(any("SLOWREPLY" in x for x in lines), lines)
+        self.assertTrue(any("慢慢想" in x for x in lines), lines)
 
     def test_update_resident_does_not_drop_the_inflight_reply(self):
         d, res, rt = self._turn_during(lambda d: d.update_resident({"actor": "sora", "name": "索拉"}))

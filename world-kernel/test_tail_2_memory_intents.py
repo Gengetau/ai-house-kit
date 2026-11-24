@@ -1,4 +1,4 @@
-"""Tail batch 2 regressions: buy-request parsing, commitment evidence windows, memory trust and conflicts.
+"""Tail batch 2 regressions: buy-request parsing, commitment evidence windows, memory trust and conflicts (trust levels on).
 
 Each section pairs positive cases (must still work) with negative ones (the acceptance-round bugs).
 Evidence rows are written exactly as the kernel exporter writes them; no test touches the matcher tables.
@@ -8,7 +8,6 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
-import logging
 import sqlite3
 import sys
 import tempfile
@@ -21,13 +20,15 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.memory import BASE_INDEXES_SQL, BASE_TABLES_SQL, MemoryStore, SCHEMA_VERSION  # noqa: E402
+from ai_house.memory_common import CommonMemoryStore as MemoryStore  # noqa: E402
 from worldkernel.intents_lite import CommitmentStore  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
 
 JST = dt.timezone(dt.timedelta(hours=9))
 T0 = dt.datetime(2026, 11, 22, 10, 0, tzinfo=JST).timestamp()
 H = 3600.0
+GROUP = "qq-group:5001"  # the old tests' channel "g1"
+TRUST_ON = {"AI_HOUSE_MEMORY_TRUST": "1"}  # trust levels, the claim kind and conflict flags are off unless switched on
 
 
 class _IntentBase(unittest.TestCase):
@@ -312,28 +313,29 @@ class _MemoryBase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         st = MemoryStore(tmp.name, clock=VirtualClock(T0), names={"sora": "苍空", "rin": "凛音"}, llm_fn=llm_fn,
-                         embed_plugin=embed_plugin)
+                         embed_plugin=embed_plugin, env=TRUST_ON)
         self.addCleanup(st.close)
         self.tmp = Path(tmp.name)
         return st
 
     @staticmethod
     def group_rows(st: MemoryStore) -> List[Dict[str, Any]]:
-        with st._connect() as c:
-            return [dict(r) for r in c.execute("SELECT * FROM mem WHERE scope='group' AND status='active' ORDER BY id")]
+        return sorted(st.list_entries("sora", "group", channel=GROUP, now=T0 + 200), key=lambda r: r["id"])
 
 
 class MemoryTrust(_MemoryBase):
+    # New store: trust levels are on only with AI_HOUSE_MEMORY_TRUST=1 (set in `make`); rows are read through
+    # `list_entries` (the old tests read the `mem` table), and the extraction ops come in the shared module's format.
     def _extract(self, lines: List[tuple], ops: List[Dict[str, Any]], st: Optional[MemoryStore] = None) -> MemoryStore:
         st = st or self.make()
         for i, (txt, role, spk) in enumerate(lines):
-            st.observe("sora", "group", txt, channel="g1", speaker=spk, speaker_role=role, now=T0 + i)
-        st.extract("sora", scope="group", channel="g1", force=True, llm_fn=lambda s, u: {"ops": ops}, now=T0 + 100)
+            st.observe("sora", "group", txt, channel=GROUP, speaker=spk, speaker_role=role, now=T0 + i)
+        st.extract("sora", scope="group", channel=GROUP, force=True, llm_fn=lambda s, u: {"ops": ops}, now=T0 + 100)
         return st
 
     def _seed_verified_friday(self) -> tuple:
         st = self.make()
-        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel="g1", about=["房主"], kind="fact",
+        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel=GROUP, about=["房主"], kind="fact",
                         trust="verified", source="auto:owner_verified", now=T0 - 1000)
         return st, mid
 
@@ -368,7 +370,7 @@ class MemoryTrust(_MemoryBase):
 
     def test_member_update_of_unverified_claim_is_still_allowed(self) -> None:
         st = self.make()
-        mid, _ = st.add("sora", "group", "小林好像周五有空", channel="g1", about=["小林"], kind="claim",
+        mid, _ = st.add("sora", "group", "小林好像周五有空", channel=GROUP, about=["小林"], kind="claim",
                         trust="group_stated", source="auto", now=T0 - 1000)
         self._extract([("小林其实周六才有空", "member", "小林")],
                       [{"op": "update", "id": mid, "text": "小林周六有空", "src": [1]}], st)
@@ -377,9 +379,9 @@ class MemoryTrust(_MemoryBase):
     def test_add_merge_cannot_overwrite_verified_text_with_weaker_trust(self) -> None:
         # A constant embedding makes every pair "near duplicates", forcing the dedupe-merge path.
         st = self.make(embed_plugin=lambda texts: [[1.0, 0.0] for _ in texts])
-        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel="g1", about=["房主"], kind="fact",
+        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel=GROUP, about=["房主"], kind="fact",
                         trust="verified", source="auto:owner_verified", now=T0 - 1000)
-        st.add("sora", "group", "房主周三要去京都出差", channel="g1", about=["房主"], kind="claim",
+        st.add("sora", "group", "房主周三要去京都出差", channel=GROUP, about=["房主"], kind="claim",
                trust="group_stated", source="auto", now=T0)
         rows = {r["id"]: r for r in self.group_rows(st)}
         self.assertEqual(rows[mid]["text"], "房主周五要去京都出差")
@@ -388,9 +390,9 @@ class MemoryTrust(_MemoryBase):
 
     def test_add_merge_still_merges_equal_or_stronger_trust(self) -> None:
         st = self.make(embed_plugin=lambda texts: [[1.0, 0.0] for _ in texts])
-        mid, _ = st.add("sora", "group", "小林好像周五有空", channel="g1", about=["小林"], kind="claim",
+        mid, _ = st.add("sora", "group", "小林好像周五有空", channel=GROUP, about=["小林"], kind="claim",
                         trust="group_stated", source="auto", now=T0 - 1000)
-        mid2, how = st.add("sora", "group", "小林周六有空", channel="g1", about=["小林"], kind="claim",
+        mid2, how = st.add("sora", "group", "小林周六有空", channel=GROUP, about=["小林"], kind="claim",
                            trust="group_stated", source="auto", now=T0)
         self.assertEqual((mid2, how), (mid, "merged"))
 
@@ -419,13 +421,14 @@ class MemoryTrust(_MemoryBase):
 
 
 class MemoryConflicts(_MemoryBase):
+    # New store: `search` flags a conflicting claim only with trust levels on; the flag is `_conflict_verified`, as before.
     def _search(self, verified: str, claim: str, query: str, vabout: tuple, cabout: tuple) -> List[Dict[str, Any]]:
         st = self.make()
-        st.add("sora", "group", verified, channel="g1", about=list(vabout), kind="fact", trust="verified",
+        st.add("sora", "group", verified, channel=GROUP, about=list(vabout), kind="fact", trust="verified",
                source="owner_verified", now=T0 - 60 * 86400)
-        st.add("sora", "group", claim, channel="g1", about=list(cabout), kind="claim", trust="group_stated",
+        st.add("sora", "group", claim, channel=GROUP, about=list(cabout), kind="claim", trust="group_stated",
                source="auto", now=T0)
-        hits = st.search("sora", "group", query, channel="g1", min_score=0.05, k=5, now=T0)
+        hits = st.search("sora", "group", query, channel=GROUP, min_score=0.05, k=5, now=T0)
         return [r for _, r in hits if r["kind"] == "claim"]
 
     def test_cross_person_preference_is_not_a_conflict(self) -> None:
@@ -458,47 +461,6 @@ class MemoryConflicts(_MemoryBase):
         claims = self._search("房主周五要去京都出差", "群友说房主周三要去京都出差", "房主什么时候去京都出差",
                               ("房主",), ("房主",))
         self.assertTrue(claims and all(c.get("_conflict_verified") for c in claims))
-
-
-class MigrationLogging(_MemoryBase):
-    def _legacy_db(self) -> Path:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        d = Path(tmp.name)
-        with contextlib.closing(sqlite3.connect(d / "memory.db")) as c:
-            c.executescript(BASE_TABLES_SQL + BASE_INDEXES_SQL)
-            for v in (1, 2):
-                c.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (v, T0))
-            for text, src in (("群友乱猜房主喜欢香菜", "auto"), ("群友乱猜凛音不吃鱼", "auto"),
-                              ("房主确认喜欢黑咖啡", "owner_verified")):
-                c.execute(
-                    "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                    "VALUES('sora', 'group', 'g', 'fact', 'verified', ?, ?, 'active', ?, ?)",
-                    (text, src, T0, T0),
-                )
-            c.commit()
-        return d
-
-    def test_v3_migration_logs_demoted_row_count_once_and_is_idempotent(self) -> None:
-        d = self._legacy_db()
-        with self.assertLogs("ai_house.memory", level=logging.INFO) as cap:
-            st = MemoryStore(d, clock=VirtualClock(T0 + 10))
-        st.close()
-        msgs = [m for m in cap.output if "v3" in m or "降级" in m]
-        self.assertEqual(len(msgs), 1, cap.output)
-        self.assertRegex(msgs[0], r"\b2\b")
-        with self.assertNoLogs("ai_house.memory", level=logging.INFO):
-            MemoryStore(d, clock=VirtualClock(T0 + 20)).close()
-        with contextlib.closing(sqlite3.connect(d / "memory.db")) as c:
-            got = c.execute("SELECT kind, trust, COUNT(*) FROM mem GROUP BY kind, trust ORDER BY kind").fetchall()
-            self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
-        self.assertEqual(got, [("claim", "group_stated", 2), ("fact", "verified", 1)])
-
-    def test_fresh_store_logs_no_demotion(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        with self.assertNoLogs("ai_house.memory", level=logging.INFO):
-            MemoryStore(tmp.name, clock=VirtualClock(T0)).close()
 
 
 if __name__ == "__main__":
