@@ -23,6 +23,11 @@ services:
       AI_HOUSE_FALLBACK_BASE_URL: ${AI_HOUSE_FALLBACK_BASE_URL:-}
       AI_HOUSE_FALLBACK_MODEL: ${AI_HOUSE_FALLBACK_MODEL:-}
       AI_HOUSE_PACK_DIR: ${AI_HOUSE_PACK_DIR:-}
+      # 记忆：用哪一套记忆库（不写就是原来的）；向量服务默认指向下面的 embedding 容器，只有新记忆库（common）会用它。
+      # 想换成自己的向量服务就写 AI_HOUSE_MEMORY_EMBED_URL；写 off 则完全不用向量（按关键词回想）。
+      AI_HOUSE_MEMORY_BACKEND: ${AI_HOUSE_MEMORY_BACKEND:-}
+      AI_HOUSE_MEMORY_EMBED_URL: ${AI_HOUSE_MEMORY_EMBED_URL:-}
+      AI_HOUSE_MEMORY_EMBED_URL_DEFAULT: http://embedding:7998
       # 本地双容器（--profile city）：这几个开关 README 里写了，这里真的转进容器
       WORLD_KERNEL_CITY_BRIDGE: ${WORLD_KERNEL_CITY_BRIDGE:-0}
       WORLD_KERNEL_CITY_ACTORS: ${WORLD_KERNEL_CITY_ACTORS:-}
@@ -43,6 +48,23 @@ services:
       - "host.docker.internal:host-gateway"
     networks: [frontend, citynet]
     restart: on-failure:5
+
+  # 记忆用的本地向量服务（CPU，不需要密钥）。不发布端口，只有同一个 compose 里的小屋连得到。
+  # 模型在第一次用到时才下载、加载（约 100MB，存在 embedding-models 卷里，之后不再联网）；没用到时几乎不占内存。
+  # 它没起来、还在加载或下载失败时，小屋照常运行，记忆按关键词回想。
+  # 下载默认走 huggingface.co；连不上时在 .env 里写 HF_ENDPOINT=镜像地址。
+  embedding:
+    build: ./deploy/embedding
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    volumes:
+      - embedding-models:/models
+    networks: [frontend]
+    mem_limit: 2g
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
   # 可选：docker compose --profile city up -d  拉起本地「晴空都」城市引擎。
   # 镜像在构建时固定到 bot-game-mcp main@971484c13004e14ee6e91e9a9a75c0bd5ec65020；运行时只挂内部网络（无外网、不发布端口），
@@ -68,4 +90,5 @@ networks:
 
 volumes:
   house-data: {}
+  embedding-models: {}
   city-data: {}

@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 from .common import loader, roster as _roster
 from .memory import (
     DEFAULT_RECALL_MAX_CHARS,
+    HttpOpenAIEmbedder,
     KINDS,
     LEAK_FREE_GROUPS_ENV,
     PRIVATE_IN_GROUPS_ENV,
@@ -48,6 +49,7 @@ log = logging.getLogger("ai_house.memory_common")
 OWNER_NUMBER = 1  # the owner, inside the database only
 OWNER_PRIVATE_CHAT = f"private:{OWNER_NUMBER}"
 WEB_GROUP_CHAT = "group:1"  # the kit's web group channel `group`
+EMBED_DEFAULT_ENV = "AI_HOUSE_MEMORY_EMBED_URL_DEFAULT"
 WORLD_LEAK_CHAT = "group:0"  # world-scope outbound checks: a group nobody can list as leak-free
 HOUSEMATE_NUMBERS = (1000, 8999)
 STRANGER_NUMBERS = (9000, 9999)
@@ -132,7 +134,19 @@ class CommonMemoryStore:
     _resolve_channel = MemoryStore.__dict__["_resolve_channel"]
     private_readable_in = MemoryStore.private_readable_in
     leak_free_in = MemoryStore.leak_free_in
-    _init_embedder = MemoryStore._init_embedder
+    def _init_embedder(self, plugin: Any) -> Any:
+        """The vector service: a plugin handed in, else the one the settings name (`AI_HOUSE_MEMORY_EMBED_URL`; `off`
+        for none), else the bundled one the compose file points to (`AI_HOUSE_MEMORY_EMBED_URL_DEFAULT`). Only this
+        store reads the bundled one: the shared code's thresholds are tuned for exactly that service, the old
+        store's are not. No key is sent to it."""
+        if plugin is None:
+            named = str(self._env.get("AI_HOUSE_MEMORY_EMBED_URL") or self._env.get("MEMORY_EMBED_URL") or "").strip()
+            if named.lower() in ("off", "none", "0"):
+                return None
+            bundled = str(self._env.get(EMBED_DEFAULT_ENV) or "").strip()
+            if not named and bundled:
+                return HttpOpenAIEmbedder(bundled)
+        return MemoryStore._init_embedder(self, plugin)
     _embed = MemoryStore._embed
     _build_extractor_fn = MemoryStore._build_extractor_fn
     vector_enabled = MemoryStore.vector_enabled
@@ -554,15 +568,27 @@ class CommonMemoryStore:
         k: Optional[int] = None,
         max_chars: int = DEFAULT_RECALL_MAX_CHARS,
         now: Optional[float] = None,
+        speaker: str = "",
+        speaker_role: Optional[str] = None,
+        speaker_id: str = "",
     ) -> str:
+        """`speaker*` say who is asking, as in `observe` (in the private chat that is the owner unless told otherwise).
+        The shared recall then does what it does in the private deployment: what is about the asker ranks higher
+        (its thresholds were tuned with that), and their person card comes along. Asker unknown: no such help."""
         actor = self._valid_actor(actor)
         scope = self._valid_scope(scope)
         resolved = self._resolve_channel(actor, scope, channel)
         mod = self._use(actor)
         # `world` is asked from a place where nothing was ever said (see _narrow_world_view for what it may see)
         chat = WORLD_LEAK_CHAT if scope == "world" else self._chat_for(mod, scope, resolved)
-        # a leading space: text from a chat member must never parse as a sender header of its own
-        lines = [" " + str(text or "")]
+        role = str(speaker_role if speaker_role is not None else ("owner" if scope == "private" else "")).strip().lower()
+        if scope != "world" and (role == "owner" or (role == "member" and (speaker or speaker_id))):
+            number = self._speaker_number(actor, role, speaker, speaker_id)
+            card = _HEADER_BAD_RE.sub("", _clean_speaker(speaker, role)).strip()[:24] or "?"
+            lines = [f"[{card}|{number}] (message_id=0): {text or ''}"]  # the header is ours; the words follow it
+        else:
+            # a leading space: text from a chat member must never parse as a sender header of its own
+            lines = [" " + str(text or "")]
         self._tl.world_view = scope == "world"
         try:
             with mod.time.at(self._now(now)):

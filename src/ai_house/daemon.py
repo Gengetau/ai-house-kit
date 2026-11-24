@@ -707,6 +707,11 @@ class HouseDaemon:
                 self.memory.extract(now=now)
             except Exception as exc:  # noqa: BLE001
                 self.log(f"memory extract error: {type(exc).__name__}: {exc}")
+            if isinstance(self.memory, CommonMemoryStore):
+                try:  # memories written while the vector service was not answering (still loading, say) get theirs
+                    self.memory.backfill_vectors()
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"memory vector backfill error: {type(exc).__name__}")
             if due_diary_day(now) is not None:
                 try:
                     stored_pl = self.settings_store.get_plugins_map()
@@ -1572,7 +1577,12 @@ class HouseDaemon:
         for aid in targets:
             if not self._turn_world_ok(turn_epoch):
                 break
-            mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
+            # the store sharing the private deployment's code ranks by who is asking, as that deployment does
+            asker: Dict[str, Any] = {}
+            if isinstance(self.memory, CommonMemoryStore):
+                asker = {"speaker": speaker.name, "speaker_role": speaker_role,
+                         "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else "")}
+            mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now, **asker)
             hint_store = self.intents
             if speaker.is_owner and hint_store is not None:
                 # what she must know about her own errands (unbuyable item, expired promise) before she answers
@@ -1608,7 +1618,7 @@ class HouseDaemon:
                     }
                 if tname == "search_memory":
                     q = str(targs.get("query") or text)
-                    found = self.memory.recall(_aid, scope, q, channel=mem_ch, now=now)
+                    found = self.memory.recall(_aid, scope, q, channel=mem_ch, now=now, **asker)
                     return {"recall": found or "暂无相关记忆"}
                 if tname == "record_promise":
                     if not speaker.is_owner:
