@@ -588,4 +588,9 @@ A1 里必须自己补上的东西（否则换了大脑就少了保护）：
 | world-kernel 全量 | Python 3.13，装了 `claude-agent-sdk` | 1306 项通过，0 失败，0 跳过（517 秒） |
 | world-catalog / world-contract-tests | Python 3.13 | 22 / 11 项通过 |
 
-这三批修复之后没有再用真实模型重跑；Gemini 相关的两项（日记失败重试、被输出上限截断的回复）只用本地假接口复现和验证过。
+这三批修复之后，2026-11-24 又加了“私聊记忆进群”的两个开关（`CHAT-AND-QQ.md`）、第四批修复，并用 terra、gemini 各重跑一遍，agent 大脑经中转用真的 Claude 模型跑了两轮；结果见 `LONGRUN-2026-11-23.md` 第 6、7 节，最后两处修复（`7cd53e4`、`22f0974`）之后没有再用真实模型重跑。最终：
+
+| 范围 | 环境 | 结果 |
+|---|---|---|
+| world-kernel 全量 | Python 3.13，装了 `claude-agent-sdk` | 1420 项通过，0 失败，0 跳过（484 秒） |
+| world-catalog / world-contract-tests | Python 3.13 | 22 / 11 项通过 |
