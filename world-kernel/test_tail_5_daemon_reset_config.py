@@ -105,6 +105,14 @@ class InFlightReplySurvivesNonResetMutations(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         self.assertEqual(len(res["replies"]), 1)
 
+    def test_a_reset_also_removes_the_store_that_shares_the_private_deployments_code(self):
+        def reset(d):
+            (d.runtime_dir / "memory-common.db").write_bytes(b"left over")
+            d.reset_house()
+
+        d, res, rt = self._turn_during(reset)
+        self.assertFalse((rt / "memory-common.db").exists())
+
     def test_a_real_reset_still_drops_the_inflight_reply(self):
         d, res, rt = self._turn_during(lambda d: d.reset_house())
         self.assertFalse(res["ok"])

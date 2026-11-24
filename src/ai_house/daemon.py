@@ -2469,6 +2469,9 @@ class HouseDaemon:
                 self.runtime_dir / "memory.db",
                 self.runtime_dir / "memory.db-wal",
                 self.runtime_dir / "memory.db-shm",
+                self.runtime_dir / "memory-common.db",  # the store that shares the private deployment's code
+                self.runtime_dir / "memory-common.db-wal",
+                self.runtime_dir / "memory-common.db-shm",
                 self.runtime_dir / "reminders.db",
                 self.runtime_dir / "reminders.db-wal",
                 self.runtime_dir / "reminders.db-shm",

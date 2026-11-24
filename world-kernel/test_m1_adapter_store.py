@@ -109,6 +109,37 @@ class PrivacyTests(StoreCase):
         self.assertEqual(st.check_outbound_leak("nia", "group", "今天天气不错", channel=GROUP, now=T0), [])
         self.assertEqual(st.check_outbound_leak("xingli", "group", REPEAT_PLAN, channel=GROUP, now=T0), [])
 
+    def test_a_world_recall_sees_world_memories_and_her_diaries_and_no_chat(self):
+        diary = "今天和房主一起收拾了阳台，种下了新买的薄荷，晚上聊了很久的旅行计划。"
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                st = self.make(unified_groups=unified, private_in_groups=True, leak_free_groups=["group"],
+                               env={"AI_HOUSE_MEMORY_RECENT": "all"}, embed_plugin=lambda texts: [[1.0, 0.0] for _ in texts])
+                st.add("nia", "world", "小屋的规矩是每周六晚上一起大扫除。", now=T0)
+                st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
+                st.add("nia", "group", "阿甲在网页群里说他周末要去爬山。", about=["阿甲"], now=T0)
+                st.add("nia", "group", "阿乙在另一个群里说她要去游泳。", channel=GROUP, about=["阿乙"], now=T0)
+                st.add("nia", "world", f"2026-11-24 日记：{diary}", kind="diary", source="diary", now=T0)
+                st.observe("nia", "private", "房主悄悄说下个月想换一份工作", now=T0)  # a line not yet tidied
+                self.assertIn("大扫除", st.recall("nia", "world", "每周六晚上一起大扫除吗", now=T0 + 60))
+                self.assertIn("薄荷", st.recall("nia", "world", "今天种下了新买的薄荷", now=T0 + 60))
+                # (the made-up vectors above make every memory match every question: what is left out is left out
+                # by what may be seen, not by the score)
+                for ask in (ASK_PLAN, "阿甲周末要去爬山吗", "阿乙要去游泳吗", "下个月想换一份工作"):
+                    got = st.recall("nia", "world", ask, now=T0 + 60)
+                    for word in ("咖啡店", "爬山", "游泳", "换一份工作", "私密"):
+                        self.assertNotIn(word, got, ask)
+                self.assertIn("咖啡店", st.recall("nia", "group", ASK_PLAN, now=T0 + 60))  # the view is back to normal
+
+    def test_no_channel_or_a_malformed_one_is_never_exempt_from_the_outbound_check(self):
+        st = self.make(leak_free_groups=["group", LISTED])
+        st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
+        self.assertEqual(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel="group", now=T0), [])
+        self.assertEqual(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=LISTED, now=T0), [])
+        for ch in ("", "  ", "qq-group:2 22", "private:nia"):
+            self.assertEqual(len(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=ch, now=T0)), 1, repr(ch))
+        self.assertEqual(len(st.check_outbound_leak("nia", "world", REPEAT_PLAN, channel=LISTED, now=T0)), 1)
+
     def test_the_two_switches_are_read_by_the_old_names(self):
         st = self.make(env={"AI_HOUSE_MEMORY_UNIFIED_GROUPS": "1", "AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS": "1",
                             "AI_HOUSE_MEMORY_LEAK_FREE_GROUPS": f"group, {LISTED}, private:9, nonsense"})
@@ -378,6 +409,19 @@ class AddListInvalidateTests(StoreCase):
         down.add("nia", "private", SECRET_PLAN, now=T0)
         self.assertIn("咖啡店", down.recall("nia", "private", ASK_PLAN, now=T0))
         self.assertFalse(self.make().vector_enabled)
+
+    def test_a_vector_plugin_gets_the_question_as_it_was_asked(self):
+        got = []
+
+        def plugin(texts):
+            got.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+        st = self.make(embed_plugin=plugin)
+        st.add("nia", "private", SECRET_PLAN, now=T0)
+        del got[:]
+        st.recall("nia", "private", ASK_PLAN, now=T0)
+        self.assertEqual(got, [ASK_PLAN])  # no space put before it on the way
 
 
 class NamesAndModelTests(StoreCase):

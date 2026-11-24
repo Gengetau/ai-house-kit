@@ -279,7 +279,31 @@ class CommonMemoryStore:
             mod.search.__defaults__ = tuple(defaults)
         mod.llm = self._make_llm(mod)
         mod.embed = self._make_embed()
+        self._narrow_world_view(mod)
         mod.init()
+
+    def _narrow_world_view(self, mod: Any) -> None:
+        """A recall for the kit's `world` scope (no chat at all: the house's own doings) may see the memories saved
+        as `world` and her own diaries, and nothing that belongs to a chat. The shared module has no such place, so
+        while such a recall runs (this thread only) its visibility rule is replaced by that narrower one and lines
+        from other chats are left out."""
+        visible, recent, note = mod._visible_sql, mod.recent_block, mod._private_note
+
+        def _visible_sql(consumer: str, chat: str) -> Tuple[str, List[Any]]:
+            if not getattr(self._tl, "world_view", False):
+                return visible(consumer, chat)
+            where = "id in (select mem_id from kit_origin where scope='world')"
+            if mod.DIARY_PRIVATE:
+                return f"status='active' and kind!='diary' and {where}", []
+            return f"status='active' and ({where} or (kind='diary' and owner=?))", [consumer]
+
+        def recent_block(consumer: str, chat: str, text: str) -> str:
+            return "" if getattr(self._tl, "world_view", False) else recent(consumer, chat, text)
+
+        def _private_note(consumer: str, chat: str) -> str:  # nothing private is shown there
+            return "" if getattr(self._tl, "world_view", False) else note(consumer, chat)
+
+        mod._visible_sql, mod.recent_block, mod._private_note = _visible_sql, recent_block, _private_note
 
     def _make_llm(self, mod: Any) -> Callable[..., Dict[str, Any]]:
         def llm(system: str, user: str, timeout: float = 300) -> Dict[str, Any]:
@@ -295,7 +319,9 @@ class CommonMemoryStore:
 
     def _make_embed(self) -> Callable[..., Any]:
         def embed(texts: Sequence[str], timeout: float = 20) -> Any:
-            return self._embed(list(texts))
+            # recall() puts a space before the question (see there); an embedder that matches on the exact text
+            # must get it as it was asked
+            return self._embed([str(t).strip() for t in texts])
 
         return embed
 
@@ -523,18 +549,23 @@ class CommonMemoryStore:
         scope = self._valid_scope(scope)
         resolved = self._resolve_channel(actor, scope, channel)
         mod = self._use(actor)
-        chat = self._chat_for(mod, scope, resolved)
+        # `world` is asked from a place where nothing was ever said (see _narrow_world_view for what it may see)
+        chat = WORLD_LEAK_CHAT if scope == "world" else self._chat_for(mod, scope, resolved)
         # a leading space: text from a chat member must never parse as a sender header of its own
         lines = [" " + str(text or "")]
-        with mod.time.at(self._now(now)):
-            if k is None:
-                return str(mod.recall(actor, chat, lines))
-            with self._k_lock:  # the shared recall reads its count from the module global
-                before, mod.RECALL_K = mod.RECALL_K, max(1, int(k))
-                try:
+        self._tl.world_view = scope == "world"
+        try:
+            with mod.time.at(self._now(now)):
+                if k is None:
                     return str(mod.recall(actor, chat, lines))
-                finally:
-                    mod.RECALL_K = before
+                with self._k_lock:  # the shared recall reads its count from the module global
+                    before, mod.RECALL_K = mod.RECALL_K, max(1, int(k))
+                    try:
+                        return str(mod.recall(actor, chat, lines))
+                    finally:
+                        mod.RECALL_K = before
+        finally:
+            self._tl.world_view = False
 
     def check_outbound_leak(
         self,
@@ -550,11 +581,14 @@ class CommonMemoryStore:
         if scope == "private":
             return []
         mod = self._use(actor)
-        if scope == "group":
-            ch = self._clean_channel(channel) or "group"
-            chat = WORLD_LEAK_CHAT if ch.lower().startswith("private") else self._chat_of_channel(mod, ch)
-        else:
-            chat = WORLD_LEAK_CHAT
+        chat = WORLD_LEAK_CHAT  # a place that is never exempt: `world`, no channel given, or one that is not a group
+        if scope == "group" and str(channel or "").strip():
+            ch = self._clean_channel(channel)
+            if ch and not ch.lower().startswith("private"):
+                chat = self._chat_of_channel(mod, ch)
+                # exempt only when the id as given is listed (a malformed id is never cleaned into a listed one)
+                if chat in mod.LEAK_FREE_CHATS and not self.leak_free_in(channel):
+                    chat = WORLD_LEAK_CHAT
         with mod.time.at(self._now(now)):
             return [int(i) for i in mod.leak(actor, chat, reply_text)]
 
