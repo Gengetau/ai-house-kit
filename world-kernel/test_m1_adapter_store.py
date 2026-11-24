@@ -114,8 +114,14 @@ class PrivacyTests(StoreCase):
         diary = "今天和房主一起收拾了阳台，种下了新买的薄荷，晚上聊了很久的旅行计划。"
         for unified in (False, True):
             with self.subTest(unified=unified):
+                slots = {}
+
+                def embed(texts):  # a memory (ends with 。) gets one of three axes, anything else all three
+                    return [[float(slots.setdefault(t, len(slots) % 3) == i) for i in range(3)] if t.endswith("。")
+                            else [1.0, 1.0, 1.0] for t in texts]
+
                 st = self.make(unified_groups=unified, private_in_groups=True, leak_free_groups=["group"],
-                               env={"AI_HOUSE_MEMORY_RECENT": "all"}, embed_plugin=lambda texts: [[1.0, 0.0] for _ in texts])
+                               env={"AI_HOUSE_MEMORY_RECENT": "all"}, embed_plugin=embed)
                 st.add("nia", "world", "小屋的规矩是每周六晚上一起大扫除。", now=T0)
                 st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
                 st.add("nia", "group", "阿甲在网页群里说他周末要去爬山。", about=["阿甲"], now=T0)
@@ -124,8 +130,8 @@ class PrivacyTests(StoreCase):
                 st.observe("nia", "private", "房主悄悄说下个月想换一份工作", now=T0)  # a line not yet tidied
                 self.assertIn("大扫除", st.recall("nia", "world", "每周六晚上一起大扫除吗", now=T0 + 60))
                 self.assertIn("薄荷", st.recall("nia", "world", "今天种下了新买的薄荷", now=T0 + 60))
-                # (the made-up vectors above make every memory match every question: what is left out is left out
-                # by what may be seen, not by the score)
+                # (the made-up vectors above make every memory match every question, and no two memories kept in
+                # the same place look alike: what is left out is left out by what may be seen, not by the score)
                 for ask in (ASK_PLAN, "阿甲周末要去爬山吗", "阿乙要去游泳吗", "下个月想换一份工作"):
                     got = st.recall("nia", "world", ask, now=T0 + 60)
                     for word in ("咖啡店", "爬山", "游泳", "换一份工作", "私密"):
@@ -304,6 +310,24 @@ class AddListInvalidateTests(StoreCase):
         with self.assertRaises(ValueError):
             st.invalidate("nia", "world", mid)
 
+    def test_a_world_memory_is_hers_unless_it_is_saved_as_shared(self):
+        st = self.make()
+        own, _ = st.add("nia", "world", "妮娅今天把阳台的薄荷移到了窗边。", now=T0)
+        both, _ = st.add("nia", "world", "小屋的规矩是每周六晚上一起大扫除。", shared=True, now=T0)
+        self.assertIn("薄荷", st.recall("nia", "world", "阳台的薄荷移到了窗边吗", now=T0 + 60))
+        self.assertNotIn("薄荷", st.recall("xingli", "world", "阳台的薄荷移到了窗边吗", now=T0 + 60))
+        self.assertNotIn("薄荷", st.recall("xingli", "group", "阳台的薄荷移到了窗边吗", now=T0 + 60))
+        self.assertNotIn("薄荷", st.recall("xingli", "private", "阳台的薄荷移到了窗边吗", now=T0 + 60))
+        for who in ("nia", "xingli"):
+            self.assertIn("大扫除", st.recall(who, "world", "每周六晚上一起大扫除吗", now=T0 + 60), who)
+        self.assertEqual([(r["id"], r["owner"]) for r in st.list_entries("nia", "world")], [(both, "shared"), (own, "nia")])
+        self.assertEqual([(r["id"], r["owner"]) for r in st.list_entries("xingli", "world")], [(both, "shared")])
+        with self.assertRaises(ValueError):
+            st.invalidate("xingli", "world", own)
+        with self.assertRaises(ValueError):
+            st.invalidate("nia", "world", both)  # a shared one needs allow_shared
+        self.assertEqual(st.invalidate("nia", "world", own)["scope"], "world")
+
     def test_list_entries_has_the_old_keys_and_the_old_scopes(self):
         st = self.make()
         p, _ = st.add("nia", "private", SECRET_PLAN, about=["房主"], kind="event", now=T0)
@@ -323,7 +347,7 @@ class AddListInvalidateTests(StoreCase):
         self.assertEqual(st.list_entries("nia", "group", channel=LISTED), [])
         self.assertEqual([r["id"] for r in st.list_entries(None, "group")], [s, g])
         wor = st.list_entries("nia", "world")
-        self.assertEqual([(r["id"], r["owner"], r["scope"], r["channel"]) for r in wor], [(w, "shared", "world", "world")])
+        self.assertEqual([(r["id"], r["owner"], r["scope"], r["channel"]) for r in wor], [(w, "nia", "world", "world")])
         self.assertEqual([r["id"] for r in st.list_entries("nia", "world", kind="diary")], [])
         self.assertEqual([r["id"] for r in st.list_entries("nia", "group", kind="promise", channel=GROUP)], [s])
         self.assertEqual(len(st.list_entries("nia", "group", limit=1)), 1)
@@ -537,6 +561,15 @@ class DecidedExtrasTests(StoreCase):
         self.assertIn("群聊陈述·未核实", on.recall("nia", "group", "房主不喜欢吃咖喱吗", channel=GROUP, now=T0))
         self.assertNotIn("未核实", on.recall("nia", "group", "房主周末要去爬山吗", channel=GROUP, now=T0))
         self.assertEqual({r["trust"] for r in on.list_entries("nia", "group", channel=GROUP)}, {"group_stated", "verified"})
+
+    def test_with_trust_on_the_claim_kind_is_kept_and_a_conflicting_hit_is_flagged(self):
+        for env, kind, flagged in (({}, "fact", False), ({"AI_HOUSE_MEMORY_TRUST": "1"}, "claim", True)):
+            st = self.make(env=env)
+            st.add("nia", "group", "房主对花生严重过敏，绝对不能吃", channel=GROUP, about=["房主"], trust="verified", now=T0 - 86400)
+            st.add("nia", "group", "群友说房主其实对花生不过敏，随便吃", channel=GROUP, about=["房主"], kind="claim", now=T0)
+            hits = st.search("nia", "group", "房主能吃花生吗", channel=GROUP, min_score=0.05, now=T0)
+            self.assertEqual(sorted({r["kind"] for _, r in hits}), sorted({"fact", kind}))
+            self.assertEqual(any(r.get("_conflict_verified") for _, r in hits), flagged)
 
 
 class NamesAndModelTests(StoreCase):

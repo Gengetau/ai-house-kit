@@ -661,11 +661,13 @@ def search(consumer, chat, query, about=(), k=RECALL_K, qvec=None, min_score=0.0
             s = _novec_score(qb, q_core, r["text"])  # was: 0.4 + 0.6 * kw if kw >= 0.15 else 0.0 (kept as its floor)
         if about and any(a in r["about"] for a in about):
             s += 0.15
+        w = 1.0
         if TRUST:  # 2026-11-24: what others said counts less; what contradicts a verified memory counts for little
-            s *= TRUST_WEIGHTS.get(r["trust"], 1.0)
+            w = TRUST_WEIGHTS.get(r["trust"], 1.0)
+            s *= w
             if r["trust"] != "verified" and _conflicts_with_verified(dict(r), verified):
                 s, r = s * 0.2, {**dict(r), "_conflict": True}
-        if s >= min_score:
+        if s >= min_score * w:  # the level moves the rank, not the cut-off: a downgraded memory is still found, marked
             scored.append((s, r))
     scored.sort(key=lambda x: -x[0])
     return scored[:k]
@@ -755,7 +757,7 @@ def _fmt(r, full=False):
     if TRUST:  # 2026-11-24: an unverified memory says so in the line, in the words the kit's own store used
         if "_conflict" in r.keys():
             head = "群聊未核实传言·与已知事实冲突，勿采信"
-        elif r["trust"] in ("group_stated", "hearsay"):
+        elif r["trust"] in ("group_stated", "hearsay") or r["kind"] == "claim":
             head = "推断·未核实" if r["scope"] == "private" else "群聊陈述·未核实"
     return f"#{r['id']} [{head}{about}] {text}（{day}）"
 
@@ -1038,7 +1040,7 @@ def add(consumer, chat, text, *, about="", kind="fact", scope="own", source="sel
     2026-11-24 owner: expires_at (a time; None = never) after which it is gone; trust (with MEMORY_TRUST, None =
     verified): a weaker text never merges over a stronger row, and a merge keeps the stronger level."""
     about, chat = _about(about), _valid_chat(chat)
-    kind = kind if kind in KINDS else "fact"
+    kind = kind if kind in KINDS or (TRUST and kind == "claim") else "fact"  # 2026-11-24: claim, with TRUST
     if kind == "rule" and not rules_on(consumer, chat):
         kind = "promise"  # only the owner, in private, sets rules
     text = _clean_text(text, _max_text(kind))
@@ -1063,7 +1065,7 @@ def add(consumer, chat, text, *, about="", kind="fact", scope="own", source="sel
     now = time.time()
     if expires_at is not None and float(expires_at) <= now:
         raise ValueError("expires_at 必须晚于当前时间")
-    trust = trust if trust in TRUST_LEVELS else "verified"
+    trust = trust if trust in TRUST_LEVELS else ("group_stated" if TRUST and kind == "claim" else "verified")
     _sweep()
     with db() as c:
         best = None  # same owner, scope and chat: merge near-duplicates instead of piling up
@@ -1870,20 +1872,237 @@ def _system(consumer, private, scribe, source_kind):
 - 没有值得记的就输出 {{"ops": []}}。寒暄闲聊照旧一条不记，一段聊天通常 0–5 条；但这段里有约定、改口、纠正、矛盾、故事进展或「{me}」给出的具体内容时，该记的都要记，最多 8 条，不要为了少而漏掉。"""
 
 
-def _op_trust(consumer, private, rows, op_src, batch):
-    """MEMORY_TRUST (rows: the batch's seen rows, None = off): the level of what the extractor writes. The owner's
-    private chat: verified. A group: verified only when every line it rests on is the owner's by number (the lines
-    the op's "src" names, else the whole batch; her own lines do not count), else group_stated. 2026-11-24 owner:
-    not carried over from the kit's own store: the check that the text says what the owner's line says, hearsay
-    for a relayed line, a private-chat memory the owner's words do not back."""
+# ---- trust: what the extractor writes (MEMORY_TRUST) --------------------------------------------------------------
+# 2026-11-24 owner: ported from the kit's own store, all of it behind TRUST (with it off none of this is reached):
+# does a text say what the owner said, does a line only relay what somebody else said.
+
+_RELAY_RE = re.compile(
+    r"(?:^|[，,。！!；;：:\s])(?:听(?:说|[\u4e00-\u9fff]{1,4}?说)|据(?:说|称)|有人说|大家都说|传闻|"
+    r"(?!我)[\u4e00-\u9fffA-Za-z]{1,6}?(?<![不别再先就只也还没])"
+    r"(?:说|讲|表示|称|提到|提过|讲过|说过|告诉(?:我|大家|房主)|跟我说|向我保证))"
+)
+
+
+_RELAY_FIRST_PERSON_RE = re.compile(r"^[\s，,：:、“\"'「『]*(?:我|咱|俺|本人)")
+
+
+_SUPPORT_SUBJECT_RE = re.compile(r"房主|主人|自己|我们|你们|他们|她们|非常|特别|比较|真的|一直|总是|经常|[我你您他她它为给替]")
+_SUPPORT_NOTE_RE = re.compile(r"[（(][^）)]*[）)]")
+# Month-level dates count too: the extractor turns 「下个月」 into 「2026年12月」, which is not something the owner's
+# line has to contain (a line that names no date backs any date the extractor wrote; one that names a date must match).
+_SUPPORT_DATE_RE = re.compile(
+    r"\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2}|\d{1,2}月\d{1,2}[日号]|\d{4}年\d{1,2}月|\d{1,2}月(?!份)|\d{4}年"
+)
+_SUPPORT_CLAUSE_RE = re.compile(r"[，,。！!？?；;\n、]+|但是?|可是|不过|却")
+_SUPPORT_NEG_RE = re.compile(r"[不没别无非未]")
+_SUPPORT_NEG_FALSE_RE = re.compile(r"非常|特别|分别|别人|别的|未来|不错|不过|没错|没关系")
+_SUPPORT_STOP_RE = re.compile("[" + "".join(sorted(_CJK_STOP_CHARS)) + "]+")
+PRIVATE_SUPPORT_MIN = 0.6  # share of the item's content units that the cited owner lines must contain
+# How the owner said it (in private / asked to keep it secret / "told X") is not a claim the owner has to have made:
+# the extractor describes the *manner* of speaking, the owner's line is the content. Stripped from the item before the
+# content check (and before the negation check: 「不要告诉别人」 is a request, not a denial of the content).
+_SUPPORT_MANNER_RE = re.compile(
+    r"(?:并|还|同时|且)?(?:要求|叮嘱|嘱咐|嘱托|请求|恳请|拜托|希望)[^，,。；;]{0,8}?"
+    r"(?:保密|保守[^，,。；;]{0,4}秘密|(?:不要|别|勿)(?:再)?(?:告诉|说出去|外传|对外说)[^，,。；;]*)"
+    r"|(?:千万)?(?:不要|别|勿)(?:再)?(?:告诉|说出去|外传|对外说)[^，,。；;]*"
+    r"|保守[^，,。；;]{0,4}秘密|保密|(?:(?:一个|一件)小?)?秘密|私下|私底下|悄悄|偷偷|暗中|亲口|当面"
+    r"|(?:告诉|告知|透露|表示|表明|提到|声称)(?:了|过)?"
+    # 「打算」/「计划」 are interchangeable ways to say the same intent; the owner's own verb decides which one he used.
+    r"|(?:计划|打算)(?:于|在)?"
+)
+_SUPPORT_LEAD_DATE_RE = re.compile(r"^\s*(?:截至|于|在)?\s*(?:\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2})\s*[，,：:]?")
+
+
+_REL_MONTH_RE = re.compile(r"下个?月|这个?月|本月|上个?月")
+
+
+def _annotate_relative_months(line, ts):
+    """「下个月」 -> 「下个月〔即2026年12月〕」, so an item that moved the month (「2026年10月」) cannot ride on it."""
+    at = datetime.datetime.fromtimestamp(float(ts), JST)
+
+    def _repl(m):
+        step = {"下": 1, "上": -1}.get(m.group(0)[0], 0)
+        idx = at.year * 12 + (at.month - 1) + step
+        return f"{m.group(0)}〔即{idx // 12}年{idx % 12 + 1}月〕"
+
+    return _REL_MONTH_RE.sub(_repl, str(line or ""))
+
+
+def _record_day_forms(ts):
+    d = datetime.datetime.fromtimestamp(float(ts), JST)
+    return (f"{d.year}年{d.month}月{d.day}日", f"{d.year}年{d.month}月{d.day}号", f"{d.year}-{d.month}-{d.day}", f"{d.year}-{d.month:02d}-{d.day:02d}")
+
+
+def _support_units(text, *, chars=False):
+    """Content units for the evidence check: subject words / function chars removed, CJK bigrams + ASCII words.
+
+    A lone content char ("虾") is a unit of its own; with `chars=True` (the evidence side) every char is one too.
+    """
+    s = _SUPPORT_SUBJECT_RE.sub(" ", str(text or "").lower())
+    units = set(re.findall(r"[a-z0-9]+", s))
+    for run in _CJK_RUN_RE.findall(s):
+        for piece in _SUPPORT_STOP_RE.split(run):
+            if len(piece) == 1 or chars:
+                units.update(piece)
+            units.update(piece[i : i + 2] for i in range(len(piece) - 1))
+    return units
+
+
+def _is_negated(text):
+    return bool(_SUPPORT_NEG_RE.search(_SUPPORT_NEG_FALSE_RE.sub("", text)))
+
+
+def _owner_lines_support(text, cited_lines, names=(), record_days=()):
+    """Deterministic check that the cited owner line(s) really say `text` (the model never decides this).
+
+    The item's content units (see `_support_units`) must be covered >= PRIVATE_SUPPORT_MIN by the cited clauses.
+    Clauses whose negation differs from the item's are ignored, so 「我不吃香菜」 cannot back 「房主爱吃香菜」.
+    `record_days` are the dates (「2026年11月21日」) on which the cited lines were said: a leading date equal to one is
+    the extractor's record date, not a claim, even when the line itself names another date (「我的生日是3月14日」).
+    """
+    cited = "\n".join(cited_lines)
+    # The roommate's own name is a subject word too: the owner says 「你」, the extractor writes 「奈尔」.
+    for name in names:
+        text = text.replace(name, " ") if name else text
+    # Parenthetical notes, and a record date the extractor added to a line that names no date, are not claims.
+    body = _SUPPORT_NOTE_RE.sub("", text)
+    lead = _SUPPORT_LEAD_DATE_RE.match(body)
+    if lead and any(day in lead.group(0) for day in record_days):
+        body = body[lead.end():]
+    body = _SUPPORT_MANNER_RE.sub(" ", body)
+    if not _SUPPORT_DATE_RE.search(cited):
+        body = _SUPPORT_DATE_RE.sub(" ", body)
+    want = _support_units(body)
+    if not want:
+        return False
+    neg = _is_negated(body)
+    have = set()
+    for clause in _SUPPORT_CLAUSE_RE.split(cited):
+        if clause.strip() and _is_negated(clause) == neg:
+            have |= _support_units(clause, chars=True)
+    # Numbers / latin names are exact: "3月6日" must not ride on a line that says "3月5日".
+    if any(u.isascii() and u not in have for u in want):
+        return False
+    # Dates / numbers were matched exactly above; they must not pad the share of the words that carry the meaning.
+    words = {u for u in want if not u.isascii()} or want
+    return len(words & have) / len(words) >= PRIVATE_SUPPORT_MIN
+
+
+_FIRST_PERSON_RE = re.compile(r"[我咱俺]|本人")
+_OWNER_SUBJECT_RE = re.compile(r"^\s*(?:截至)?(?:\d{4}年\d{1,2}月\d{1,2}[日号]|\d{4}-\d{1,2}-\d{1,2})?\s*[，,：:]?\s*(?:房主|主人)")
+
+
+def _is_owner_self_text(text, others=()):
+    """True when an extracted item is about the owner himself (「2026年11月21日，房主说自己对花生过敏」)."""
+    body = _SUPPORT_NOTE_RE.sub("", str(text or ""))
+    return bool(_OWNER_SUBJECT_RE.match(body)) and not any(n and n in body for n in others)
+
+
+def _is_relayed_line(line):
+    """True when a line reports what somebody else said about a third party ("小林说他对花生过敏").
+
+    A report whose content is about the speaker themself ("医生说我对花生过敏", "老板告诉我我下周出差") is still the
+    speaker's own first-hand information and is not treated as relayed.
+    """
+    text = str(line or "")
+    for m in _RELAY_RE.finditer(text):
+        if not _RELAY_FIRST_PERSON_RE.match(text[m.end():]):
+            return True
+    return False
+
+
+def _overlap(feats, text):
+    """Weighted overlap of a text with a feature set, in [0, 1] (the kit's `_keyword_overlap`)."""
+    mem = _lexical_features(text)
+    if not feats or not mem:
+        return 0.0
+    shared = sum(min(w, mem[k]) for k, w in feats.items() if k in mem)
+    if shared <= 0.0:
+        return 0.0
+    mem_norm = sum(mem.values())
+    denom = math.sqrt(mem_norm * max(min(sum(feats.values()), 4.0 * mem_norm), 1e-6))
+    return min(1.0, shared / denom) if denom > 0 else 0.0
+
+
+_TRUST_STRICT = ("fact", "preference", "person", "claim", "rule")
+_TRUST_IGNORE_BG = _LOW_IDF_BIGRAMS | {"可能", "好像", "应该", "大概", "不确定", "记住", "知道", "觉得", "一点",
+                                       "有点", "什么", "还是", "或者", "比如", "私下", "悄悄", "房主", "群里"}
+# the line numbers of the extraction prompt, for an op's "src" (the first point of EVIDENCE_PROMPT, without its dates)
+TRUST_PROMPT = EVIDENCE_PROMPT.split("\n- 日期")[0]
+
+
+def _op_trust(consumer, private, rows, op, update=False):
+    """MEMORY_TRUST (rows: the batch's seen rows, None = off -> {}): kind, trust and source of what the extractor
+    writes, as the kit's own store judged it; ValueError when the op has no evidence. What the op's "src" names
+    (all non-her lines when it names none) must hold a line that is not her own, and in a group a statement and
+    not only a question; a group text shares a word with its statements, and her own guess does not bring in a
+    new thing. Group: verified only when the owner (by number) said it in a line that is not a relay and no other
+    line's words are in the text, else a claim (a rule: refused); a relayed line says so in the source. Owner's
+    private chat: verified when the cited lines say what the text says (`_owner_lines_support`), else a claim; a
+    claim the owner's own first-person line backs, about himself, is a fact. Never hearsay."""
     if rows is None:
-        return None
-    if private:
-        return "verified"
-    ids = _src_lines(op_src, batch) if batch is not None and op_src is not None else []
-    me = _me(consumer)
-    said = [ID.speaker(r["line"], me) for r in rows if (not ids or r["id"] in ids) and not ID.is_self(r["line"], me)]
-    return "verified" if said and all(w == "owner" for w in said) else "group_stated"
+        return {}
+    me, src = _me(consumer), op.get("src")
+    mine = [ID.is_self(r["line"], me) for r in rows]
+    non_self = [r for r, m in zip(rows, mine) if not m]
+    self_rows = [r for r, m in zip(rows, mine) if m]
+    text = str(op.get("text") or "")
+    kind = op.get("kind") or ("promise" if update else "fact")
+    kind = kind if kind in KINDS or kind == "claim" else "fact"
+    words = lambda r: _said(r["line"])[1].strip()  # noqa: E731
+    asks = lambda r: _only_asks(words(r))  # noqa: E731
+    named = [r for r in _src_lines(src, rows) if r in non_self] if src is not None else []
+    ev = named if src is not None else non_self
+    if not ev:
+        raise ValueError("缺乏非本人原话证据，拒绝写入记忆")
+    decl = [words(r) for r in ev if not asks(r)]
+    if kind in _TRUST_STRICT and (not update or src is not None):
+        if not private:
+            if not decl and not update:
+                raise ValueError("候选原话仅为提问句，缺乏陈述证据")
+            if decl and _overlap(_lexical_features(text), "\n".join(decl)) <= 0.0:
+                raise ValueError("抽取记忆与陈述原话缺乏实词关联")
+        if self_rows and not update:
+            ours = _pairs("\n".join(words(r) for r in non_self))
+            guess = {bg for bg in _pairs("\n".join(words(r) for r in self_rows))
+                     if bg not in ours and bg not in _TRUST_IGNORE_BG and len(bg) >= 2}
+            made_up = {bg for bg in guess & _pairs(text) if bg not in "\n".join(decl)}
+            if made_up and not decl and not private:
+                raise ValueError("拒绝将室友未经确认的猜测内容写入长期记忆")
+            if len(made_up) >= 2 and len(made_up) >= max(2, len(ours & _pairs(text))):
+                raise ValueError("拒绝将室友猜测的新实体写入事实记忆")
+    weak = ("claim", "group_stated") if kind in ("fact", "preference", "person", "claim") else (kind, "group_stated")
+    if not private:
+        by_owner = [r for r in named if ID.speaker(r["line"], me) == "owner" and not asks(r)]
+        first_hand = [words(r) for r in by_owner if not _is_relayed_line(words(r))]
+        relayed = [words(r) for r in by_owner if _is_relayed_line(words(r))]
+        if first_hand and _overlap(_lexical_features(text), "\n".join(first_hand)) > 0.0:
+            ours = _pairs("\n".join(first_hand))
+            others = _pairs("\n".join(relayed + [words(r) for r in rows if ID.speaker(r["line"], me) != "owner"]))
+            if not {bg for bg in others if bg not in ours and bg not in _TRUST_IGNORE_BG and len(bg) >= 2} & _pairs(text):
+                return {"kind": kind, "trust": "group_stated" if kind == "claim" else "verified",
+                        "source": "auto:owner_verified"}
+        if kind == "rule":
+            raise ValueError("群聊规则缺乏显式房主原话陈述证据")
+        return {"kind": weak[0], "trust": weak[1], "source": "auto:relayed" if relayed and not first_hand else "auto"}
+    if not update:
+        cited = [r for r in ev if not asks(r)]
+        lines = [_annotate_relative_months(words(r), r["ts"]) for r in cited]
+        days = tuple(f for r in cited for f in _record_day_forms(r["ts"]))
+        who = [n for n in _asker_names(consumer) if n]
+        if not _owner_lines_support(text, lines, who, days):
+            if kind == "rule":
+                raise ValueError("私聊规则缺乏房主原话支持")
+            return {"kind": weak[0], "trust": weak[1], "source": "auto"}
+        if kind == "claim":  # a claim is somebody's word about somebody; the owner's own about himself is a fact
+            back = [c for c in lines if _owner_lines_support(text, [c], who, days)] or lines
+            others = [n for k, n in R.names("consumer").items() if k != consumer and n]
+            about = _about(op.get("about") or "").split("|")
+            if (all(a in {"房主", "主人", "", *who} for a in about) and _is_owner_self_text(text, others)
+                    and back and all(_FIRST_PERSON_RE.search(c) and not _is_relayed_line(c) for c in back)):
+                return {"kind": "fact", "trust": "verified", "source": "auto"}
+            return {"kind": "claim", "trust": "group_stated", "source": "auto"}
+    return {"kind": kind, "trust": "group_stated" if kind == "claim" else "verified", "source": "auto"}
 
 
 def _apply(consumer, chat, ops, private, scribe, source, src=None, rows=None):
@@ -1897,19 +2116,20 @@ def _apply(consumer, chat, ops, private, scribe, source, src=None, rows=None):
             kind = op.get("op")
             if kind == "add":
                 scope = "public" if (scribe and not private and op.get("scope") == "public") else "own"
-                mid, how = add(consumer, chat, op.get("text"), about=op.get("about") or "", kind=op.get("kind"),
-                               scope=scope, source=source, trust=_op_trust(consumer, private, rows, op.get("src"), src))
+                mid, how = add(consumer, chat, op.get("text"), about=op.get("about") or "", scope=scope,
+                               **{"kind": op.get("kind"), "source": source, **_op_trust(consumer, private, rows, op)})
                 if how != "same":
                     done["added" if how == "added" else "merged"] += 1
                 if src is not None and op.get("src") is not None:
                     _src_add(mid, op.get("src"), src)
             elif kind == "update":
-                trust = _op_trust(consumer, private, rows, op.get("src"), src)
-                old = _own_row(consumer, chat, op.get("id")) if trust not in (None, "verified") else None
+                lv = _op_trust(consumer, private, rows, op, update=True)
+                old = _own_row(consumer, chat, op.get("id")) if lv.get("trust", "verified") != "verified" else None
                 if old is not None and old["trust"] == "verified" and old["kind"] != "diary":
                     # 2026-11-24 owner: only the owner rewrites a verified memory; another's version goes in beside it
+                    # (with TRUST on: as a claim, as the kit's own store did)
                     mid, how = add(consumer, chat, op.get("text"), about=op.get("about") or old["about"],
-                                   kind=old["kind"], source=source, trust=trust)
+                                   kind="claim", source=lv["source"], trust=lv["trust"])
                     if how != "same":
                         done["added" if how == "added" else "merged"] += 1
                     if src is not None and op.get("src") is not None:
@@ -1957,6 +2177,8 @@ def extract(consumer, chat, private, most=None, again=False):
         if marked:
             # the dates of 明天 / 上周二 worked out here, and the line number an op's "src" refers to
             shown = f"L{len(selected) + 1} {_dated_line(shown, r['ts'])}"
+        elif TRUST:  # 2026-11-24: the line number an op's "src" refers to, which what the owner said is checked against
+            shown = f"L{len(selected) + 1} {shown}"
         addition = ([header] if header else []) + [shown]
         extra_chars = sum(len(p) + 1 for p in addition)
         # Every observed line is at most 800 chars, so the first row always fits.
@@ -1974,7 +2196,7 @@ def extract(consumer, chat, private, most=None, again=False):
             f"聊天记录（{'房主私聊' if private else '群聊'}）：\n{transcript}")
     t0 = time.time()
     try:
-        got = llm(_system(consumer, bool(private), scribe, "chat") + (EVIDENCE_PROMPT if marked else "")
+        got = llm(_system(consumer, bool(private), scribe, "chat") + (EVIDENCE_PROMPT if marked else TRUST_PROMPT if TRUST else "")
                   + (INTENTS.prompt(NAMES.get(consumer, consumer)) if INTENTS else ""), user)
     except Blocked:
         if len(selected) > 1:

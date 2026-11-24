@@ -302,10 +302,10 @@ class CommonMemoryStore:
         def _visible_sql(consumer: str, chat: str) -> Tuple[str, List[Any]]:
             if not getattr(self._tl, "world_view", False):
                 return visible(consumer, chat)
-            where = "id in (select mem_id from kit_origin where scope='world')"
+            where = "(id in (select mem_id from kit_origin where scope='world') and (owner=? or scope='public'))"
             if mod.DIARY_PRIVATE:
-                return f"status='active' and kind!='diary' and {where}", []
-            return f"status='active' and ({where} or (kind='diary' and owner=?))", [consumer]
+                return f"status='active' and kind!='diary' and {where}", [consumer]
+            return f"status='active' and ({where} or (kind='diary' and owner=?))", [consumer, consumer]
 
         def recent_block(consumer: str, chat: str, text: str) -> str:
             return "" if getattr(self._tl, "world_view", False) else recent(consumer, chat, text)
@@ -630,8 +630,6 @@ class CommonMemoryStore:
             if float(ttl_s) <= 0:
                 raise ValueError("ttl_s 必须大于 0")
             expires_at = ts + float(ttl_s)
-        if trust is None and kind == "claim":  # the old store's kind for what somebody merely said
-            trust = "group_stated"
         with mod.time.at(ts):
             if kind == "diary":
                 # the housemate's own. Written from the house group, so the shared module keeps it as her own
@@ -639,7 +637,9 @@ class CommonMemoryStore:
                 # the module keeps it private and shows it in the owner's private chat only.
                 return int(mod.diary(actor, WEB_GROUP_CHAT, text)), "added"
             chat = self._chat_for(mod, scope, resolved)
-            shared_row = scope == "world" or (scope == "group" and bool(shared))
+            # a `world` memory is hers unless it is saved as shared, as in the old store: another housemate does
+            # not get it (it lives with the web group's rows; `kit_origin` remembers that it is a world one)
+            shared_row = scope in ("group", "world") and bool(shared)
             mid, how = mod.add(actor, chat, text, about=about if about is not None else "", kind=kind,
                                scope="public" if shared_row else "own", source=source, merge=merge,
                                trust=trust, expires_at=expires_at)
@@ -665,7 +665,7 @@ class CommonMemoryStore:
 
     def _kit_row(self, row: Mapping[str, Any], world: bool) -> Dict[str, Any]:
         scope, channel = self._kit_view(row, world)
-        return {
+        out = {
             "id": int(row["id"]), "owner": "shared" if row["owner"] == "public" else row["owner"], "scope": scope,
             "channel": channel, "about": row["about"], "kind": row["kind"],
             "trust": row["trust"] if "trust" in row.keys() else "", "text": row["text"],
@@ -673,6 +673,9 @@ class CommonMemoryStore:
             "last_used": row["last_used"], "uses": row["uses"],
             "expires_at": row["expires_at"] if "expires_at" in row.keys() else None,
         }
+        if "_conflict" in row.keys():  # a search hit the shared module marked as contradicting a verified memory
+            out["_conflict_verified"] = True
+        return out
 
     def list_entries(
         self,
@@ -710,8 +713,8 @@ class CommonMemoryStore:
         else:
             if actor:
                 act = self._valid_actor(actor)
-                clauses.append(f"((kind='diary' and owner=?) or ({origin} and owner='public'))")
-                params.append(act)
+                clauses.append(f"((kind='diary' and owner=?) or ({origin} and owner in (?, 'public')))")
+                params += [act, act]
             else:
                 clauses.append(f"(kind='diary' or {origin})")
         if kind:

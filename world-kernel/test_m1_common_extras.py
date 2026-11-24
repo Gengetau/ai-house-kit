@@ -310,8 +310,12 @@ class TrustExtractorTests(Case):
         self.assertEqual([r["trust"] for r in self.rows()], ["verified"])
 
     def test_in_a_group_what_only_the_owner_said_is_verified(self):
-        self.run_extract(GROUP, [OWNER_SAYS, HER_OWN], [self.ADD])
+        self.run_extract(GROUP, [OWNER_SAYS, HER_OWN], [dict(self.ADD, src=[1])])  # 2026-11-24: the op names its line
         self.assertEqual([r["trust"] for r in self.rows()], ["verified"])
+
+    def test_in_a_group_an_op_that_names_no_line_is_not_verified(self):
+        self.run_extract(GROUP, [OWNER_SAYS, HER_OWN], [self.ADD])
+        self.assertEqual([r["trust"] for r in self.rows()], ["group_stated"])
 
     def test_in_a_group_what_others_said_is_not(self):
         self.run_extract(GROUP, [OWNER_SAYS, OTHER_SAYS], [self.ADD])
@@ -325,7 +329,8 @@ class TrustExtractorTests(Case):
         with patch.multiple(self.m, EVIDENCE=True):
             self.m.init()
             self.run_extract(GROUP, [OWNER_SAYS, OTHER_SAYS],
-                             [dict(self.ADD, src=[1]), dict(self.ADD, text="路人觉得房主对花生不过敏，没事", src=[2])])
+                             [dict(self.ADD, text="房主花生过敏，吃了会起疹子", src=[1]),
+                              dict(self.ADD, text="路人觉得房主对花生不过敏，没事", src=[2])])
         self.assertEqual([r["trust"] for r in self.rows()], ["verified", "group_stated"])
 
     def test_another_one_cannot_rewrite_a_verified_memory_but_the_owner_can(self):
@@ -334,7 +339,7 @@ class TrustExtractorTests(Case):
         rows = self.rows()
         self.assertEqual([(r["text"], r["trust"]) for r in rows],
                          [("房主对花生过敏，吃了会起疹子", "verified"), ("房主对花生一点都不过敏", "group_stated")])
-        self.run_extract(GROUP, [OWNER_SAYS], [{"op": "update", "id": mid, "text": "房主对花生和虾都过敏"}])
+        self.run_extract(GROUP, [OWNER_SAYS], [{"op": "update", "id": mid, "text": "房主对花生和虾都过敏", "src": [1]}])
         self.assertEqual(self.rows()[0]["text"], "房主对花生和虾都过敏")
         self.assertEqual(len(self.rows()), 2)
 
@@ -342,6 +347,181 @@ class TrustExtractorTests(Case):
         self.m.llm = lambda system, user: {"ops": [self.ADD]}
         self.m.import_notebook("nia", GROUP, "房主对花生过敏")
         self.assertEqual([r["trust"] for r in self.rows()], ["verified"])
+
+
+# ---- 3b. the rest of the kit's own trust rules, ported behind the same switch (2026-11-24) ------------------------
+
+OWNER_LINE = "[房主|999] (message_id=11): 我对花生过敏，我的生日是3月14日"
+HER_GUESS = "[妮娅(你)|1000] (message_id=12): 你是不是对虾过敏呀"
+FRIEND = "[路人|42] (message_id=13): 我听说房主周三要去京都出差"
+RELAYED = "[房主|999] (message_id=14): 小林说他对花生过敏"
+FIRST_HAND = "[房主|999] (message_id=15): 医生说我对花生过敏"
+QUESTION = "[路人|42] (message_id=16): 房主有什么过敏或者忌口吗？"
+
+
+class TrustRulesCase(Case):
+    def ex(self, chat, lines, ops, private=0):
+        """Run one extraction with a model that answers `ops`; keeps what the model was shown in self.shown."""
+        self.shown = []
+        self.m.llm = lambda system, user: (self.shown.append((system, user)), {"ops": ops})[1]
+        self.m.observe("nia", chat, lines)
+        return self.m.extract("nia", chat, private)
+
+    def rows(self):
+        with self.m.db() as c:
+            return [dict(r) for r in c.execute("select * from mem where status='active' order by id")]
+
+    def one(self, chat, lines, op, private=0):
+        res = self.ex(chat, lines, [op], private)
+        rows = self.rows()
+        return res, rows[-1] if rows else None
+
+
+class TrustRulesOnTests(TrustRulesCase):
+    env = {"MEMORY_TRUST": "1"}
+
+    # 1. a relayed line is somebody else's word, even from the owner's mouth
+    def test_a_relayed_line_is_a_claim_that_says_so_and_a_first_hand_one_is_not(self):
+        _, row = self.one(GROUP, [RELAYED], {"op": "add", "text": "小林对花生过敏", "kind": "fact", "src": [1]})
+        self.assertEqual((row["kind"], row["trust"], row["source"]), ("claim", "group_stated", "auto:relayed"))
+        _, row = self.one(GROUP, [FIRST_HAND], {"op": "add", "text": "房主对花生过敏", "kind": "fact", "src": [1]})
+        self.assertEqual((row["kind"], row["trust"], row["source"]), ("fact", "verified", "auto:owner_verified"))
+
+    def test_the_extractor_never_marks_hearsay_itself(self):
+        for line in (RELAYED, FRIEND, OWNER_LINE):
+            self.setUp()
+            _, row = self.one(GROUP, [line], {"op": "add", "text": "房主对花生过敏", "kind": "fact", "src": [1]})
+            self.assertNotEqual(row["trust"] if row else "", "hearsay")
+
+    # 2. the memory's wording against what the owner said
+    def test_in_the_owners_chat_a_changed_allergen_birthday_or_month_is_downgraded(self):
+        for kind, text, want in (
+            ("fact", "房主对花生过敏", ("fact", "verified")),
+            ("fact", "房主的生日是3月14日", ("fact", "verified")),
+            ("fact", "房主对虾过敏", ("claim", "group_stated")),
+            ("fact", "房主的生日是3月15日", ("claim", "group_stated")),
+            ("event", "房主打算2026年10月辞职开咖啡店", ("event", "group_stated")),  # the owner said 12月 below
+        ):
+            with self.subTest(text=text):
+                self.setUp()
+                line = "[房主|999] (message_id=11): 我打算12月辞职去开咖啡店" if kind == "event" else OWNER_LINE
+                _, row = self.one(OWNER, [line], {"op": "add", "text": text, "kind": kind, "src": [1]}, private=1)
+                self.assertEqual((row["kind"], row["trust"]), want)
+
+    def test_in_a_group_the_words_of_somebody_else_keep_a_text_from_being_verified(self):
+        op = {"op": "add", "text": "房主周三要去京都出差", "kind": "fact", "src": [1]}
+        _, row = self.one(GROUP, ["[房主|999] (message_id=11): 我周五要去京都出差", FRIEND], op)
+        self.assertEqual((row["kind"], row["trust"]), ("claim", "group_stated"))
+        self.setUp()
+        _, row = self.one(GROUP, ["[房主|999] (message_id=11): 我周五要去京都出差", FRIEND],
+                          dict(op, text="周五要去京都出差"))
+        self.assertEqual((row["kind"], row["trust"], row["source"]), ("fact", "verified", "auto:owner_verified"))
+
+    def test_a_group_rule_needs_the_owners_words(self):
+        res, row = self.one(GROUP, [FRIEND], {"op": "add", "text": "以后群里禁止提京都出差", "kind": "rule", "src": [1]})
+        self.assertEqual((res["added"], res["rejected"], row), (0, 1, None))
+
+    # 3. in the owner's chat, what his words do not carry is an inference
+    def test_what_the_owners_words_do_not_carry_is_an_inference_and_still_comes_to_mind(self):
+        _, row = self.one(OWNER, [OWNER_LINE], {"op": "add", "text": "房主养了一只狗", "kind": "fact", "src": [1]}, private=1)
+        self.assertEqual((row["kind"], row["trust"], row["scope"]), ("claim", "group_stated", "private"))
+        with self.m.db() as c:
+            line = self.m._fmt(c.execute("select * from mem where id=?", (row["id"],)).fetchone())
+        self.assertIn("[推断·未核实", line)
+        self.assertNotIn("群聊陈述", line)
+        self.assertIn("推断·未核实", self.m.recall("nia", OWNER, ["[房主|999] (message_id=20): 房主养了狗吗"]))
+
+    def test_a_private_rule_the_owner_did_not_give_is_refused(self):
+        self.m.RULE_CONSUMERS = {"nia"}
+        res, row = self.one(OWNER, [OWNER_LINE], {"op": "add", "text": "房主要求：以后不许提猫", "kind": "rule", "src": [1]}, 1)
+        self.assertEqual((res["added"], res["rejected"], row), (0, 1, None))
+
+    # 4. the kind `claim`
+    def test_the_claim_kind_is_kept_and_is_unverified_unless_said_otherwise(self):
+        mid, _ = self.m.add("nia", GROUP, "路人说他周末要去爬山", kind="claim")
+        with self.m.db() as c:
+            row = c.execute("select * from mem where id=?", (mid,)).fetchone()
+        self.assertEqual((row["kind"], row["trust"]), ("claim", "group_stated"))
+        self.assertIn("[群聊陈述·未核实", self.m._fmt(row))
+        self.assertIn("路人说他周末要去爬山", self.m.recall("nia", GROUP, ["[路人|42] (message_id=1): 路人周末要去爬山吗"]))
+
+    def test_a_claim_the_owner_backs_about_himself_is_a_fact_and_one_about_somebody_else_is_not(self):
+        text = "房主说自己对花生过敏"
+        _, row = self.one(OWNER, [OWNER_LINE], {"op": "add", "text": text, "kind": "claim", "about": ["房主"], "src": [1]}, 1)
+        self.assertEqual((row["kind"], row["trust"]), ("fact", "verified"))
+        self.setUp()
+        _, row = self.one(OWNER, ["[房主|999] (message_id=11): 我觉得凯对花生过敏"],
+                          {"op": "add", "text": "房主说凯对花生过敏", "kind": "claim", "about": ["房主", "凯"], "src": [1]}, 1)
+        self.assertEqual((row["kind"], row["trust"]), ("claim", "group_stated"))
+        self.setUp()
+        _, row = self.one(OWNER, [RELAYED], {"op": "add", "text": text, "kind": "claim", "about": ["房主"], "src": [1]}, 1)
+        self.assertEqual((row["kind"], row["trust"]), ("claim", "group_stated"))
+
+    # 5. an op needs lines that are not her own
+    def test_an_op_that_names_only_her_own_line_or_a_question_is_rejected(self):
+        res, row = self.one(OWNER, [OWNER_LINE, HER_GUESS], {"op": "add", "text": "房主对虾过敏", "kind": "fact", "src": [2]}, 1)
+        self.assertEqual((res["added"], res["rejected"], row), (0, 1, None))
+        self.setUp()
+        res, row = self.one(GROUP, [QUESTION], {"op": "add", "text": "房主可能对花生过敏", "kind": "fact", "src": [1]})
+        self.assertEqual((res["added"], res["rejected"], row), (0, 1, None))
+
+    def test_her_own_guess_does_not_bring_in_a_new_thing(self):
+        res, row = self.one(OWNER, ["[房主|999] (message_id=11): 我最近老是睡不好", "[妮娅(你)|1000] (message_id=12): 你是不是对花生过敏呀"],
+                            {"op": "add", "text": "房主对花生过敏", "kind": "claim", "about": ["房主"], "src": [1]}, 1)
+        self.assertEqual((res["added"], res["rejected"], row), (0, 1, None))
+
+    # 6. what the model is shown
+    def test_the_lines_are_numbered_for_src(self):
+        self.ex(GROUP, [OWNER_LINE], [])
+        system, user = self.shown[0]
+        self.assertIn("L1 [房主|999]", user)
+        self.assertIn('"src"', system)
+        self.assertNotIn("〔即", user)  # the dates of the evidence layer are not part of this
+
+    # 7. a verified memory is not rewritten by somebody else
+    def test_another_ones_version_of_a_verified_memory_is_stored_beside_it_as_a_claim(self):
+        mid, _ = self.m.add("nia", GROUP, "房主周五要去京都出差", about=["房主"])
+        self.ex(GROUP, [FRIEND], [{"op": "update", "id": mid, "text": "房主周三要去京都出差", "src": [1]}])
+        rows = self.rows()
+        self.assertEqual([(r["text"], r["kind"], r["trust"]) for r in rows],
+                         [("房主周五要去京都出差", "fact", "verified"), ("房主周三要去京都出差", "claim", "group_stated")])
+
+    # 8. the level moves the rank, not the cut-off
+    def test_a_level_does_not_push_a_match_under_the_recall_cut_off(self):
+        self.m.add("nia", OWNER, "房主说自己对坚果过敏", about=["房主"], kind="claim")
+        self.assertIn("推断·未核实", self.m.recall("nia", OWNER, ["[房主|999] (message_id=20): 房主过敏"]))
+
+
+class TrustRulesOffTests(TrustRulesCase):
+    def test_off_nothing_is_judged_numbered_or_refused(self):
+        self.assertFalse(self.m.TRUST)
+        # her own line named, a question only, a changed allergen: all stored as before
+        res = self.ex(OWNER, [OWNER_LINE, HER_GUESS], [{"op": "add", "text": "房主对虾过敏", "kind": "fact", "src": [2]}], 1)
+        self.assertEqual((res["added"], res["rejected"]), (1, 0))
+        system, user = self.shown[0]
+        self.assertNotIn("L1 ", user)
+        self.assertNotIn('"src"', system)
+        self.assertNotIn("trust", self.columns())
+        self.assertEqual([(r["kind"], r["source"]) for r in self.rows()], [("fact", "auto")])
+
+    def test_off_the_claim_kind_is_an_ordinary_fact_and_reads_as_one(self):
+        mid, _ = self.m.add("nia", GROUP, "路人说他周末要去爬山", kind="claim")
+        with self.m.db() as c:
+            row = c.execute("select * from mem where id=?", (mid,)).fetchone()
+        self.assertEqual(row["kind"], "fact")
+        self.assertNotIn("未核实", self.m._fmt(row))
+        self.assertNotIn("trust", self.columns())
+
+    def test_off_a_group_text_of_the_owner_and_a_relay_are_stored_without_a_source_tag(self):
+        self.ex(GROUP, [RELAYED], [{"op": "add", "text": "小林对花生过敏", "kind": "fact", "src": [1]}])
+        self.assertEqual([(r["kind"], r["source"]) for r in self.rows()], [("fact", "auto")])
+
+    def test_off_the_cut_off_is_the_one_it_was(self):
+        self.m.add("nia", OWNER, "房主说自己对坚果过敏", about=["房主"])
+        got = self.m.search("nia", OWNER, "房主过敏", min_score=0.0)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.m.search("nia", OWNER, "房主过敏", min_score=got[0][0] + 1e-9), [])
+        self.assertEqual(len(self.m.search("nia", OWNER, "房主过敏", min_score=got[0][0])), 1)
 
 
 # ---- 4. expiry ------------------------------------------------------------------------------------------------

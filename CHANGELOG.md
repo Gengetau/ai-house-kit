@@ -12,6 +12,9 @@
 - 把 kit 现有 327 个涉及记忆的用例对着适配层跑了一遍并逐个归类（`docs/PORTING-PLAN.md` 15.7）；查出的适配层四处缺陷已修（`world` 召回读到群里的记忆、重置不删新库、向量插件拿到带空格的问题、没给频道时出站检查被放过）。
 - 公共代码在没有向量可比时改按问句里的实义词回想（有向量时分数不变）；刚说还没整理的话可按关键词带出（`MEMORY_RECENT_KEYWORD`，公共代码默认关，适配层替 kit 打开）；新增 `backfill_vectors()`。适配层补回 `search`、`update`、`sweep_expired`、`backfill_vectors`。见 `docs/PORTING-PLAN.md` 15.9。
 - 新增开关 `AI_HOUSE_MEMORY_BACKEND`：写 `common` 才用这套与私有部署共用代码的记忆库（试用，旧记忆暂不带过来）；不写就是原来的记忆库，行为不变。写错时 `ai-house up` 拒绝启动，`ai-house doctor` 会显示当前用的是哪一套。
+- 可信度余下的规则搬进公共代码（转述句、与房主原话对照、私聊里的推断、`claim` 类别、依据门槛），都在可信度开关后面。
+- 新增旧库迁移工具 `python3 -m ai_house.memory_migrate <数据目录> [--dry-run]`：把 `memory.db` 里的记忆带进 `memory-common.db`，只读旧文件、可重复运行、报告不含记忆内容。还没有接进 `ai-house` 命令。
+- 适配层修正：`world` 范围的记忆属于存它的住客，除非明说是共有的（原先一律存成全屋公共）。
 - 除这个默认关闭的开关外，以上都没有改动运行路径，`MemoryStore` 还是旧实现；新旧行为的差别表和后续步骤见 `docs/PORTING-PLAN.md` 第 15 节。
 
 ### 私聊记忆进群（可选，两个独立开关，默认都关，行为不变）
