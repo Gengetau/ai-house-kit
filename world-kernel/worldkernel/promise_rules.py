@@ -4,6 +4,7 @@ import re
 
 from . import vocab_life1 as _V
 BOTS = frozenset(_V.ROSTER)
+DEFAULT_NAMES = ("奈尔", "艾莎", "阿尔玛", "米娜", "由纪", "婉妲", "房主")  # the default pack's people and the owner
 KINDS = {"arrived", "activity", "purchased", "brought_home", "handoff"}
 NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 UNITS = r"[份包袋瓶个块杯盒]"
@@ -12,10 +13,14 @@ TOGETHER_S = 600
 
 
 def compile_terms(text, vocab, party=None):
-    """Closed grammar: unrecognised residue blocks automatic completion, never drops a clause."""
+    """Closed grammar: unrecognised residue blocks automatic completion, never drops a clause. The names and
+    the housemates it knows are those of the default pack; `bound(vocab)` gives the same for another pack."""
+    return _compile_terms(text, vocab, party, DEFAULT_NAMES)
+
+
+def _compile_terms(text, vocab, party, names):
     from .inventory import RULES
     t = str(text)
-    names = ("奈尔", "艾莎", "阿尔玛", "米娜", "由纪", "婉妲", "房主")
     people = len(party) if party is not None else sum(name in t for name in names)
     for name in sorted(list(vocab.PEOPLE), key=len, reverse=True):
         t = t.replace(name, "")
@@ -128,31 +133,35 @@ def _overlap(rows, seconds):
 
 def judge(intent, evidence, now):
     """Cross-trip quantities accumulate only from trips proving the other conditions too."""
+    return _judge_all(intent, evidence, now, BOTS)
+
+
+def _judge_all(intent, evidence, now, bots):
     terms = intent.get("terms", [])
     other = [t for t in terms if t.get("kind") not in ("purchased", "brought_home")]
     if other and len(other) != len(terms):
         eligible, support = set(), []
         for plan in {e.get("plan_id") for e in evidence if e.get("plan_id")}:
             result = _judge(dict(intent, terms=other),
-                            [e for e in evidence if e.get("plan_id") == plan], now)
+                            [e for e in evidence if e.get("plan_id") == plan], now, bots)
             if result["complete"]:
                 eligible.add(plan)
                 support.extend(result["keys"])
         evidence = [e for e in evidence if e.get("plan_id") in eligible]
-        result = _judge(intent, evidence, now)
+        result = _judge(intent, evidence, now, bots)
         if result["complete"]:
             result["keys"] = sorted(set(result["keys"] + support))
         return result
-    return _judge(intent, evidence, now)
+    return _judge(intent, evidence, now, bots)
 
 
-def _judge(intent, evidence, now):
+def _judge(intent, evidence, now, bots=BOTS):
     """All terms AND; returns complete + progress keys. plan_finished never satisfies a term."""
     party = intent.get("party", [])
     terms = intent.get("terms", [])
     result = {"complete": False, "keys": [], "progress": []}
     if (intent.get("status") != "accepted" or intent.get("scope", "world") != "world"
-            or not party or not set(party) <= BOTS or not terms
+            or not party or not set(party) <= bots or not terms
             or any(x.get("kind") not in KINDS for x in terms)):
         return result
     lower = max(intent.get("said_at", intent["created"]), (intent.get("due_from") or intent["created"]) - 7200)
@@ -226,3 +235,25 @@ def _judge(intent, evidence, now):
             satisfied &= bool(chosen)
     result.update(complete=bool(satisfied), keys=sorted(used), progress=progress)
     return result
+
+
+class _Bound:
+    """The two rules bound to one pack: its housemates may promise, its names are not residue."""
+
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.bots = frozenset(vocab.ROSTER)
+        self.names = tuple(str(n) for n in vocab.NAMES.values()) + ("房主",)
+
+    def compile_terms(self, text, vocab=None, party=None):
+        return _compile_terms(text, self.vocab if vocab is None else vocab, party, self.names)
+
+    def judge(self, intent, evidence, now):
+        return _judge_all(intent, evidence, now, self.bots)
+
+
+def bound(vocab):
+    """-> an object with `compile_terms(text, vocab=None, party=None)` and `judge(intent, evidence, now)` for the
+    pack `vocab` (a vocabulary namespace: ROSTER, NAMES, PLACES, ...). The module-level functions stay the default
+    pack's."""
+    return _Bound(vocab)

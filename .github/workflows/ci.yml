@@ -41,6 +41,12 @@ jobs:
         run: python -m unittest discover -s . -p 'test_*.py'
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+      - name: intents-conformance-tests
+        # the same for the shared promise module (src/ai_house/common/intents.py); four cases need the private world engine and show as skipped
+        working-directory: intents-conformance-tests
+        run: python -m unittest discover -s . -p 'test_*.py'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
 
   agent-shell:
     # Residents run by the real Claude Code shell, against a local stand-in for the model API (no key, no network).
