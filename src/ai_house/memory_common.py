@@ -264,6 +264,9 @@ class CommonMemoryStore:
         mod.UNIFIED = set(residents) if self.unified_groups else set()
         mod.PRIVATE_IN_GROUPS = bool(self.private_in_groups)
         mod.LEAK_FREE_CHATS = {self._chat_of_channel(mod, ch) for ch in self.leak_free_groups}
+        # the kit's default: a housemate's own diaries come to mind in every chat (AI_HOUSE_MEMORY_DIARY_PRIVATE=1:
+        # only in the owner's private chat, which is the shared module's own default)
+        mod.DIARY_PRIVATE = False
         for attr, value in {**self._numeric, **self._switches(residents)}.items():
             setattr(mod, attr, value)
         # `search(k=RECALL_K)` binds its default when the file is read; point it at the setting in force
@@ -579,8 +582,11 @@ class CommonMemoryStore:
         resolved = self._resolve_channel(actor, scope, channel)
         mod = self._use(actor)
         with mod.time.at(self._now(now)):
-            if kind == "diary":  # a diary is the housemate's own, kept where only the owner's private chat sees it
-                return int(mod.diary(actor, OWNER_PRIVATE_CHAT, text)), "added"
+            if kind == "diary":
+                # the housemate's own. Written from the house group, so the shared module keeps it as her own
+                # (not private) while its diary switch is off, and she finds it in every chat; with the switch on
+                # the module keeps it private and shows it in the owner's private chat only.
+                return int(mod.diary(actor, WEB_GROUP_CHAT, text)), "added"
             chat = self._chat_for(mod, scope, resolved)
             shared_row = scope == "world" or (scope == "group" and bool(shared))
             mid, how = mod.add(actor, chat, text, about=about if about is not None else "", kind=kind,

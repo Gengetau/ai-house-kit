@@ -113,9 +113,13 @@ class LeakTests(Base):
         self.assertNotIn("别在这里说出来", house)
         self.assertIn("别在这里说出来", other)
 
-    def test_off_when_owner_dm_memories_never_reach_groups(self):
-        with patch.object(memory, "PRIVATE_IN_GROUPS", False):
-            self.assertEqual(memory.leak("elsa", G, "房主下周三要去大阪出差三天"), [])
+    def test_a_group_is_checked_whatever_the_two_switches_say(self):
+        # 2026-11-24 owner: was "off when owner-DM memories never reach groups" (expected []). A group that is not
+        # exempt is now checked with either switch off; only LEAK_FREE_CHATS takes a group out.
+        for off in ({"PRIVATE_IN_GROUPS": False}, {"UNIFIED": set()}, {"PRIVATE_IN_GROUPS": False, "UNIFIED": set()}):
+            with self.subTest(off=sorted(off)), patch.multiple(memory, **off):
+                self.assertTrue(memory.leak("elsa", G, "房主下周三要去大阪出差三天"))
+                self.assertEqual(memory.leak("elsa", HOUSE, "房主下周三要去大阪出差三天"), [])
 
     def test_non_owner_private_checks_even_when_group_recall_is_disabled(self):
         with patch.object(memory, "PRIVATE_IN_GROUPS", False), patch.object(memory, "UNIFIED", set()):

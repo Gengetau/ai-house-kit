@@ -6,8 +6,9 @@
 
 - 新增 `src/ai_house/common/`：私有部署的记忆模块和按号码认人的模块，去私有化后原样搬来；与原件的差别登记在该目录的 `UPSTREAM.md`。
 - 新增 `memory-conformance-tests/`：私有部署自己的 113 个记忆用例，对着这份公共代码跑，CI 多一步。
-- 新增 `src/ai_house/memory_common.py`（`CommonMemoryStore`）：`MemoryStore` 的同一套调用，内部转给公共代码；自己的库文件 `memory-common.db`。**尚未接线**，50 个用例。
-- 这两步都没有改动运行路径，`MemoryStore` 还是旧实现；新旧行为的差别表和后续步骤见 `docs/PORTING-PLAN.md` 第 15 节。
+- 新增 `src/ai_house/memory_common.py`（`CommonMemoryStore`）：`MemoryStore` 的同一套调用，内部转给公共代码；自己的库文件 `memory-common.db`。**尚未接线**，52 个用例。
+- 公共代码按维护者的决定改了四处行为（登记在 `UPSTREAM.md`）：没列为免查的群一律做出站检查，不看开关；“私聊记忆进群”不再依附“统一记忆”；密钥过滤多认 `sk-…` 等几种写法；日记开关关闭时住客在每个会话都想得起自己的日记。适配层的日记默认随之改为“都想得起”（`AI_HOUSE_MEMORY_DIARY_PRIVATE=1` 时只在房主私聊里）。
+- 以上都没有改动运行路径，`MemoryStore` 还是旧实现；新旧行为的差别表和后续步骤见 `docs/PORTING-PLAN.md` 第 15 节。
 
 ### 私聊记忆进群（可选，两个独立开关，默认都关，行为不变）
 

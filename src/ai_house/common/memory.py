@@ -73,6 +73,8 @@ RULES_MAX, RULES_CHARS = 5, 300
 # they came from. Diaries stay out of every chat but the owner's private one (they are private now).
 # MEMORY_PRIVATE_IN_GROUPS=1: what the owner told her in private also comes to mind in groups, marked ·私密,
 # to know and not say. Bot-to-bot / game private chats never see private memories.
+# 2026-11-24 owner: the two switches stand apart. PRIVATE_IN_GROUPS no longer needs the bot to be in MEMORY_UNIFIED
+# (a bot that is not sees, in a group, that group's memories and what the owner told her in private).
 UNIFIED = {c for c in os.environ.get("MEMORY_UNIFIED", "").split(",") if c}
 PRIVATE_IN_GROUPS = os.environ.get("MEMORY_PRIVATE_IN_GROUPS", "0") == "1"
 # A-08: diary privacy survives UNIFIED rollback and legacy own/public scopes.
@@ -81,6 +83,8 @@ DIARY_PRIVATE = os.environ.get("MEMORY_DIARY_PRIVATE", "1") == "1"
 PUBLIC_EXPOSURE_GATE = os.environ.get("MEMORY_PUBLIC_EXPOSURE_GATE", "1") == "1"
 # 2026-10-25 owner (#68): "硬检查也行，加个白名单，ai小屋那个群就不设限制了". A group message is checked against
 # her owner-DM memories before it goes (leak()); these chats are not checked.
+# 2026-11-24 owner: every other group is checked whatever MEMORY_UNIFIED / MEMORY_PRIVATE_IN_GROUPS say (a private
+# memory can reach a group message by other roads than recall: the session, a tool, a diary).
 LEAK_FREE_CHATS = {c for c in os.environ.get("MEMORY_LEAK_FREE_CHATS", "").split(",") if c}  # default is empty (no chat exempt); the exempt-group default is meant to come from config
 LEAK_SHARE, LEAK_MIN_PAIRS, LEAK_COS = 0.5, 4, 0.82
 # Pending observations are opt-in; shadow records IDs/scores only, never dialogue.
@@ -149,9 +153,13 @@ DIARY_FULL = 2  # at most this many diaries shown whole in one search
 # Chat text that tries to give the bots orders, or private data, is never kept as a memory.
 INJECTION = re.compile(r"系统提示|系统通知|忽略(之前|以上|前面)|无视(之前|设定)|你(现在)?必须|从现在起你|开发者模式|"
                        r"管理员授权|prompt|jailbreak|ignore (all|previous)|指令[:：]", re.I)
-SECRETS = re.compile(r"(密码|口令|验证码|token|api[ _-]?key|身份证|银行卡)\S{0,4}[:：是为]?\s*\S{4,}", re.I)
+# 2026-11-24 owner: also two more key words and what looks like a key by itself (sk-…, agw_…), with no word before it
+KEY_LIKE = r"\bsk-[A-Za-z0-9_\-]{12,}\b|\bagw_[A-Za-z0-9_\-]{8,}\b"
+SECRETS = re.compile(r"(密码|口令|验证码|token|api[ _-]?key|secret[ _-]?key|bridge[ _-]?key|身份证|银行卡)"
+                     r"\S{0,4}[:：是为]?\s*\S{4,}|" + KEY_LIKE, re.I)
 # 2026-11-03 owner OK: the diary only refuses a keyword + [:：是为=] + a key-like ASCII value ("token换米饭" is prose)
-DIARY_SECRETS = re.compile(r"(密码|口令|验证码|token|api[ _-]?key|身份证|银行卡)\s*[:：是为=]\s*[A-Za-z0-9_\-]{6,}", re.I)
+DIARY_SECRETS = re.compile(r"(密码|口令|验证码|token|api[ _-]?key|secret[ _-]?key|bridge[ _-]?key|身份证|银行卡)"
+                           r"\s*[:：是为=]\s*[A-Za-z0-9_\-]{6,}|" + KEY_LIKE, re.I)
 
 
 # ---- storage --------------------------------------------------------------------
@@ -245,17 +253,23 @@ def _visible_sql(consumer, chat):
             return ("status='active' and ((owner=? and scope in ('own','private')) or scope='public') "
                     "and (kind!='diary' or owner=?)", [consumer, consumer])
         return ("status='active' and ((owner=? and scope in ('own','private')) or scope='public')", [consumer])
+    in_group = PRIVATE_IN_GROUPS and chat.startswith("group:")  # what the owner told her in private shows here too
     if consumer in UNIFIED:
-        mine = "('own','private')" if PRIVATE_IN_GROUPS and chat.startswith("group:") else "('own')"
+        mine = "('own','private')" if in_group else "('own')"
         # 2026-11-03 owner OK: with DIARY_PRIVATE off she recalls her OWN diaries everywhere, never another's
         if DIARY_PRIVATE:
             return (f"status='active' and kind!='diary' and ((owner=? and scope in {mine}) or scope='public')",
                     [consumer])
         return (f"status='active' and (kind!='diary' or owner=?) and ((owner=? and scope in {mine}) or scope='public')",
                 [consumer, consumer])
-    diary = "kind!='diary' and " if DIARY_PRIVATE else ""
-    return (f"status='active' and {diary}chat=? and ((owner=? and scope='own') or scope='public')",
-            [canonical(consumer, chat), consumer])
+    # not unified: this chat's own and public ones (2026-11-24: and, with PRIVATE_IN_GROUPS, her private ones in a group)
+    here, params = "(chat=? and ((owner=? and scope='own') or scope='public'))", [canonical(consumer, chat), consumer]
+    if in_group:
+        here, params = here + " or (owner=? and scope='private')", params + [consumer]
+    if DIARY_PRIVATE:
+        return (f"status='active' and kind!='diary' and ({here})", params)
+    # 2026-11-24 owner: with DIARY_PRIVATE off her OWN diaries (scope own) come to mind in every chat here too
+    return (f"status='active' and ({here} or (kind='diary' and owner=? and scope='own'))", params + [consumer])
 
 
 def _writable_sql(consumer, chat):
@@ -275,7 +289,7 @@ def _writable_sql(consumer, chat):
 
 def _private_note(consumer, chat):
     """Recall header line for private memories shown outside the owner's private chat ('' when none can be)."""
-    if consumer in UNIFIED and PRIVATE_IN_GROUPS and chat.startswith("group:") and not owner_private(consumer, chat):
+    if PRIVATE_IN_GROUPS and chat.startswith("group:") and not owner_private(consumer, chat):
         if chat in LEAK_FREE_CHATS:  # owner 10-25 「可以」: in the 小屋 group they may talk about it naturally
             return "标着·私密的是房主私聊里跟你说的事：这里是小屋自己的群，想提可以自然地提。\n"
         return "标着·私密的是房主私聊里跟你说的事：心里知道就好，别在这里说出来，也别暗示。\n"
@@ -286,13 +300,12 @@ def leak(consumer, chat, text):
     """The owner-DM memories a group message would give away (owner #68): ids of her private memories whose
     character pairs it mostly repeats, or that it says again in other words (vector close and still sharing
     some pairs). Negative ids refer to pending seen rows, positive ids to mem rows.
-    [] when fine, when the chat is not checked, or when there is nothing private to give away."""
+    [] when fine, when the chat is not checked, or when there is nothing private to give away.
+    Checked: every group not in LEAK_FREE_CHATS and every private chat but the owner's own (2026-11-24 owner: a
+    group is checked whatever MEMORY_UNIFIED / MEMORY_PRIVATE_IN_GROUPS say)."""
     chat = _valid_chat(chat)
     text = str(text or "").strip()
-    external_private = chat.startswith("private:") and not owner_private(consumer, chat)
-    if (not external_private and (not (consumer in UNIFIED and PRIVATE_IN_GROUPS)
-                                 or not chat.startswith("group:") or chat in LEAK_FREE_CHATS)) \
-            or owner_private(consumer, chat) or len(text) < 4:
+    if owner_private(consumer, chat) or len(text) < 4 or (chat.startswith("group:") and chat in LEAK_FREE_CHATS):
         return []
     with db() as c:
         rows = c.execute("select id, text, vec from mem where owner=? and scope='private' and status='active' "
@@ -563,7 +576,8 @@ def recent_block(consumer, chat, text):
         return ""
     if not (chat.startswith("group:") or owner_private(consumer, chat)):
         return ""
-    if chat.startswith("group:") and consumer not in UNIFIED:
+    allow_private = PRIVATE_IN_GROUPS and chat.startswith("group:")
+    if chat.startswith("group:") and consumer not in UNIFIED and not allow_private:
         return ""  # without unified memory a group may not see other chats
     try:
         now = time.time()
@@ -571,11 +585,15 @@ def recent_block(consumer, chat, text):
         same = {chat, canon} | {k.split("@", 1)[1] for k, v in CHAT_ALIASES.items()
                                 if k.startswith(consumer + "@") and v == canon}
         private_chats = _owner_private_chats(consumer)
-        allow_private = consumer in UNIFIED and PRIVATE_IN_GROUPS and chat.startswith("group:")
-        visible, params = "(private=0 and chat like 'group:%')", []
+        visible, params = [], []
+        if consumer in UNIFIED or not chat.startswith("group:"):  # other groups: the owner's chat, or a unified bot
+            visible.append("(private=0 and chat like 'group:%')")
         if allow_private and private_chats:
-            visible += " or (private=1 and chat in (" + ",".join("?" for _ in private_chats) + "))"
+            visible.append("(private=1 and chat in (" + ",".join("?" for _ in private_chats) + "))")
             params.extend(sorted(private_chats))
+        if not visible:
+            return ""
+        visible = " or ".join(visible)
         with db() as c:
             rows = c.execute("select * from seen where consumer=? and done=0 and ts>=? and ts<=? "
                              "and chat not in (" + ",".join("?" for _ in same) + ") and (" + visible + ") "

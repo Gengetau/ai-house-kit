@@ -61,11 +61,20 @@ class RecentTests(unittest.TestCase):
         with patch.object(memory, "UNIFIED", set()):
             self.assertIn("橙子", self.block(OWNER))
 
-    def test_group_private_requires_both_permissions_and_owner(self):
+    def test_group_private_requires_its_permission_and_owner(self):
+        # 2026-11-24 owner: was "requires both permissions" (UNIFIED and PRIVATE_IN_GROUPS). The two stand apart now:
+        # without UNIFIED a group still gets the owner's private lines, and still no other group's.
         self.seen(OWNER)
+        self.seen(ELSEWHERE, "[测试者|606] (message_id=708): 合成话题苹果")
         self.assertIn("房主私聊·私密：你知道，但别在群里说出来", self.block())
-        for setting, value in (("UNIFIED", set()), ("PRIVATE_IN_GROUPS", False), ("OWNER_CHATS", set())):
+        self.assertIn("苹果", self.block())
+        for setting, value in (("PRIVATE_IN_GROUPS", False), ("OWNER_CHATS", set())):
             with self.subTest(setting=setting), patch.object(memory, setting, value):
+                self.assertNotIn("房主私聊", self.block())
+        with patch.object(memory, "UNIFIED", set()):
+            self.assertIn("房主私聊·私密：你知道，但别在群里说出来", self.block())
+            self.assertNotIn("苹果", self.block())
+            with patch.object(memory, "PRIVATE_IN_GROUPS", False):
                 self.assertEqual(self.block(), "")
 
     def test_owner_gets_all_groups_but_not_other_private(self):
@@ -256,11 +265,14 @@ class PendingLeakTests(unittest.TestCase):
 
     def test_pending_leak_permissions_allowlist_and_private_chat_are_unchanged(self):
         line = "合成房主下周要去海边旅馆住两天"
-        self.seen(OWNER, line)
-        for name, value in (("RECENT", set()), ("UNIFIED", set()), ("PRIVATE_IN_GROUPS", False),
-                            ("OWNER_CHATS", set()), ("LEAK_FREE_CHATS", {GROUP})):
+        mid = self.seen(OWNER, line)
+        for name, value in (("RECENT", set()), ("OWNER_CHATS", set()), ("LEAK_FREE_CHATS", {GROUP})):
             with self.subTest(name=name), patch.object(memory, name, value):
                 self.assertEqual(memory.leak(BOT, GROUP, line), [])
+        # 2026-11-24 owner: these two were in the list above (expected []); a group is checked whatever they say
+        for name, value in (("UNIFIED", set()), ("PRIVATE_IN_GROUPS", False)):
+            with self.subTest(name=name), patch.object(memory, name, value):
+                self.assertEqual(memory.leak(BOT, GROUP, line), [-mid])
         self.assertEqual(memory.leak(BOT, OWNER, line), [])
 
     def test_pending_leak_matches_injected_sanitized_excerpt(self):

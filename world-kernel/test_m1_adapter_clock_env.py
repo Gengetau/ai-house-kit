@@ -139,7 +139,8 @@ class HostEnvironmentTests(StoreCase):
             self.assertFalse(dirty.vector_enabled)  # MEMORY_EMBED_URL is not read
             dirty.add("nia", "private", SECRET_PLAN, now=T0)
             self.assertEqual(dirty.recall("nia", "group", ASK_PLAN, channel="qq-group:111", now=T0), "")
-            self.assertEqual(dirty.check_outbound_leak("nia", "group", SECRET_PLAN, channel="qq-group:111", now=T0), [])
+            # the group is checked (it is not listed here; the host's MEMORY_LEAK_FREE_CHATS did not exempt anything)
+            self.assertEqual(len(dirty.check_outbound_leak("nia", "group", SECRET_PLAN, channel="qq-group:111", now=T0)), 1)
             self.assertFalse(dirty.leak_free_in("qq-group:111"))
             self.assertEqual(len(dirty.list_entries("nia", "private")), 1)  # MEMORY_MAX_ACTIVE=1 did not trim anything
             dirty.add("nia", "private", "房主喜欢喝热的豆浆。", now=T0)
@@ -184,16 +185,18 @@ class SettingsTests(StoreCase):
     def test_the_other_switches_have_an_environment_entry_and_a_code_default(self):
         base = self.make()._mod
         self.assertEqual((base.RULE_CONSUMERS, base.RECENT, base.URGENT, base.EVIDENCE, base.PUBLIC_SCRIBES), (set(),) * 2 + (False, False, set()))
-        self.assertTrue(base.DIARY_PRIVATE and base.PUBLIC_EXPOSURE_GATE)
+        self.assertTrue(base.PUBLIC_EXPOSURE_GATE)
+        self.assertFalse(base.DIARY_PRIVATE)  # the kit's own default: her diaries come to mind in every chat
+        self.assertTrue(self.make(env={"AI_HOUSE_MEMORY_DIARY_PRIVATE": "1"})._mod.DIARY_PRIVATE)
         env = {"AI_HOUSE_MEMORY_RULES": "nia", "AI_HOUSE_MEMORY_RECENT": "all", "AI_HOUSE_MEMORY_RECENT_K": "99",
                "AI_HOUSE_MEMORY_RECENT_WINDOW_S": "60", "AI_HOUSE_MEMORY_URGENT": "1", "AI_HOUSE_MEMORY_URGENT_GAP_S": "10",
                "AI_HOUSE_MEMORY_EVIDENCE": "1", "AI_HOUSE_MEMORY_EVIDENCE_FOR": "nia", "AI_HOUSE_MEMORY_EVIDENCE_CHARS": "100",
-               "AI_HOUSE_MEMORY_PUBLIC_SCRIBES": "xingli", "AI_HOUSE_MEMORY_DIARY_PRIVATE": "0",
+               "AI_HOUSE_MEMORY_PUBLIC_SCRIBES": "xingli", "AI_HOUSE_MEMORY_DIARY_PRIVATE": "1",
                "AI_HOUSE_MEMORY_PUBLIC_EXPOSURE_GATE": "0"}
         mod = self.make(env=env)._mod
         self.assertEqual((mod.RULE_CONSUMERS, mod.RECENT, mod.RECENT_K, mod.RECENT_WINDOW_S), ({"nia"}, {"nia", "xingli"}, 40, 60))
         self.assertEqual((mod.URGENT, mod.URGENT_GAP_S, mod.EVIDENCE, mod.EVIDENCE_FOR, mod.EVIDENCE_CHARS), (True, 10, True, {"nia"}, 100))
-        self.assertEqual((mod.PUBLIC_SCRIBES, mod.DIARY_PRIVATE, mod.PUBLIC_EXPOSURE_GATE), ({"xingli"}, False, False))
+        self.assertEqual((mod.PUBLIC_SCRIBES, mod.DIARY_PRIVATE, mod.PUBLIC_EXPOSURE_GATE), ({"xingli"}, True, False))
 
     def test_a_rule_the_owner_gives_in_private_needs_the_rules_switch(self):
         off, on = self.make(), self.make(env={"AI_HOUSE_MEMORY_RULES": "nia"})

@@ -120,13 +120,27 @@ class PrivacyTests(StoreCase):
         self.assertIn("想提可以自然地提", st.recall("nia", "group", ASK_PLAN, channel="", now=T0))  # empty = web group
         self.assertIn("别在这里说出来", st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0))
 
-    def test_private_in_groups_without_unified_does_nothing_in_the_shared_module(self):
-        # Known difference from the old store (reported): the shared module only reads private memories into a
-        # group, and only checks outbound text, for a housemate in its UNIFIED set.
+    def test_private_in_groups_works_without_unified(self):
+        # The two switches stand apart (decided 2026-11-24; before, the shared module needed both).
         st = self.make(private_in_groups=True)
         st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
+        st.add("nia", "group", "阿甲在另一个群里说他周末要去爬山。", channel=LISTED, about=["阿甲"], now=T0)
+        hush = st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0)
+        self.assertIn("·私密", hush)
+        self.assertIn("别在这里说出来", hush)
+        self.assertEqual(st.recall("nia", "group", "阿甲周末要去爬山吗", channel=GROUP, now=T0), "")  # not unified
+        self.assertEqual(st.recall("xingli", "group", ASK_PLAN, channel=GROUP, now=T0), "")
+        self.assertEqual(len(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=GROUP, now=T0)), 1)
+
+    def test_outbound_check_runs_in_unlisted_groups_with_both_switches_off(self):
+        # decided 2026-11-24: a group that is not listed is checked whatever the two switches say
+        st = self.make(leak_free_groups=[LISTED])
+        st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
         self.assertEqual(st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0), "")
-        self.assertEqual(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=GROUP, now=T0), [])
+        self.assertEqual(len(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=GROUP, now=T0)), 1)
+        self.assertEqual(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=LISTED, now=T0), [])
+        self.assertEqual(st.check_outbound_leak("nia", "private", REPEAT_PLAN, now=T0), [])
+        self.assertEqual(st.check_outbound_leak("xingli", "group", REPEAT_PLAN, channel=GROUP, now=T0), [])
 
     def test_group_memories_stay_in_their_own_group_unless_unified(self):
         st = self.make()
@@ -218,14 +232,34 @@ class LinesAndSpeakerTests(StoreCase):
 
 
 class AddListInvalidateTests(StoreCase):
-    def test_a_diary_is_found_in_the_owners_private_chat_and_nowhere_else(self):
-        st = self.make()
+    def test_with_the_diary_switch_on_a_diary_is_found_in_the_owners_private_chat_only(self):
         diary = "今天和房主一起收拾了阳台，种下了新买的薄荷，晚上聊了很久的旅行计划。"
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                st = self.make(unified_groups=unified, private_in_groups=unified,
+                               env={"AI_HOUSE_MEMORY_DIARY_PRIVATE": "1"})
+                st.add("nia", "world", f"2026-11-24 日记：{diary}", kind="diary", source="diary", now=T0)
+                self.assertIn("薄荷", st.recall("nia", "private", "今天种下了新买的薄荷", now=T0))
+                self.assertEqual(st.recall("nia", "group", "今天种下了新买的薄荷", channel=GROUP, now=T0), "")
+                self.assertEqual(st.recall("nia", "group", "今天种下了新买的薄荷", now=T0), "")
+                self.assertEqual(st.recall("xingli", "private", "今天种下了新买的薄荷", now=T0), "")
+
+    def test_a_diary_is_found_by_its_writer_in_every_chat_and_by_nobody_else(self):
+        # the kit's default (decided 2026-11-24): her own diaries come to mind in groups too, unified or not
+        diary = "今天和房主一起收拾了阳台，种下了新买的薄荷，晚上聊了很久的旅行计划。"
+        for unified in (True, False):
+            with self.subTest(unified=unified):
+                self.one_diary_everywhere(self.make(unified_groups=unified), diary)
+
+    def one_diary_everywhere(self, st, diary):
         mid, how = st.add("nia", "world", f"2026-11-24 日记：{diary}", kind="diary", source="diary", now=T0)
         self.assertEqual(how, "added")
         self.assertIn("薄荷", st.recall("nia", "private", "今天种下了新买的薄荷", now=T0))
-        self.assertEqual(st.recall("nia", "group", "今天种下了新买的薄荷", channel=GROUP, now=T0), "")
+        self.assertIn("薄荷", st.recall("nia", "group", "今天种下了新买的薄荷", channel=GROUP, now=T0))
+        self.assertIn("薄荷", st.recall("nia", "group", "今天种下了新买的薄荷", now=T0))
         self.assertEqual(st.recall("xingli", "private", "今天种下了新买的薄荷", now=T0), "")
+        self.assertEqual(st.recall("xingli", "group", "今天种下了新买的薄荷", channel=GROUP, now=T0), "")
+        self.assertEqual(st.recall("xingli", "group", "今天种下了新买的薄荷", now=T0), "")
         row = st.list_entries("nia", "world", now=T0)[0]
         self.assertEqual((row["id"], row["kind"], row["scope"], row["channel"], row["owner"]),
                          (mid, "diary", "world", "world", "nia"))
