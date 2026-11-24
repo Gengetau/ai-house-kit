@@ -45,6 +45,7 @@ from .intents import CommitmentStore, diet_memo_blocked, reply_declines
 from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
+from .memory_common import CommonMemoryStore
 from .proactive import ProactiveEngine
 from .send_gate import SendGate
 from .onboarding import (
@@ -206,6 +207,25 @@ def _acquire_runtime_lock(lock_file: Path) -> None:
 
 # `RoommateChatAgent.pick_group_responders` lets at most this many roommates answer one house-group message.
 _GROUP_MAX_RESPONDERS = 2
+
+
+MEMORY_BACKEND_ENV = "AI_HOUSE_MEMORY_BACKEND"
+MEMORY_BACKENDS = ("legacy", "common")
+
+
+def memory_backend_problem(raw: Any) -> str:
+    """Why `AI_HOUSE_MEMORY_BACKEND` cannot be used, or `''` when it is empty or one of the known names."""
+    val = str(raw or "").strip().lower()
+    if val in ("",) + MEMORY_BACKENDS:
+        return ""
+    return f"{MEMORY_BACKEND_ENV} 只能写 legacy（原来的记忆库，默认）或 common（与私有部署共用代码的记忆库，试用），现在写的是 {val[:20]!r}"
+
+
+def memory_backend(env: Optional[Mapping[str, str]]) -> str:
+    """Which memory store the house runs on. `common` is the store that shares the private deployment's code
+    (`memory_common.py`, its own `memory-common.db`); anything else, a misspelt name included, is the old one."""
+    val = str((env or {}).get(MEMORY_BACKEND_ENV) or "").strip().lower()
+    return "common" if val == "common" else "legacy"
 
 
 def _env_float(raw: Any, default: float) -> float:
@@ -515,7 +535,11 @@ class HouseDaemon:
             else self.chat_agent.kernel_chat_fn()
         )
 
-        self.memory = MemoryStore(
+        problem = memory_backend_problem(self.env.get(MEMORY_BACKEND_ENV))
+        if problem:  # `ai-house up` refuses this; a house built in code gets the default and a line in the log
+            self.log(f"{problem}；按 legacy 处理")
+        store_cls = CommonMemoryStore if memory_backend(self.env) == "common" else MemoryStore
+        self.memory = store_cls(
             self.runtime_dir,
             clock=self.clock,
             llm_fn=self._llm_fn,
