@@ -1,0 +1,3 @@
+# 测试夹具里的假令牌（提交 1ee9a2d），不是真凭据；后续提交 c9b427b 已改成不会被误报的写法。
+# 密钥扫描按提交历史检查，所以这一条历史发现需要按指纹忽略。只忽略这一条，不放宽任何规则。
+1ee9a2d8332f9abed972369aeaf032fcda50ea2d:world-kernel/test_private_memory_groups.py:generic-api-key:470
