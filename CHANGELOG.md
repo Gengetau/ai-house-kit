@@ -6,7 +6,8 @@
 
 - 新增 `src/ai_house/common/`：私有部署的记忆模块和按号码认人的模块，去私有化后原样搬来；与原件的差别登记在该目录的 `UPSTREAM.md`。
 - 新增 `memory-conformance-tests/`：私有部署自己的 113 个记忆用例，对着这份公共代码跑，CI 多一步。
-- 这一步只是把代码和测试放进仓库，`MemoryStore` 还没有改用它；后续步骤和会随之改变的行为见 `docs/PORTING-PLAN.md` 第 15 节。
+- 新增 `src/ai_house/memory_common.py`（`CommonMemoryStore`）：`MemoryStore` 的同一套调用，内部转给公共代码；自己的库文件 `memory-common.db`。**尚未接线**，50 个用例。
+- 这两步都没有改动运行路径，`MemoryStore` 还是旧实现；新旧行为的差别表和后续步骤见 `docs/PORTING-PLAN.md` 第 15 节。
 
 ### 私聊记忆进群（可选，两个独立开关，默认都关，行为不变）
 
