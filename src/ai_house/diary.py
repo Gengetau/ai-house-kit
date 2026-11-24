@@ -59,6 +59,11 @@ _TITLE_LINE_RE = re.compile(
     rf"^[ \t]*{_DIARY_DATE}?[^\n{_TITLE_PUNCT}]{{0,12}}日记[ \t]*[：:]?[ \t]*(?:\n|$)"
 )
 _BOLD_PAIR_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+# A dateline of its own above the text: 「11月21日，夜」, 「2026年11月22日，夜。」, 「11月21日（周六） 晴」.
+_DATELINE_RE = re.compile(
+    rf"^[ \t]*{_DIARY_DATE}(?:[，,、 \t]*(?:夜晚|夜里|深夜|睡前|晚上|夜|晚|(?:周|星期)[一二三四五六日天]|晴|阴|多云|小雨|雨|雪)){{0,3}}"
+    r"[ \t]*[。.]?[ \t]*\n"
+)
 
 DIARY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS house_diaries (
@@ -108,6 +113,8 @@ def _drop_diary_title(text: str) -> str:
                 rest = m.group(1)[title.end():] if title else m.group(1)
         elif (m := _TITLE_LINE_RE.match(text)):
             rest = text[m.end():]
+        elif (m := _DATELINE_RE.match(text)) and text[m.end():].strip():
+            rest = text[m.end():]
         else:
             break
         text = rest.lstrip()
@@ -118,7 +125,7 @@ def finish_diary_text(raw: str, limit: int = DIARY_MAX_CHARS) -> str:
     """Control chars removed; over `limit`, or ending mid-sentence, it is cut back to the last finished sentence.
 
     A title at the head (「**奈尔的睡前日记**」, 「# …」, 「【…日记】」, a line 「11月21日 日记」) and paired `**` bold marks
-    go first, so that neither is counted against the limit nor survives into the stored text.
+    go first (so does a dateline of its own, 「11月21日，夜」), so that neither is counted against the limit nor survives into the stored text.
     A reply with no finished sentence to fall back to (or one that would shrink below `_MIN_KEEP_CHARS`) is kept as it is
     (hard-cut at `limit` only when over it, at the last comma if there is one), rather than emptied.
     """

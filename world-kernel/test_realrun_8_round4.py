@@ -319,6 +319,20 @@ class DiaryTextHasNoTitle(unittest.TestCase):
         body = "今天我在院子里看书，看了很久很久。" * 17  # 289 chars: fits once the 14-char title is gone
         self.assertEqual(finish_diary_text("**奈尔的睡前日记** " + body), body)
 
+    def test_a_dateline_of_its_own_above_the_text_goes(self) -> None:
+        # what the rerun with the fixes showed: 「11月21日，夜\n\n早上换好…」 under the stored 「2026-11-21 日记：」 prefix
+        body = "早上换好苏格兰格纹连衣裙，别上珍珠发夹。我和由纪吃了奈尔做的盐烤鱼。"
+        for head in ("11月21日，夜\n\n", "11月21日，晚上\n\n", "2026年11月22日，夜。\n\n", "2026年11月22日，夜\n",
+                     "11月21日（周六） 晴\n", "2026-11-21 周六，夜\n\n", "11月21日\n"):
+            with self.subTest(head=head):
+                self.assertEqual(finish_diary_text(head + body), body)
+
+    def test_a_date_that_opens_a_sentence_stays(self) -> None:
+        for text in ("11月21日，夜里我睡不着，就去厨房热了牛奶。", "11月21日，晚上和大家吃了咖喱饭。后来早早睡了。",
+                     "2026-11-22 日记：早上我做了吐司；中午我去了超市。", "11月21日，夜"):
+            with self.subTest(text=text):
+                self.assertEqual(finish_diary_text(text), text)
+
     def test_a_reply_that_is_only_a_title_is_not_emptied(self) -> None:
         self.assertTrue(finish_diary_text("**奈尔的睡前日记**").strip("*"))
 
