@@ -512,6 +512,7 @@ class OutboundMemoryCheck(_Base):
 
 
 class ReplyGuardInListedGroup(unittest.TestCase):
+    TOKEN = "tk" * 12  # a made-up value, spelled so that secret scanners do not mistake it for a real one
     PERSONA = "你是苍空，一个住在小屋里的安静的作曲人，说话慢悠悠的，喜欢在夜里弹琴。"
 
     def guard(self, groups: str, tmp: str = "/srv/ai-house/runtime") -> ReplyGuard:
@@ -520,7 +521,7 @@ class ReplyGuardInListedGroup(unittest.TestCase):
         st = MemoryStore(d.name, env={ENV: groups})
         self.addCleanup(st.close)
         g = ReplyGuard(
-            {"AI_HOUSE_OWNER_TOKEN": "tok-live-secret-0123456789"},
+            {"AI_HOUSE_OWNER_TOKEN": self.TOKEN},
             runtime_dir=tmp,
             protected_texts=[self.PERSONA],
             leak_free=st.leak_free_in,
@@ -546,7 +547,7 @@ class ReplyGuardInListedGroup(unittest.TestCase):
         g = self.guard("group")
         cases = {
             "cq_code": "好的 [CQ:image,file=a.png] 这是图片",
-            "secret": "令牌是 tok-live-secret-0123456789 请收好",
+            "secret": f"令牌是 {self.TOKEN} 请收好",
             "internal_path": "日志在 /home/ubuntu/app/run.log 里",
             "internal_path2": "把 .env 文件发给我",
             "internal_path3": "配置在 /srv/ai-house/runtime/x 下面",
