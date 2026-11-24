@@ -184,7 +184,11 @@ class SettingsTests(StoreCase):
 
     def test_the_other_switches_have_an_environment_entry_and_a_code_default(self):
         base = self.make()._mod
-        self.assertEqual((base.RULE_CONSUMERS, base.RECENT, base.URGENT, base.EVIDENCE, base.PUBLIC_SCRIBES), (set(),) * 2 + (False, False, set()))
+        self.assertEqual((base.RULE_CONSUMERS, base.URGENT, base.EVIDENCE, base.PUBLIC_SCRIBES), (set(), False, False, set()))
+        # the kit's own defaults: lines not yet tidied come to mind for everyone, by keyword when there are no vectors
+        self.assertEqual((base.RECENT, base.RECENT_KEYWORD, base.TRUST, base.NO_MEMORY_NOTE_ON), ({"nia", "xingli"}, True, False, True))
+        quiet = self.make(env={"AI_HOUSE_MEMORY_RECENT": "none", "AI_HOUSE_MEMORY_RECENT_KEYWORD": "0"})._mod
+        self.assertEqual((quiet.RECENT, quiet.RECENT_KEYWORD), (set(), False))
         self.assertTrue(base.PUBLIC_EXPOSURE_GATE)
         self.assertFalse(base.DIARY_PRIVATE)  # the kit's own default: her diaries come to mind in every chat
         self.assertTrue(self.make(env={"AI_HOUSE_MEMORY_DIARY_PRIVATE": "1"})._mod.DIARY_PRIVATE)

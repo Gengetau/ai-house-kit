@@ -425,6 +425,69 @@ class AddListInvalidateTests(StoreCase):
         self.assertEqual(got, [ASK_PLAN])  # no space put before it on the way
 
 
+class OldInterfaceTests(StoreCase):
+    """Methods the old store had that callers and tools may still use."""
+
+    def test_update_rewords_a_memory_from_its_own_scope_only(self):
+        st = self.make()
+        gid, _ = st.add("nia", "group", "阿甲周末要去爬山。", channel=GROUP, about=["阿甲"], now=T0)
+        pid, _ = st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
+        out = st.update("nia", "group", gid, "阿甲周末改去游泳了。", channel=GROUP, now=T0 + 5)
+        self.assertEqual((out["id"], out["text"], out["scope"], out["channel"]), (gid, "阿甲周末改去游泳了。", "group", GROUP))
+        self.assertEqual(self.rows(st, "select prev from mem where id=?", gid)[0]["prev"], "阿甲周末要去爬山。")
+        with self.assertRaises(ValueError):  # nothing said in private is written into a row a group can read
+            st.update("nia", "private", gid, "房主私下说阿甲其实不想去。", now=T0 + 6)
+        with self.assertRaises(ValueError):
+            st.update("nia", "group", pid, "房主的打算改了。", channel=GROUP, now=T0 + 6)
+        with self.assertRaises(ValueError):
+            st.update("xingli", "private", pid, "房主的打算改了。", now=T0 + 6)
+        st.update("nia", "private", pid, "房主打算明年春天再辞职去开咖啡店。", expires_at=T0 + 3600, now=T0 + 7)
+        self.assertEqual(st.list_entries("nia", "private", now=T0 + 8)[0]["expires_at"], T0 + 3600)
+        self.assertEqual(st.invalidate("nia", "private", gid, now=T0 + 9)["status"], "invalidated")  # taking out is allowed
+
+    def test_search_sweep_and_backfill(self):
+        st = self.make()
+        st.add("nia", "private", "房主对花生过敏。", about=["房主"], ttl_s=600, now=T0)
+        st.add("nia", "group", "阿甲周末要去爬山。", channel=GROUP, about=["阿甲"], now=T0)
+        hits = st.search("nia", "private", "我对什么过敏", now=T0 + 1)
+        self.assertEqual([(r["scope"], r["text"]) for _, r in hits], [("private", "房主对花生过敏。")])
+        self.assertGreaterEqual(hits[0][0], 0.5)
+        self.assertEqual(st.search("xingli", "private", "我对什么过敏", now=T0 + 1), [])
+        self.assertEqual(st.sweep_expired(now=T0 + 599), 0)
+        self.assertEqual(st.sweep_expired(now=T0 + 601), 1)
+        self.assertEqual(st.search("nia", "private", "我对什么过敏", now=T0 + 602), [])
+        self.assertEqual(st.backfill_vectors(), 0)  # no vector service
+        with_vectors = self.make(data_dir=str(st.db_path.parent), embed_plugin=lambda texts: [[1.0, 0.5] for _ in texts])
+        self.assertEqual(with_vectors.backfill_vectors(), 1)
+        self.assertEqual(with_vectors.backfill_vectors(), 0)
+
+
+class NoVectorServiceTests(StoreCase):
+    """A house with no vector service (the kit's default) still remembers when asked in plain words."""
+
+    def test_a_plain_question_finds_the_fact(self):
+        st = self.make()
+        self.assertFalse(st.vector_enabled)
+        st.add("nia", "private", "房主对花生过敏。", about=["房主"], now=T0)
+        self.assertIn("花生", st.recall("nia", "private", "你还记得我对什么过敏吗？", now=T0))
+        self.assertEqual(st.recall("nia", "private", "你记得我喜欢什么颜色吗？", now=T0), NOTHING_FOUND)
+        self.assertEqual(st.recall("nia", "private", "今天天气真不错", now=T0), "")
+
+    def test_what_the_owner_just_said_in_private_comes_to_mind_in_a_group_only_with_the_switch(self):
+        said = "下个月我打算辞职去开咖啡店"
+        for on in (True, False):
+            with self.subTest(private_in_groups=on):
+                st = self.make(private_in_groups=on)
+                st.observe("nia", "private", said, now=T0)  # not yet tidied into a memory
+                got = st.recall("nia", "group", "房主打算辞职去开咖啡店吗", channel=GROUP, now=T0 + 60)
+                if on:
+                    self.assertIn("咖啡店", got)
+                    self.assertIn("别在群里说出来", got)
+                else:
+                    self.assertNotIn("咖啡店", got)
+                self.assertNotIn("咖啡店", st.recall("xingli", "group", "房主打算辞职去开咖啡店吗", channel=GROUP, now=T0 + 60))
+
+
 class DecidedExtrasTests(StoreCase):
     """The four things the old store had that went into the shared file (decided 2026-11-24), through the adapter."""
 

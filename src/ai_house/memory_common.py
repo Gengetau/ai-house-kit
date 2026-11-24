@@ -112,6 +112,8 @@ def _csv(raw: Any, everyone: Iterable[str]) -> set:
     text = str(raw or "").strip()
     if text.lower() in ("all", "*"):
         return set(everyone)
+    if text.lower() in ("none", "off", "0"):  # an empty value means "not set"; this is how to say "nobody"
+        return set()
     return {x.strip() for x in text.split(",") if x.strip()}
 
 
@@ -250,6 +252,7 @@ class CommonMemoryStore:
         put("EVIDENCE_VER_CHARS", "MEMORY_EVIDENCE_VERSION_CHARS", lambda v: max(0, int(v)))
         put("DIARY_PRIVATE", "MEMORY_DIARY_PRIVATE", lambda v: str(v).strip() == "1")
         put("TRUST", "MEMORY_TRUST", lambda v: str(v).strip() == "1")
+        put("RECENT_KEYWORD", "MEMORY_RECENT_KEYWORD", lambda v: str(v).strip() == "1")
         put("NO_MEMORY_NOTE_ON", "MEMORY_NO_MEMORY_NOTE", lambda v: str(v).strip() == "1")
         put("PUBLIC_EXPOSURE_GATE", "MEMORY_PUBLIC_EXPOSURE_GATE", lambda v: str(v).strip() == "1")
         return out
@@ -270,6 +273,10 @@ class CommonMemoryStore:
         # the kit's default: a housemate's own diaries come to mind in every chat (AI_HOUSE_MEMORY_DIARY_PRIVATE=1:
         # only in the owner's private chat, which is the shared module's own default)
         mod.DIARY_PRIVATE = False
+        # also the kit's own defaults, as its old store behaved: what was just said elsewhere and is not yet tidied
+        # into memories comes to mind for everyone, and without a vector service it is found by keyword
+        mod.RECENT = set(residents)
+        mod.RECENT_KEYWORD = True
         for attr, value in {**self._numeric, **self._switches(residents)}.items():
             setattr(mod, attr, value)
         # `search(k=RECALL_K)` binds its default when the file is read; point it at the setting in force
@@ -740,26 +747,123 @@ class CommonMemoryStore:
         ts = self._now(now)
         clean_reason = _clean_text(reason, limit=80) or "invalidated"
         mod = self._use(actor)
-        # the owner's private chat may edit all of her own rows and every public one: the kit's narrower rule is
-        # checked here, on the row as the kit sees it
-        chat = self._chat_for(mod, "group", resolved) if scope == "group" else OWNER_PRIVATE_CHAT
-        missing = ValueError(f"未找到可作废的记忆 #{mid}")
         with mod.time.at(ts):
-            try:
-                row = mod._own_row(actor, chat, mid)
-            except ValueError:
-                raise missing from None
-            kit_scope, _ = self._kit_view(row, bool(self._world_ids([mid])))
-            shared_row = row["owner"] == "public"
-            if scope == "private" and shared_row:
-                raise missing
-            if scope in ("group", "world") and (kit_scope != scope or (shared_row and not allow_shared)):
-                raise missing
+            chat, row, kit_scope = self._editable_row(mod, actor, scope, resolved, mid, allow_shared,
+                                                      ValueError(f"未找到可作废的记忆 #{mid}"))
             mod.forget(actor, chat, mid)
             with self._adapter_conn() as c:
                 mod._log(c, actor, "invalidate", {"id": mid, "reason": clean_reason})
         out = self._kit_row(row, kit_scope == "world")
         out.update(status="invalidated", invalidated_reason=clean_reason, updated=ts)
+        return out
+
+    def _editable_row(self, mod: Any, actor: str, scope: str, resolved: str, mid: int, allow_shared: bool,
+                      missing: Exception, *, rewrite: bool = False) -> Tuple[str, Any, str]:
+        """(chat, row, kit scope) of a memory the kit lets `actor` change from `scope`, else raises `missing`.
+        The shared module lets the owner's private chat edit all of her own rows and every public one; the kit's
+        narrower rule is checked here, on the row as the kit sees it: a group or world row is changed from its own
+        scope; from the private chat her own rows of any scope may be taken out, but only private ones reworded
+        (`rewrite`), so that nothing said in private is ever written into a row a group can read."""
+        chat = self._chat_for(mod, "group", resolved) if scope == "group" else OWNER_PRIVATE_CHAT
+        try:
+            row = mod._own_row(actor, chat, mid)
+        except ValueError:
+            raise missing from None
+        kit_scope, _ = self._kit_view(row, bool(self._world_ids([mid])))
+        shared_row = row["owner"] == "public"
+        if scope == "private" and (shared_row or (rewrite and kit_scope != "private")):
+            raise missing
+        if scope in ("group", "world") and (kit_scope != scope or (shared_row and not allow_shared)):
+            raise missing
+        return chat, row, kit_scope
+
+    def update(
+        self,
+        actor: str,
+        scope: str,
+        mem_id: Union[int, str],
+        text: str,
+        *,
+        channel: str = "",
+        about: Optional[Union[str, Sequence[str]]] = None,
+        expires_at: Any = ...,
+        allow_shared: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Reword a memory from the scope it belongs to; the shared module keeps the earlier wording."""
+        actor = self._valid_actor(actor)
+        scope = self._valid_scope(scope)
+        resolved = self._resolve_channel(actor, scope, channel)
+        if isinstance(mem_id, bool):
+            raise ValueError("记忆编号无效")
+        try:
+            mid = int(str(mem_id).lstrip("#"))
+        except ValueError as exc:
+            raise ValueError("记忆编号无效") from exc
+        mod = self._use(actor)
+        with mod.time.at(self._now(now)):
+            chat, row, kit_scope = self._editable_row(mod, actor, scope, resolved, mid, allow_shared,
+                                                      ValueError(f"未找到可修改的记忆 #{mid}"), rewrite=True)
+            try:
+                mod.update(actor, chat, mid, text, about=about)
+            except ValueError as exc:
+                raise ValueError("更新内容不合规") from exc
+            with self._adapter_conn() as c:
+                if expires_at is not ...:
+                    c.execute("update mem set expires_at=? where id=?",
+                              (float(expires_at) if expires_at is not None else None, mid))
+                row = c.execute("select * from mem where id=?", (mid,)).fetchone()
+        return self._kit_row(row, kit_scope == "world")
+
+    def sweep_expired(self, now: Optional[float] = None) -> int:
+        """Take what is past its time out now (reads do it by themselves). -> how many."""
+        mod = self._mod
+        with self._adapter_conn() as c:
+            before = int(c.execute("select count(*) from mem where status='expired'").fetchone()[0])
+        with mod.time.at(self._now(now)):
+            mod._sweep()
+        with self._adapter_conn() as c:
+            return int(c.execute("select count(*) from mem where status='expired'").fetchone()[0]) - before
+
+    def backfill_vectors(self, batch_size: int = 64) -> int:
+        """Give a vector to the memories written while there was no vector service. -> how many."""
+        if not self.vector_enabled:
+            return 0
+        return int(self._mod.backfill_vectors(batch=max(1, int(batch_size))))
+
+    def search(
+        self,
+        actor: str,
+        scope: str,
+        query: str,
+        *,
+        channel: str = "",
+        about: Sequence[str] = (),
+        k: Optional[int] = None,
+        min_score: Optional[float] = None,
+        include_private: bool = True,
+        now: Optional[float] = None,
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """What `actor` may see from there that matches, best first, as (score, row as the kit shows it)."""
+        actor = self._valid_actor(actor)
+        scope = self._valid_scope(scope)
+        resolved = self._resolve_channel(actor, scope, channel)
+        mod = self._use(actor)
+        chat = WORLD_LEAK_CHAT if scope == "world" else self._chat_for(mod, scope, resolved)
+        self._tl.world_view = scope == "world"
+        try:
+            with mod.time.at(self._now(now)):
+                hits = mod.search(actor, chat, str(query or ""), about=[str(a) for a in (about or ())],
+                                  k=mod.RECALL_K if k is None else max(1, int(k)),
+                                  min_score=mod.RECALL_MIN if min_score is None else float(min_score))
+        finally:
+            self._tl.world_view = False
+        world = self._world_ids([int(r["id"]) for _, r in hits])
+        out = []
+        for score, r in hits:
+            if not include_private and scope != "private" and r["scope"] == "private":
+                continue
+            out.append((float(score), self._kit_row(r, int(r["id"]) in world)))
         return out
 
     forget = invalidate

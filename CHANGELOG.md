@@ -6,10 +6,11 @@
 
 - 新增 `src/ai_house/common/`：私有部署的记忆模块和按号码认人的模块，去私有化后原样搬来；与原件的差别登记在该目录的 `UPSTREAM.md`。
 - 新增 `memory-conformance-tests/`：私有部署自己的 113 个记忆用例，对着这份公共代码跑，CI 多一步。
-- 新增 `src/ai_house/memory_common.py`（`CommonMemoryStore`）：`MemoryStore` 的同一套调用，内部转给公共代码；自己的库文件 `memory-common.db`。**尚未接线**，52 个用例。
+- 新增 `src/ai_house/memory_common.py`（`CommonMemoryStore`）：`MemoryStore` 的同一套调用，内部转给公共代码；自己的库文件 `memory-common.db`。**尚未接线**，62 个用例。
 - 公共代码按维护者的决定改了四处行为（登记在 `UPSTREAM.md`）：没列为免查的群一律做出站检查，不看开关；“私聊记忆进群”不再依附“统一记忆”；密钥过滤多认 `sk-…` 等几种写法；日记开关关闭时住客在每个会话都想得起自己的日记。适配层的日记默认随之改为“都想得起”（`AI_HOUSE_MEMORY_DIARY_PRIVATE=1` 时只在房主私聊里）。
 - 14.5 定下的四样并进公共代码并接到适配层：查不到就照实说不记得（默认开）、设置写法检查、可信度开关（默认关，`AI_HOUSE_MEMORY_TRUST=1`）、到期清理（`add(ttl_s=, expires_at=)`，默认不设期限）。说明和没搬的部分见 `docs/PORTING-PLAN.md` 15.8。
 - 把 kit 现有 327 个涉及记忆的用例对着适配层跑了一遍并逐个归类（`docs/PORTING-PLAN.md` 15.7）；查出的适配层四处缺陷已修（`world` 召回读到群里的记忆、重置不删新库、向量插件拿到带空格的问题、没给频道时出站检查被放过）。
+- 公共代码在没有向量可比时改按问句里的实义词回想（有向量时分数不变）；刚说还没整理的话可按关键词带出（`MEMORY_RECENT_KEYWORD`，公共代码默认关，适配层替 kit 打开）；新增 `backfill_vectors()`。适配层补回 `search`、`update`、`sweep_expired`、`backfill_vectors`。见 `docs/PORTING-PLAN.md` 15.9。
 - 以上都没有改动运行路径，`MemoryStore` 还是旧实现；新旧行为的差别表和后续步骤见 `docs/PORTING-PLAN.md` 第 15 节。
 
 ### 私聊记忆进群（可选，两个独立开关，默认都关，行为不变）
