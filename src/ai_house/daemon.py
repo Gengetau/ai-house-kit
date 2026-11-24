@@ -45,6 +45,8 @@ from .intents import CommitmentStore, diet_memo_blocked, reply_declines
 from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
+from . import memory_migrate
+from .memory_common import CommonMemoryStore
 from .proactive import ProactiveEngine
 from .send_gate import SendGate
 from .onboarding import (
@@ -206,6 +208,25 @@ def _acquire_runtime_lock(lock_file: Path) -> None:
 
 # `RoommateChatAgent.pick_group_responders` lets at most this many roommates answer one house-group message.
 _GROUP_MAX_RESPONDERS = 2
+
+
+MEMORY_BACKEND_ENV = "AI_HOUSE_MEMORY_BACKEND"
+MEMORY_BACKENDS = ("legacy", "common")
+
+
+def memory_backend_problem(raw: Any) -> str:
+    """Why `AI_HOUSE_MEMORY_BACKEND` cannot be used, or `''` when it is empty or one of the known names."""
+    val = str(raw or "").strip().lower()
+    if val in ("",) + MEMORY_BACKENDS:
+        return ""
+    return f"{MEMORY_BACKEND_ENV} 只能写 legacy（原来的记忆库，默认）或 common（与私有部署共用代码的记忆库，试用），现在写的是 {val[:20]!r}"
+
+
+def memory_backend(env: Optional[Mapping[str, str]]) -> str:
+    """Which memory store the house runs on. `common` is the store that shares the private deployment's code
+    (`memory_common.py`, its own `memory-common.db`); anything else, a misspelt name included, is the old one."""
+    val = str((env or {}).get(MEMORY_BACKEND_ENV) or "").strip().lower()
+    return "common" if val == "common" else "legacy"
 
 
 def _env_float(raw: Any, default: float) -> float:
@@ -378,9 +399,20 @@ class HouseDaemon:
                 else self.chat_agent.kernel_chat_fn()
             )
             self.authority.life.model = LiveLifeModel(life_chat, self.vocab.SELVES) if life_chat else FakeLifeModel(vocab=self.vocab)
+            if self.authority.note is not None:
+                self.authority.note.chat = self._day_note_chat(router, life_chat)
             if self.authority.city_bridge is not None and hasattr(self.authority.city_bridge, "chat"):
                 self.authority.city_bridge.chat = life_chat
                 self.authority.city_bridge.selves = self.vocab.SELVES
+
+    def _day_note_chat(self, router: Any, life_chat: Any) -> Any:
+        """The model route for the night's 「今天的小屋」 note. It is one long writing job over the whole day's fact list,
+        like a diary, not one of her quick decisions: it goes through the `diary` route (60 s a request, 90 s in all, its
+        failures do not feed the breaker chat shares) instead of `life` (25 s / 45 s). With a test hook or no live model
+        route it stays on whatever her decisions use."""
+        if self._llm_fn is None and router is not None and router.has_live_endpoint(purpose="diary"):
+            return router.chat_fn(purpose="diary")
+        return life_chat
 
     def _schedule_post_reply(self, turn_epoch: int, job: Any) -> None:
         """Run `job` in the background under the same lock as the periodic post-step jobs (never inside a turn)."""
@@ -504,7 +536,13 @@ class HouseDaemon:
             else self.chat_agent.kernel_chat_fn()
         )
 
-        self.memory = MemoryStore(
+        problem = memory_backend_problem(self.env.get(MEMORY_BACKEND_ENV))
+        if problem:  # `ai-house up` refuses this; a house built in code gets the default and a line in the log
+            self.log(f"{problem}；按 legacy 处理")
+        store_cls = CommonMemoryStore if memory_backend(self.env) == "common" else MemoryStore
+        if store_cls is CommonMemoryStore:
+            self._carry_old_memories()
+        self.memory = store_cls(
             self.runtime_dir,
             clock=self.clock,
             llm_fn=self._llm_fn,
@@ -553,6 +591,8 @@ class HouseDaemon:
             vocab=self.vocab,
             extra_extensions=ext_factories,
             intents_mod=self.intents,
+            note_chat=self._day_note_chat(self.model_router, life_chat),
+            day_note_retries=2,
         )
         self._managed_plugin_extensions = managed_exts
         self._managed_plugin_ext_map = managed_map
@@ -572,6 +612,21 @@ class HouseDaemon:
                 and not self.proactive.is_initialized()
             ):
                 self.proactive.anchor(self.world_db, now=self.clock.now())
+
+    def _carry_old_memories(self) -> None:
+        """A house that ran on the old store keeps what it remembers: before the new store opens, carry over what
+        `memory.db` holds and the new file does not have yet (`memory_migrate`: the old file is only read, a second
+        run adds nothing). A failure is logged and the house starts all the same; the next start tries again."""
+        if not (self.runtime_dir / "memory.db").exists():
+            return
+        try:
+            report = memory_migrate.migrate(self.runtime_dir, env=self.env, names=self.vocab.NAMES, clock=self.clock)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"旧记忆库的内容没能带进新记忆库（{type(exc).__name__}）；小屋照常启动，下次启动会再试")
+            return
+        if report.get("wrote"):
+            for line in memory_migrate.describe(report):
+                self.log(line)
 
     def log(self, msg: str) -> None:
         print(f"[ai-house] {msg}", flush=True)
@@ -652,6 +707,11 @@ class HouseDaemon:
                 self.memory.extract(now=now)
             except Exception as exc:  # noqa: BLE001
                 self.log(f"memory extract error: {type(exc).__name__}: {exc}")
+            if isinstance(self.memory, CommonMemoryStore):
+                try:  # memories written while the vector service was not answering (still loading, say) get theirs
+                    self.memory.backfill_vectors()
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"memory vector backfill error: {type(exc).__name__}")
             if due_diary_day(now) is not None:
                 try:
                     stored_pl = self.settings_store.get_plugins_map()
@@ -1517,7 +1577,12 @@ class HouseDaemon:
         for aid in targets:
             if not self._turn_world_ok(turn_epoch):
                 break
-            mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now)
+            # the store sharing the private deployment's code ranks by who is asking, as that deployment does
+            asker: Dict[str, Any] = {}
+            if isinstance(self.memory, CommonMemoryStore):
+                asker = {"speaker": speaker.name, "speaker_role": speaker_role,
+                         "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else "")}
+            mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now, **asker)
             hint_store = self.intents
             if speaker.is_owner and hint_store is not None:
                 # what she must know about her own errands (unbuyable item, expired promise) before she answers
@@ -1553,7 +1618,7 @@ class HouseDaemon:
                     }
                 if tname == "search_memory":
                     q = str(targs.get("query") or text)
-                    found = self.memory.recall(_aid, scope, q, channel=mem_ch, now=now)
+                    found = self.memory.recall(_aid, scope, q, channel=mem_ch, now=now, **asker)
                     return {"recall": found or "暂无相关记忆"}
                 if tname == "record_promise":
                     if not speaker.is_owner:
@@ -1731,10 +1796,13 @@ class HouseDaemon:
                             ),
                         )
                 if speaker.is_owner and rep["mode"] != "blocked":
+                    # asleep: the "reply" is a placeholder, she did not agree to anything (nothing is recorded as her
+                    # promise), and the placeholder is not what she "said" back; the owner's line still reaches her
+                    asleep = rep["mode"] == "sleeping"
                     self.intents.enqueue_chat(
                         aid,
                         text,
-                        rep["text"],
+                        "" if asleep else rep["text"],
                         where=where,
                         intents=rep.get("tool_intents") or None,
                         now=now,
@@ -1742,6 +1810,7 @@ class HouseDaemon:
                         speaker_role=speaker_role,
                         proposer_id=speaker.identity_id or "user:owner",
                         party=list(targets),
+                        record_intents=not asleep,
                     )
                 self.memory.observe(
                     aid,
@@ -2452,6 +2521,9 @@ class HouseDaemon:
                 self.runtime_dir / "memory.db",
                 self.runtime_dir / "memory.db-wal",
                 self.runtime_dir / "memory.db-shm",
+                self.runtime_dir / "memory-common.db",  # the store that shares the private deployment's code
+                self.runtime_dir / "memory-common.db-wal",
+                self.runtime_dir / "memory-common.db-shm",
                 self.runtime_dir / "reminders.db",
                 self.runtime_dir / "reminders.db-wal",
                 self.runtime_dir / "reminders.db-shm",
@@ -2472,6 +2544,8 @@ class HouseDaemon:
                 self.runtime_dir / "proactive_state.json",
                 self.runtime_dir / "group_behavior.json",
             ]
+            # the copies `memory_migrate` keeps of the new store before it writes hold memories too
+            targets += sorted(self.runtime_dir.glob("memory-common.db.bak-*"))
             wait_ev = threading.Event()
             for fp in targets:
                 for attempt in range(4):

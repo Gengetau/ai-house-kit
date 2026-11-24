@@ -30,7 +30,8 @@ def log(msg):
 
 class Authority:
     def __init__(self, path, world_db, chat, selves, clock=None, model=None, migrate_items=None, day_note=None,
-                 browse=None, env=None, vocab=None, extra_extensions=(), intents_mod=None):
+                 browse=None, env=None, vocab=None, extra_extensions=(), intents_mod=None, note_chat=None,
+                 day_note_retries=0):
         self.clock = clock or WallClock()
         self.store = Store(path, self.clock, world_id=WORLD, synthetic=False, holder=HOLDER)
         self.store.acquire()
@@ -86,7 +87,10 @@ class Authority:
                 log(f"city_bridge recover deferred: {type(e).__name__}: {e}")
         if day_note is None:
             day_note = daynote.enabled(eff_env)
-        self.note = daynote.DayNote(self.life, world_db, chat, log=log) if day_note and chat else None
+        # the night's note may be asked through a route of its own (slower limits than her decisions) and asked again
+        # when a call fails; by default it is the same chat as everything else and asked once
+        self.note = (daynote.DayNote(self.life, world_db, note_chat or chat, log=log, retries=day_note_retries)
+                     if day_note and chat else None)
 
     def close(self):
         """Release the scheduler lease if still held and close the kernel Store."""

@@ -10,7 +10,8 @@
 >   `doctor --onebot-ping` 对一个真实协议端（SnowLuma 1.14.16，已登录的真实 QQ 号）的连通检查，以及一次完整的收发：
 >   房主从 QQ 发来一条私聊，小屋经协议端回了一条文字，协议端确认发出。这次用的是宿主网络那种摆法（2.2 节第四行）。
 > - 只做过语法校验或本地模拟的：systemd 单元（`systemd-analyze verify`）、两个容器共用外部网络的摆法（`docker compose config`）。
-> - 还没在真实 QQ 上试过的：群聊、图片和语音、协议端掉线后的重连与补发、长时间挂机、风控下的表现。
+> - 2026-11-24 补了一次群聊：两个真实群里被房主 @ 后的文字回话和私聊内容的拦截，7 轮（[LONGRUN-2026-11-23.md](LONGRUN-2026-11-23.md) 第 9 节）。
+> - 还没在真实 QQ 上试过的：别的群友发问、图片和语音、协议端掉线后的重连与补发、长时间挂机、风控下的表现。
 >
 > 第一次接请用测试群和小号。
 
@@ -43,6 +44,7 @@ docker compose -f compose.yaml -f deploy/compose.always-on.yaml up -d
 - 数据在命名卷 `house-data` 里，`docker compose down` 不会删它；`down -v` 会。
 - 默认只发布到宿主机的 `127.0.0.1:8780`。要从别的设备访问，请在前面放一个带 HTTPS 的反向代理，不要直接把端口改成对外发布。
 - 停止：`docker compose stop`。小屋收到停止信号后会保存状态再退出，最多等 30 秒。
+- 默认会多起一个 `embedding` 容器（记忆用的本地向量服务，见 1.3）。不想要它：`docker compose up -d ai-house` 只起小屋。
 
 ### 1.2 systemd（不用 Docker）
 
@@ -108,6 +110,33 @@ journalctl -u ai-house -f
 - 配置有问题（令牌、端口被占、QQ 接入配置写错、同一数据目录已有实例）时退出码是 2，不会自动重启，改好后 `sudo systemctl restart ai-house`。
 - `systemctl stop` 会让小屋保存状态、关闭通道、释放运行锁后退出。
 - 备份：`sudo -u aihouse /opt/ai-house-kit/.venv/bin/ai-house backup --data-dir /var/lib/ai-house/runtime`；恢复前先 `systemctl stop ai-house`（见 [CHAT-AND-QQ.md](CHAT-AND-QQ.md) 第 5 节）。
+
+### 1.3 记忆用的本地向量服务
+
+`compose.yaml` 默认带一个 `embedding` 容器：CPU 上跑的小模型（`BAAI/bge-small-zh-v1.5`，由 `fastembed` 0.7.3 提供），不需要密钥，不发布端口，只有同一个 compose 里的小屋连得到。有了它，住客能按意思而不只是按字面想起事情，发到群里之前对“换个说法把私聊内容说出去”的检查也更严。
+
+- **现在只有新记忆库会用它**（`.env` 里写 `AI_HOUSE_MEMORY_BACKEND=common`，目前仍是试用）。默认的旧记忆库不读这个地址，行为不变：它的门槛不是对着这个模型调的，实测接上后会把不相关的记忆也带出来。
+- 模型在第一次用到时才下载和加载：下载约 100MB，存在命名卷 `embedding-models` 里，之后不再联网。没用到时容器只占十几 MB 内存，加载后约 170MB（实测）。
+- 它没起来、还在加载或下载失败时，小屋照常运行，记忆按关键词回想；之后每次用到会再试，期间写下的记忆过后会补上向量。
+- 下载默认走 `huggingface.co`。连不上时在 `.env` 里写 `HF_ENDPOINT=<镜像地址>` 再 `docker compose up -d`。
+- 换成自己的向量服务（OpenAI 兼容的 `/v1/embeddings`）：`.env` 里写 `AI_HOUSE_MEMORY_EMBED_URL=<地址>`。**换模型不建议**：记忆代码里的回想门槛和出站检查门槛是对着上面这一组合调的，别的模型分数的刻度不同，会想不起来或者乱带（实测见 `PORTING-PLAN.md` 15.13、15.15）。完全不用向量：`AI_HOUSE_MEMORY_EMBED_URL=off`。
+- 看状态：`docker compose exec embedding python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:7998/health').read().decode())"`，`model_state` 是 `idle`（还没用到）、`loading`、`ready` 或 `failed`。
+
+不用 Docker 时没有容器可带，要自己起这个服务（一个文件，除 `fastembed` 外只用标准库）：
+
+```sh
+python3 -m venv /opt/ai-house-embedding
+```
+
+```sh
+/opt/ai-house-embedding/bin/pip install fastembed==0.7.3
+```
+
+```sh
+EMBEDDING_CACHE=/var/lib/ai-house/embedding-models /opt/ai-house-embedding/bin/python deploy/embedding/server.py
+```
+
+它默认只听 `127.0.0.1:7998`。然后在小屋的环境里写 `AI_HOUSE_MEMORY_EMBED_URL_DEFAULT=http://127.0.0.1:7998`（用这个名字而不是 `AI_HOUSE_MEMORY_EMBED_URL`：前者只有新记忆库会读，而且不会把模型的 API Key 带给它）。要常驻的话照 1.2 的模板另写一个 systemd 单元。
 
 ## 2. 和 OneBot 协议端并排运行
 

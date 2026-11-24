@@ -22,7 +22,15 @@ from .auth import BindRefused, check_bind
 from .backup import BackupVersionError, DaemonRunningError, create_backup, restore_backup, verify_backup
 from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import openai_compatible_chat
-from .daemon import JST, DaemonLockError, HouseDaemon, make_http_server
+from .daemon import (
+    JST,
+    MEMORY_BACKEND_ENV,
+    DaemonLockError,
+    HouseDaemon,
+    make_http_server,
+    memory_backend,
+    memory_backend_problem,
+)
 from .llm import explain_llm_error
 from .memory import LEAK_FREE_GROUPS_ENV, PRIVATE_IN_GROUPS_ENV, parse_leak_free_groups
 from .plugin_api import PluginRegistry
@@ -93,8 +101,10 @@ def _private_in_groups_problem(raw: str) -> str:
 def cmd_up(args: argparse.Namespace) -> int:
     _load_dotenv(args.env_file)
     # a half-open privacy setting is worse than none: refuse to start rather than guess which entries were meant
-    problem = _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, "")) or _private_in_groups_problem(
-        os.environ.get(PRIVATE_IN_GROUPS_ENV, "")
+    problem = (
+        _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, ""))
+        or _private_in_groups_problem(os.environ.get(PRIVATE_IN_GROUPS_ENV, ""))
+        or memory_backend_problem(os.environ.get(MEMORY_BACKEND_ENV, ""))
     )
     if problem:
         print(f"[ai-house] 配置有问题，没有启动：{problem}", file=sys.stderr, flush=True)
@@ -402,6 +412,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "name": "private_in_groups",
             "ok": not pig_problem,
             "detail": pig_problem or ("住客在群里想得起房主私聊里说的事" if pig_raw == "1" else "私聊记忆不进群"),
+        })
+
+    mb_raw = eff_env.get(MEMORY_BACKEND_ENV, "").strip()
+    if mb_raw:
+        mb_problem = memory_backend_problem(mb_raw)
+        checks.append({
+            "name": "memory_backend",
+            "ok": not mb_problem,
+            "detail": mb_problem or (
+                "记忆用与私有部署共用代码的那一套（试用；库文件 memory-common.db，原来 memory.db 里的记忆不会自动带过来）"
+                if memory_backend(eff_env) == "common" else "记忆用原来的那一套"
+            ),
         })
 
     try:

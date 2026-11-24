@@ -26,7 +26,7 @@ Source = "https://github.com/Gengetau/ai-house-kit"
 [tool.setuptools]
 package-dir = { "" = "world-kernel", "ai_house" = "src/ai_house", "worldkernel" = "world-kernel/worldkernel", "worldcatalog" = "world-catalog/worldcatalog" }
 py-modules = ["authority", "shadow", "simulate", "kitchen_night"]
-packages = ["ai_house", "ai_house.agent", "ai_house.builtin_plugins", "worldkernel", "worldcatalog"]
+packages = ["ai_house", "ai_house.agent", "ai_house.builtin_plugins", "ai_house.common", "worldkernel", "worldcatalog"]
 
 [tool.setuptools.package-data]
 ai_house = [
