@@ -50,6 +50,7 @@ docker compose --profile city up -d --build
 PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-kernel -p "test_*.py"
 PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-catalog -p "test_*.py"
 PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-contract-tests -p "test_*.py"
+PYTHONPATH=src python3 -m unittest discover -s memory-conformance-tests -p "test_*.py"
 ```
 
 ## License

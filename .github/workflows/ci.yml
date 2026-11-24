@@ -35,6 +35,12 @@ jobs:
       - name: world-contract-tests
         working-directory: world-contract-tests
         run: PYTHONPATH=../world-catalog python -m unittest discover -s . -p 'test_*.py'
+      - name: memory-conformance-tests
+        # the private deployment's own memory tests, run against the shared memory module (src/ai_house/common)
+        working-directory: memory-conformance-tests
+        run: python -m unittest discover -s . -p 'test_*.py'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
 
   agent-shell:
     # Residents run by the real Claude Code shell, against a local stand-in for the model API (no key, no network).

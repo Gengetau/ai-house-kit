@@ -87,6 +87,7 @@ docker compose --profile city up -d --build
 - **`world-kernel/`**：单写者事务、命令管线、R1/R2 视图、受众隔离材料、L0 日常、预算账本、轻量约定与履行（`intents_lite.py`）、衣柜与晴空都桥接客户端。
 - **`world-catalog/`**：统一词表、`load_pack()`、守卫校验 `guard()` 与默认樱丘六人示例世界 `life1/`。
 - **`world-contract-tests/`**：黄金契约测试与离线判定器 `oracle.py`。
+- **`src/ai_house/common/`、`memory-conformance-tests/`**：与维护者私有部署逐行共用的记忆代码及其原有测试（尚未接入运行路径，见 [docs/PORTING-PLAN.md](docs/PORTING-PLAN.md) 第 15 节）。
 - 插件开发与自定义世界包详见 **[docs/CUSTOM-WORLD-TUTORIAL.md](docs/CUSTOM-WORLD-TUTORIAL.md)** 与 **[docs/PLUGINS-AND-CITY.md](docs/PLUGINS-AND-CITY.md)**。
 
 ## 跑全套测试
@@ -96,6 +97,7 @@ python3 -m pip install -e ".[dev]"
 PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-kernel -p "test_*.py"
 PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-catalog -p "test_*.py"
 PYTHONPATH=src:world-kernel:world-catalog python3 -m unittest discover -s world-contract-tests -p "test_*.py"
+PYTHONPATH=src python3 -m unittest discover -s memory-conformance-tests -p "test_*.py"
 ```
 
 ## 免责声明与许可证
