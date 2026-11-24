@@ -2,6 +2,13 @@
 
 ## 未发布
 
+### 私聊记忆进群（可选，两个独立开关，默认都关，行为不变）
+
+- `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=1`：住客在任何群里都想得起她自己和房主的私聊记忆（含还没整理的私聊原话），标「私密」，提示里要求她别说出来。
+- `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS`（`group`、`qq-group:<群号>`，逗号分隔）：列出的群发送前不再拦私聊内容（其余检查照常），提示里允许她提；没列出的群照旧硬拦。
+- 列出的群里形成的群记忆不会在没列出的群里读到（开了 `AI_HOUSE_MEMORY_UNIFIED_GROUPS` 时也一样）；群里不能改写私聊记忆；这类群里整理出的记忆不存成共同范围。
+- 开关二写法不对时 `ai-house up` 报错退出，`ai-house doctor` 多一项检查。说明和风险见 `docs/CHAT-AND-QQ.md`。
+
 ### 住客大脑可以改由 agent 外壳来跑（可选，默认不变）
 
 - 新增 `AI_HOUSE_BRAIN`（全屋）和 `AI_HOUSE_ACTOR_BRAIN_<住客>`（单人）。默认 `direct`，行为和以前完全一样，不需要装任何东西。

@@ -24,6 +24,7 @@ from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import openai_compatible_chat
 from .daemon import JST, DaemonLockError, HouseDaemon, make_http_server
 from .llm import explain_llm_error
+from .memory import LEAK_FREE_GROUPS_ENV, parse_leak_free_groups
 from .plugin_api import PluginRegistry
 
 
@@ -68,8 +69,25 @@ def _load_dotenv(path: str = ".env") -> None:
             os.environ[k] = v
 
 
+def _leak_free_groups_problem(raw: str) -> str:
+    """Why `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` cannot be used, or `''` when it is empty or well formed."""
+    _ok, bad = parse_leak_free_groups(raw)
+    if not bad:
+        return ""
+    shown = "、".join(repr(x) for x in bad[:5])
+    return (
+        f"{LEAK_FREE_GROUPS_ENV} 里有写法不对的项：{shown}。"
+        "只能写 group（小屋网页里的群）或 qq-group:<纯数字群号>，多个用逗号分隔；私聊（private…）不能放进来"
+    )
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     _load_dotenv(args.env_file)
+    # a half-open privacy setting is worse than none: refuse to start rather than guess which entries were meant
+    problem = _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, ""))
+    if problem:
+        print(f"[ai-house] 配置有问题，没有启动：{problem}", file=sys.stderr, flush=True)
+        return 2
     host = args.host or os.environ.get("AI_HOUSE_HOST") or "127.0.0.1"
     port = args.port if args.port is not None else int(os.environ.get("AI_HOUSE_PORT") or "8780")
     data_dir = args.data_dir or os.environ.get("AI_HOUSE_DATA_DIR") or "./runtime"
@@ -201,6 +219,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         "ONEBOT_OWNER_QQ=",
         "ONEBOT_ACTOR=",
         "ONEBOT_GROUPS=",
+        "# 私聊记忆进群：AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=1 才让住客在群里想得起房主的私聊（默认关）；下面列出的群（group、qq-group:<群号>，逗号分隔）发送前不再拦私聊内容，留空 = 都照拦",
+        "AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=0",
+        f"{LEAK_FREE_GROUPS_ENV}=",
         "",
     ]
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -352,6 +373,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             checks.append({"name": "onebot_live_ping", "ok": bool(res["ok"]), "detail": res["detail"]})
     elif onebot_ping:
         checks.append({"name": "onebot_live_ping", "ok": False, "detail": "指定了 --onebot-ping 但未配置 ONEBOT_WS_URL"})
+
+    pm_raw = eff_env.get(LEAK_FREE_GROUPS_ENV, "").strip()
+    if pm_raw:
+        pm_problem = _leak_free_groups_problem(pm_raw)
+        pm_ok, _bad = parse_leak_free_groups(pm_raw)
+        checks.append({
+            "name": "leak_free_groups",
+            "ok": not pm_problem,
+            "detail": pm_problem or f"这些群发送前不查私聊内容：{'、'.join(pm_ok)}",
+        })
 
     try:
         data_dir.mkdir(parents=True, exist_ok=True)

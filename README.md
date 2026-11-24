@@ -9,7 +9,7 @@
 - **三行命令开箱即住（零前端构建、跨 Windows / Linux）**：核心运行时仅靠 Python 3.11+ 标准库与 SQLite；不填 API Key 也能以零成本内置演示模式体验完整一天的生活，填入任意 OpenAI 兼容端点（OpenAI / Gemini / DeepSeek / Claude / 本地 Ollama）即切换真实智能体，并支持主备模型自动故障转移（`AI_HOUSE_FALLBACK_*`）。
 - **挂机一整天只需百次级调用（省掉 98% 无效轮询）**：睡觉、洗漱、日常消遣由零成本 L0 规则驱动，只在需要拿主意的节点（做饭、邀约、购物、搭话、外出）预留 `Budget` 调一次模型；对话与日记生成均在内核写锁外执行，慢模型不会冻结状态面板。
 - **从聊天约定到真实采购履行的闭环**：在群聊或私聊里和室友约好「帮忙买 2 个鸡蛋」，会进入 `house_intents` 并驱动 `Shopping` 外出下单采购，结合内核 `intent_evidence` / `script` 自动对账标记为 `completed`。
-- **受众隔离长期记忆 & 每晚室友个人日记**：Built-in SQLite `MemoryStore` 严格隔离 `private` / `group` / `world` 三重边界（群聊绝不召回或泄露房主私聊秘密，且支持在工作台一键「忘掉」）；每晚 22:30 JST 自动生成第一人称个人日记（仅基于当日客观 `daylog`/`script`），23:30 JST 生成「今天的小屋」。
+- **受众隔离长期记忆 & 每晚室友个人日记**：Built-in SQLite `MemoryStore` 严格隔离 `private` / `group` / `world` 三重边界（群聊默认不召回、不泄露房主私聊秘密；维护者可用 `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS` 与 `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` 开启，见 `docs/CHAT-AND-QQ.md`；支持在工作台一键「忘掉」）；每晚 22:30 JST 自动生成第一人称个人日记（仅基于当日客观 `daylog`/`script`），23:30 JST 生成「今天的小屋」。
 - **四轴插件、工具循环 & 自定义世界包 (`WorldPack`)**：内置表情贴纸（`sticker_pack`）、桌游掷骰（`dice_tabletop`）、共享书架便签（`book_nook`）三款示例插件；通过 `ai-house pack-check indie-studio-3` 一键切换 3 人独立游戏工作室模板（已随包内置）。
 - **双模联动「晴空都」([bot-game-mcp](https://github.com/Gengetau/bot-game-mcp))**：
   - **模式 A（本地双容器私享）**：`docker compose --profile city up -d --build`，支持通过 `BOTGAME_HOUSE_ROSTER_JSON` 把自定义 `WorldPack` 住客名单同步给城市引擎；

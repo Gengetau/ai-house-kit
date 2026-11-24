@@ -5,7 +5,9 @@ A reply is held back, not edited, when it contains
   * an absolute server path, the runtime directory, or the names of the database/env files,
   * a long verbatim stretch of a protected text (the persona / system prompt),
   * a raw `[CQ:` code,
-  * (for group output) a long verbatim stretch of something said in a private chat.
+  * (for group output) a long verbatim stretch of something said in a private chat. The one exception: a group the
+    maintainer listed in `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` does not count that as a leak for the roommate who heard
+    it in private (`check(..., actor=...)`); every other check above still applies there.
 
 `check()` returns a short reason code, never the offending text, so logs stay clean.
 """
@@ -14,7 +16,7 @@ from __future__ import annotations
 import re
 import threading
 from collections import deque
-from typing import Deque, Iterable, Mapping, Optional, Set
+from typing import Callable, Deque, Iterable, Mapping, Optional, Set, Tuple
 
 _SECRET_KEY = re.compile(
     r"(?:_(?:TOKEN|SECRET|KEY)(?:_|$)|(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|BRIDGE_KEY|_KEY)$)",
@@ -52,6 +54,7 @@ class ReplyGuard:
         runtime_dir: object = "",
         protected_texts: Iterable[str] = (),
         private_memory: int = 60,
+        leak_free: Optional[Callable[[str], bool]] = None,
     ):
         self._secrets = sorted(
             {str(v).strip() for k, v in env.items() if _SECRET_KEY.search(str(k)) and len(str(v).strip()) >= MIN_SECRET_LEN},
@@ -63,25 +66,30 @@ class ReplyGuard:
         self._protected: Set[str] = set()
         for t in protected_texts:
             self._protected.update(_windows(t, SHINGLE_PROTECTED))
-        self._private: Deque[Set[str]] = deque(maxlen=private_memory)
+        self._private: Deque[Tuple[str, Set[str]]] = deque(maxlen=private_memory)
+        # `MemoryStore.leak_free_in`: the single place that says which group channels are leak-free
+        self._leak_free = leak_free
         self._lock = threading.Lock()
 
     def add_protected(self, text: str) -> None:
         with self._lock:
             self._protected.update(_windows(text, SHINGLE_PROTECTED))
 
-    def note_private(self, text: str) -> None:
+    def note_private(self, text: str, actor: str = "") -> None:
         """Remember something the owner said in a private chat so it cannot surface verbatim in a group.
 
         Only the owner's words are remembered: the roommate's own replies repeat stock phrases, and blocking those
-        in a group would be a false alarm.
+        in a group would be a false alarm. `actor` is the roommate the owner was talking to.
         """
         w = set(_windows(text, SHINGLE_PRIVATE))
         if w:
             with self._lock:
-                self._private.append(w)
+                self._private.append((str(actor or ""), w))
 
-    def check(self, channel: str, text: str) -> Optional[str]:
+    def check(self, channel: str, text: str, *, actor: str = "") -> Optional[str]:
+        """`actor` is the roommate whose reply this is. Giving it (together with the real group `channel`) is what lets
+        a group opened by `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` skip the private-content check for what the owner said to
+        that same roommate in private; what the owner said to anyone else, and callers that pass no `actor`, stay checked."""
         t = str(text or "")
         if "[cq:" in t.lower():
             return "cq_code"
@@ -95,6 +103,9 @@ class ReplyGuard:
                 return "system_prompt"
             if not str(channel).startswith("private"):
                 mine = set(_windows(t, SHINGLE_PRIVATE))
-                if mine and any(mine & p for p in self._private):
+                exempt = ""
+                if actor and self._leak_free is not None and self._leak_free(channel):
+                    exempt = str(actor)
+                if mine and any(mine & p for who, p in self._private if not (exempt and who == exempt)):
                     return "private_content"
         return None

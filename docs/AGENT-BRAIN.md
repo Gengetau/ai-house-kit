@@ -55,7 +55,8 @@ AI_HOUSE_AGENT_API_KEY=<Anthropic 的密钥>
 
 - 每个“住客 × 对话”是一个会话；活着的会话是一个 Claude Code 子进程。官方建议按每个进程约 1 GiB 内存留余量。
   小机器上把 `AI_HOUSE_AGENT_MAX_CLIENTS` 调小。
-- 私聊和群聊是两个会话，互不可见；群聊会话里读不到私聊内容，这一点和直连方式的隔离规则一致。
+- 私聊和群聊是两个会话，对话记录互不可见。群里能不能通过翻记忆（`search_memory`）读到私聊内容，和直连方式用同一条规则：默认不能，
+  由 `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS` 决定（见 docs/CHAT-AND-QQ.md）。
 - 每一轮的用量（输入、输出 token，耗时，成败）照旧记进小屋的用量账本，来源显示为 `agent/claude`。
 - 外壳自带提示缓存，会话越长省得越多；一轮通常是一到两次模型调用（用了工具就多一次）。
 
