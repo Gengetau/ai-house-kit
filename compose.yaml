@@ -32,6 +32,8 @@ services:
       WORLD_KERNEL_CITY_ACTORS: ${WORLD_KERNEL_CITY_ACTORS:-}
       WORLD_KERNEL_CITY_PLANS: ${WORLD_KERNEL_CITY_PLANS:-0}
       CITY_PROFILE: ${CITY_PROFILE:-qingkong}
+      # 天气信哪个来源：open-meteo（默认，真实天气）或 qingkong（城市引擎自己的气候）；见 docs/PLUGINS-AND-CITY.md
+      WORLD_KERNEL_WEATHER_SOURCE: ${WORLD_KERNEL_WEATHER_SOURCE:-open-meteo}
       CITY_BRIDGE_KEY: ${CITY_BRIDGE_KEY:-}
       CITY_BRIDGE_URL: ${CITY_BRIDGE_URL:-http://qingkong-city:7700/city/bridge/v1}
       # 公共城市远足（每个室友一把令牌，名称见 docs/PLUGINS-AND-CITY.md）

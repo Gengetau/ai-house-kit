@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import json
 import math
+import os
 import socket
 import time
 import urllib.error
@@ -23,11 +24,66 @@ BRIDGE_PROTOCOL = "city-bridge/1"
 MAPPINGS_VERSION = 2
 SUPPORTED_MAPPINGS_VERSIONS = (2, 3)
 WEATHER_STALE_MS = 3 * 3600 * 1000
+HOUR_MS = 3600 * 1000
 JST = dt.timezone(dt.timedelta(hours=9))
 
 _MONTH_TEMP = (5.5, 6.5, 9.5, 14.5, 19.0, 22.0, 26.0, 27.5, 23.5, 18.0, 12.5, 8.0)
 _AREA_ORDER = ("sakuraoka", "rurigai", "kazeminato")
 QINGKONG_AREA_ORDER = ("hiyorizaka", "ryokogai", "kumominato")
+_RAIN_CODES = frozenset((51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99))
+_ALLOWED_SOURCES_BY_MODE = {
+    "open-meteo": ("open-meteo", "synthetic"),
+    "qingkong": ("qingkong", "synthetic"),
+}
+
+
+def normalize_weather_source(raw):
+    s = str(raw or "").strip().lower()
+    if s == "qingkong":
+        return "qingkong"
+    return "open-meteo"
+
+
+def allowed_weather_sources(weather_source="open-meteo"):
+    mode = normalize_weather_source(weather_source)
+    return frozenset(_ALLOWED_SOURCES_BY_MODE[mode])
+
+
+def _parse_code(val, default=1):
+    return int(val) if val is not None else int(default)
+
+
+def is_rain_code(code, precip_mm=0.0):
+    c = int(code)
+    p = float(precip_mm or 0.0)
+    return c in _RAIN_CODES or (p >= 0.1 and not (71 <= c <= 77) and c not in (85, 86))
+
+
+def _floor_hour(ms):
+    return (int(ms) // HOUR_MS) * HOUR_MS
+
+
+def _pack_hourly_json(hourly, override=None):
+    hourly_list = hourly if isinstance(hourly, list) else []
+    if isinstance(override, dict):
+        return dumps({"hourly": hourly_list, "override": override})
+    return dumps(hourly_list)
+
+
+def _unpack_hourly_json(raw_json):
+    data = raw_json
+    if isinstance(raw_json, (str, bytes)):
+        try:
+            data = json.loads(raw_json)
+        except (ValueError, TypeError):
+            return ([], None)
+    if isinstance(data, list):
+        return (data, None)
+    if isinstance(data, dict):
+        hourly = data.get("hourly")
+        override = data.get("override")
+        return (hourly if isinstance(hourly, list) else [], override if isinstance(override, dict) else None)
+    return ([], None)
 
 
 def _utf16_key(s):
@@ -437,17 +493,150 @@ class CityBridgeHttpClient:
         )
 
 
+def resolve_weather_at(cache_row, target_ms, *, clock_ms=None, allowed_sources=None, online=None, area=None):
+    """Evaluate cached weather at target_ms (override window -> half-open 1h slot -> fallback)."""
+    area_name = area or (cache_row["area"] if cache_row is not None else "sakuraoka")
+    target_ms = int(target_ms)
+    ref_now = target_ms if clock_ms is None else int(clock_ms)
+    if cache_row is None:
+        return city_fallback_weather(target_ms, area=area_name)
+
+    row_source = str(cache_row["source"] or "")
+    if allowed_sources is not None and row_source not in allowed_sources:
+        return city_fallback_weather(target_ms, area=area_name)
+
+    row_status = str(cache_row["status"] or "")
+    if row_status == "fallback":
+        return city_fallback_weather(target_ms, area=area_name)
+
+    last_ok = cache_row["last_ok_at_ms"]
+    fetched = int(cache_row["fetched_at_ms"])
+    age_ref = int(last_ok) if last_ok is not None else fetched
+    if ref_now - age_ref > WEATHER_STALE_MS:
+        return city_fallback_weather(target_ms, area=area_name)
+
+    is_online = (row_status == "ok") if online is None else bool(online)
+    effective_status = "ok" if (is_online and row_status == "ok") else "stale"
+    hourly, override = _unpack_hourly_json(cache_row["hourly_json"])
+
+    # Step 1: active override window [starts_at_ms, expires_at_ms)
+    if isinstance(override, dict):
+        ov_start = override.get("starts_at_ms")
+        ov_exp = override.get("expires_at_ms")
+        if ov_start is not None and ov_exp is not None and int(ov_start) <= target_ms < int(ov_exp):
+            ov_code = _parse_code(override.get("code"), _parse_code(cache_row["code"]))
+            ov_precip = float(override["precip_mm"]) if override.get("precip_mm") is not None else float(cache_row["precip_mm"])
+            ov_rain = bool(override["rain"]) if override.get("rain") is not None else is_rain_code(ov_code, ov_precip)
+            ov_temp = float(override["temp_c"]) if override.get("temp_c") is not None else float(cache_row["temp_c"])
+            return {
+                "area": cache_row["area"],
+                "observed_at_ms": int(cache_row["observed_at_ms"]),
+                "fetched_at_ms": fetched,
+                "code": ov_code,
+                "temp_c": ov_temp,
+                "precip_mm": ov_precip,
+                "rain": ov_rain,
+                "source": row_source,
+                "status": effective_status,
+                "text": weather_text(ov_code),
+            }
+
+    # Step 2: half-open 1-hour slot [at_ms, at_ms + 3_600_000)
+    # When target_ms is within the live snapshot's own hour [floor_hour(fetched_at_ms), +1h)
+    # and no mid-hour override has already expired, prefer the cached current snapshot over hourly[0]
+    # so open-meteo live rain/clear matches the city instead of falling back to an hourly forecast.
+    override_expired = (
+        isinstance(override, dict)
+        and override.get("expires_at_ms") is not None
+        and target_ms >= int(override["expires_at_ms"])
+    )
+    fetched_hour = _floor_hour(fetched)
+    if not override_expired and fetched_hour <= target_ms < fetched_hour + HOUR_MS:
+        row_code = _parse_code(cache_row["code"])
+        return {
+            "area": cache_row["area"],
+            "observed_at_ms": int(cache_row["observed_at_ms"]),
+            "fetched_at_ms": fetched,
+            "code": row_code,
+            "temp_c": float(cache_row["temp_c"]),
+            "precip_mm": float(cache_row["precip_mm"]),
+            "rain": bool(cache_row["rain"]),
+            "source": row_source,
+            "status": effective_status,
+            "text": str(cache_row["text"] or weather_text(row_code)),
+        }
+
+    slot_start = _floor_hour(target_ms)
+    hourly_starts = [int(h["at_ms"]) for h in hourly if isinstance(h, dict) and h.get("at_ms") is not None]
+    matched = next((h for h in hourly if isinstance(h, dict) and h.get("at_ms") is not None and int(h["at_ms"]) == slot_start), None)
+    if matched is not None:
+        use_natural = override_expired and isinstance(matched.get("natural"), dict)
+        point = matched["natural"] if use_natural else matched
+        pt_code = _parse_code(point.get("code"), _parse_code(cache_row["code"]))
+        pt_precip = float(point["precip_mm"]) if point.get("precip_mm") is not None else 0.0
+        pt_rain = bool(point["rain"]) if point.get("rain") is not None else is_rain_code(pt_code, pt_precip)
+        pt_temp = float(point["temp_c"]) if point.get("temp_c") is not None else float(cache_row["temp_c"])
+        return {
+            "area": cache_row["area"],
+            "observed_at_ms": int(matched["at_ms"]),
+            "fetched_at_ms": fetched,
+            "code": pt_code,
+            "temp_c": pt_temp,
+            "precip_mm": pt_precip,
+            "rain": pt_rain,
+            "source": row_source,
+            "status": effective_status,
+            "text": weather_text(pt_code),
+        }
+
+    # Outside explicit hourly forecast horizon -> isomorphic fallback
+    if hourly_starts:
+        if target_ms < min(hourly_starts) or target_ms >= max(hourly_starts) + HOUR_MS:
+            return city_fallback_weather(target_ms, area=area_name)
+
+    # Expired override without natural hourly point -> never reuse expired override
+    if override_expired:
+        return city_fallback_weather(target_ms, area=area_name)
+
+    row_code = _parse_code(cache_row["code"])
+    return {
+        "area": cache_row["area"],
+        "observed_at_ms": int(cache_row["observed_at_ms"]),
+        "fetched_at_ms": fetched,
+        "code": row_code,
+        "temp_c": float(cache_row["temp_c"]),
+        "precip_mm": float(cache_row["precip_mm"]),
+        "rain": bool(cache_row["rain"]),
+        "source": row_source,
+        "status": effective_status,
+        "text": str(cache_row["text"] or weather_text(row_code)),
+    }
+
+
 class CityWeatherProvider:
     """K9 / F14: kernel weather backed by GET /city/bridge/v1/weather with 3h stale & identical fallback."""
 
-    def __init__(self, store, client, *, home_area="sakuraoka", refresh_interval_ms=30 * 60 * 1000):
+    def __init__(self, store, client, *, home_area="sakuraoka", refresh_interval_ms=30 * 60 * 1000, weather_source=None):
         self.s = store
         self.client = client
         self.home_area = home_area
         self.refresh_interval_ms = int(refresh_interval_ms)
         self._last_fetch_attempt_ms = None
+        mode_raw = weather_source if weather_source is not None else os.environ.get("WORLD_KERNEL_WEATHER_SOURCE", "open-meteo")
+        self.weather_source = normalize_weather_source(mode_raw)
+        self.allowed_sources = allowed_weather_sources(self.weather_source)
+        self._purge_disallowed_cache()
+
+    def _purge_disallowed_cache(self):
+        if getattr(self.s, "_in_tx", None) == "read":
+            return
+        pair = tuple(sorted(self.allowed_sources))
+        with self.s.tx() as db:
+            db.execute("DELETE FROM city_weather_cache WHERE source NOT IN (?, ?)", pair)
 
     def sync(self, now_ms=None, *, force=False):
+        if getattr(self.s, "_in_tx", None) == "read":
+            return False
         now_ms = int(round(self.s.clock.now() * 1000)) if now_ms is None else int(now_ms)
         if (not force and self._last_fetch_attempt_ms is not None
                 and 0 <= now_ms - self._last_fetch_attempt_ms < self.refresh_interval_ms):
@@ -456,13 +645,19 @@ class CityWeatherProvider:
         try:
             resp = self.client.get_weather()
         except CityBridgeError:
+            self._purge_disallowed_cache()
             return False
         areas = resp.get("areas") if isinstance(resp, dict) else None
         if not isinstance(areas, list):
             return False
         with self.s.tx() as db:
+            pair = tuple(sorted(self.allowed_sources))
+            db.execute("DELETE FROM city_weather_cache WHERE source NOT IN (?, ?)", pair)
             for snap in areas:
                 if not isinstance(snap, dict) or not isinstance(snap.get("area"), str):
+                    continue
+                snap_source = str(snap.get("source") or "open-meteo")
+                if snap_source not in self.allowed_sources:
                     continue
                 area = snap["area"]
                 status = str(snap.get("status") or "ok")
@@ -470,6 +665,8 @@ class CityWeatherProvider:
                 prev = db.execute("SELECT last_ok_at_ms FROM city_weather_cache WHERE area=?", (area,)).fetchone()
                 prev_ok = prev[0] if prev and prev[0] is not None else None
                 last_ok = fetched if status == "ok" else prev_ok
+                code_val = _parse_code(snap.get("code"))
+                text_val = str(snap.get("text") or weather_text(code_val))
                 db.execute(
                     "INSERT INTO city_weather_cache(area,observed_at_ms,fetched_at_ms,last_ok_at_ms,code,temp_c,"
                     "precip_mm,rain,source,status,text,hourly_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -480,60 +677,45 @@ class CityWeatherProvider:
                     " text=excluded.text, hourly_json=excluded.hourly_json",
                     (
                         area,
-                        int(snap.get("observed_at_ms") or fetched),
+                        int(snap["observed_at_ms"] if snap.get("observed_at_ms") is not None else fetched),
                         fetched,
                         last_ok,
-                        int(snap.get("code") or 1),
+                        code_val,
                         float(snap.get("temp_c") if snap.get("temp_c") is not None else 15.0),
                         float(snap.get("precip_mm") or 0.0),
                         1 if snap.get("rain") else 0,
-                        str(snap.get("source") or "open-meteo"),
+                        snap_source,
                         status,
-                        str(snap.get("text") or weather_text(int(snap.get("code") or 1))),
-                        dumps(snap.get("hourly") if isinstance(snap.get("hourly"), list) else []),
+                        text_val,
+                        _pack_hourly_json(snap.get("hourly"), snap.get("override")),
                     ),
                 )
         return True
 
-    def area_snapshot(self, area, now_ms=None, *, sync=True):
-        now_ms = int(round(self.s.clock.now() * 1000)) if now_ms is None else int(now_ms)
-        online = self.sync(now_ms, force=sync) if sync else False
+    def area_snapshot(self, area, now_ms=None, *, sync=True, target_ms=None):
+        clock_ms = int(round(self.s.clock.now() * 1000)) if now_ms is None else int(now_ms)
+        eval_ms = clock_ms if target_ms is None else int(target_ms)
+        online = self.sync(clock_ms, force=sync) if sync else False
         with self.s.read() as db:
             row = db.execute("SELECT * FROM city_weather_cache WHERE area=?", (area,)).fetchone()
         if row is not None:
-            last_ok = row["last_ok_at_ms"]
-            age_ref = last_ok if last_ok is not None else row["fetched_at_ms"]
-            if online and row["fetched_at_ms"] == now_ms:
-                return {
-                    "area": row["area"],
-                    "observed_at_ms": row["observed_at_ms"],
-                    "fetched_at_ms": row["fetched_at_ms"],
-                    "code": row["code"],
-                    "temp_c": float(row["temp_c"]),
-                    "precip_mm": float(row["precip_mm"]),
-                    "rain": bool(row["rain"]),
-                    "source": row["source"],
-                    "status": row["status"],
-                    "text": row["text"],
-                }
-            if row["status"] != "fallback" and age_ref is not None and now_ms - int(age_ref) <= WEATHER_STALE_MS:
-                return {
-                    "area": row["area"],
-                    "observed_at_ms": row["observed_at_ms"],
-                    "fetched_at_ms": row["fetched_at_ms"],
-                    "code": row["code"],
-                    "temp_c": float(row["temp_c"]),
-                    "precip_mm": float(row["precip_mm"]),
-                    "rain": bool(row["rain"]),
-                    "source": row["source"],
-                    "status": "ok" if (online and row["status"] == "ok") else "stale",
-                    "text": row["text"],
-                }
-        return city_fallback_weather(now_ms, area=area)
+            if str(row["source"] or "") not in self.allowed_sources:
+                self._purge_disallowed_cache()
+                return city_fallback_weather(eval_ms, area=area)
+            return resolve_weather_at(
+                row,
+                eval_ms,
+                clock_ms=clock_ms,
+                allowed_sources=self.allowed_sources,
+                online=online,
+                area=area,
+            )
+        return city_fallback_weather(eval_ms, area=area)
 
     def __call__(self, ts=None):
-        now_ms = int(round((self.s.clock.now() if ts is None else float(ts)) * 1000))
-        snap = self.area_snapshot(self.home_area, now_ms=now_ms, sync=True)
+        clock_ms = int(round(self.s.clock.now() * 1000))
+        target_ms = clock_ms if ts is None else int(round(float(ts) * 1000))
+        snap = self.area_snapshot(self.home_area, now_ms=clock_ms, target_ms=target_ms, sync=True)
         return {
             "temp_c": snap["temp_c"],
             "rain": snap["rain"],

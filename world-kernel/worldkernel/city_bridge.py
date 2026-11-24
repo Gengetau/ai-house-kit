@@ -311,6 +311,7 @@ class CityBridgeAdapter:
         city_model=None,
         allowed_actors=DEFAULT_PILOT_ACTORS,
         weather_provider=None,
+        weather_source=None,
         default_carry_yen=DEFAULT_CARRY_YEN,
         safety_margin_yen=DEFAULT_SAFETY_MARGIN_YEN,
         max_decisions_per_visit=DEFAULT_MAX_DECISIONS_PER_VISIT,
@@ -343,7 +344,7 @@ class CityBridgeAdapter:
         self.wallet = self._outings.wallet if self._outings is not None else Wallet(self.k)
         self.wallet.sync()
         self.body_effects = CityBodyEffects(self.k)
-        self.weather = weather_provider or CityWeatherProvider(self.s, self.client)
+        self.weather = weather_provider or CityWeatherProvider(self.s, self.client, weather_source=weather_source)
 
         self._catalog_cache = None
         self._places_by_id = {}
@@ -2303,7 +2304,7 @@ class CityBridgeAdapter:
         return {"ok": ok, "engine_reconcile_ok": engine_ok, "findings": findings}
 
 
-def install_from_env(life, chat=None, selves=None, env=None):
+def install_from_env(life, chat=None, selves=None, env=None, *, weather_provider=None):
     """Optional Authority extension factory (disabled unless WORLD_KERNEL_CITY_BRIDGE=1)."""
     env = os.environ if env is None else env
     if env.get("WORLD_KERNEL_CITY_BRIDGE", "0") != "1":
@@ -2331,7 +2332,10 @@ def install_from_env(life, chat=None, selves=None, env=None):
             return None
     profile = env.get("CITY_PROFILE", "").strip().lower()
     client = CityBridgeHttpClient(base_url, bridge_key)
-    weather = CityWeatherProvider(life.s, client, home_area="hiyorizaka") if profile == "qingkong" else None
+    weather_source = env.get("WORLD_KERNEL_WEATHER_SOURCE", "open-meteo")
+    weather = weather_provider
+    if weather is None and profile == "qingkong":
+        weather = CityWeatherProvider(life.s, client, home_area="hiyorizaka", weather_source=weather_source)
     targets = dict(QINGKONG_CITY_PLACE_TARGETS) if profile == "qingkong" else None
     model = LiveCityDecisionModel(chat, selves) if chat else DeterministicCityModel()
     intercept = env.get("WORLD_KERNEL_CITY_PLANS", "0") == "1"
@@ -2341,6 +2345,7 @@ def install_from_env(life, chat=None, selves=None, env=None):
         city_model=model,
         allowed_actors=actors,
         weather_provider=weather,
+        weather_source=weather_source,
         city_place_targets=targets,
         intercept_plans=intercept,
     )

@@ -50,6 +50,7 @@ class Authority:
                     eff_env.get("CITY_BRIDGE_URL", "http://127.0.0.1:17654/city/bridge/v1"),
                     eff_env["CITY_BRIDGE_KEY"],
                 ),
+                weather_source=eff_env.get("WORLD_KERNEL_WEATHER_SOURCE", "open-meteo"),
             )
         self.life = Life(self.store, model=model or LiveLifeModel(chat, selves),
                          weather=city_weather,
@@ -58,7 +59,8 @@ class Authority:
                          extensions=[outings.install, avatar.install(world_db), chatlink.install(world_db)]
                          + ([browsing] if browsing else []) + list(extra_extensions),
                          vocab=vocab)
-        self.city_bridge = city_bridge.install_from_env(self.life, chat=chat, selves=selves, env=eff_env)
+        self.city_bridge = city_bridge.install_from_env(self.life, chat=chat, selves=selves, env=eff_env,
+                                                        weather_provider=city_weather)
         if self.city_bridge is not None:
             self.life.extensions.append(self.city_bridge)
         self.proj = Projector(self.life, world_db)
