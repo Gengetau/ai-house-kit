@@ -45,6 +45,7 @@ from .intents import CommitmentStore, diet_memo_blocked, reply_declines
 from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from .memory import MemoryStore
+from . import memory_migrate
 from .memory_common import CommonMemoryStore
 from .proactive import ProactiveEngine
 from .send_gate import SendGate
@@ -539,6 +540,8 @@ class HouseDaemon:
         if problem:  # `ai-house up` refuses this; a house built in code gets the default and a line in the log
             self.log(f"{problem}；按 legacy 处理")
         store_cls = CommonMemoryStore if memory_backend(self.env) == "common" else MemoryStore
+        if store_cls is CommonMemoryStore:
+            self._carry_old_memories()
         self.memory = store_cls(
             self.runtime_dir,
             clock=self.clock,
@@ -609,6 +612,21 @@ class HouseDaemon:
                 and not self.proactive.is_initialized()
             ):
                 self.proactive.anchor(self.world_db, now=self.clock.now())
+
+    def _carry_old_memories(self) -> None:
+        """A house that ran on the old store keeps what it remembers: before the new store opens, carry over what
+        `memory.db` holds and the new file does not have yet (`memory_migrate`: the old file is only read, a second
+        run adds nothing). A failure is logged and the house starts all the same; the next start tries again."""
+        if not (self.runtime_dir / "memory.db").exists():
+            return
+        try:
+            report = memory_migrate.migrate(self.runtime_dir, env=self.env, names=self.vocab.NAMES, clock=self.clock)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"旧记忆库的内容没能带进新记忆库（{type(exc).__name__}）；小屋照常启动，下次启动会再试")
+            return
+        if report.get("wrote"):
+            for line in memory_migrate.describe(report):
+                self.log(line)
 
     def log(self, msg: str) -> None:
         print(f"[ai-house] {msg}", flush=True)
@@ -2516,6 +2534,8 @@ class HouseDaemon:
                 self.runtime_dir / "proactive_state.json",
                 self.runtime_dir / "group_behavior.json",
             ]
+            # the copies `memory_migrate` keeps of the new store before it writes hold memories too
+            targets += sorted(self.runtime_dir.glob("memory-common.db.bak-*"))
             wait_ev = threading.Event()
             for fp in targets:
                 for attempt in range(4):

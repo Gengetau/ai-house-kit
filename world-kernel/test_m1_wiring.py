@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import sqlite3
 import sys
@@ -48,18 +49,25 @@ class Model:
         return self.reply, 10
 
 
-def house(tc, backend=None, model=None, **env):
-    tmp = tempfile.TemporaryDirectory()
-    tc.addCleanup(tmp.cleanup)
+def house(tc, backend=None, model=None, rt=None, **env):
+    """A house in a new folder, or (`rt`) started again on a folder an earlier one used."""
+    if rt is None:
+        tmp = tempfile.TemporaryDirectory()
+        tc.addCleanup(tmp.cleanup)
+        rt = Path(tmp.name) / "rt"
     full = dict(env)
     if backend is not None:
         full[MEMORY_BACKEND_ENV] = backend
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        d = HouseDaemon(Path(tmp.name) / "rt", pack_dir=PACK, env=full, start_ts=T0, virtual_clock=True,
+        d = HouseDaemon(rt, pack_dir=PACK, env=full, start_ts=T0, virtual_clock=True,
                         allow_onboarding=False, llm_fn=model or Model())
     tc.addCleanup(d.close)
-    return d, Path(tmp.name) / "rt", out.getvalue()
+    return d, rt, out.getvalue()
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 class SwitchTests(unittest.TestCase):
@@ -151,6 +159,75 @@ class HouseOnTheNewStore(unittest.TestCase):
             self.d.reset_house()
         self.assertFalse((self.rt / "memory-common.db").exists())
         self.assertEqual(self.d.list_memories(actor="sora", scope="private"), [])
+
+
+class AHouseThatRanOnTheOldStore(unittest.TestCase):
+    """Switching to the new store keeps what she remembers: the start carries the old file's memories over."""
+
+    FACT = "房主对花生过敏，吃了会起疹子"
+
+    def old_house(self, rt=None):
+        d, rt, _ = house(self, None, rt=rt)
+        d.memory.add("sora", "private", self.FACT, now=d.clock.now())
+        d.close()
+        return rt
+
+    def texts(self, d, actor="sora"):
+        return " ".join(r["text"] for r in d.list_memories(actor=actor, scope="private"))
+
+    def test_what_she_remembered_is_there_after_the_switch(self):
+        rt = self.old_house()
+        before = sha(rt / "memory.db")
+        model = Model()
+        d, _, said = house(self, "common", model, rt=rt)
+        self.assertIn("花生过敏", self.texts(d))
+        self.assertNotIn("花生", self.texts(d, "rin"))  # still hers alone
+        self.assertEqual(sha(rt / "memory.db"), before)  # the old file is only read
+        self.assertIn("搬进新库 1 条", said)
+        self.assertNotIn("花生", said)  # the log counts, it does not quote
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(d.converse("private:sora", ASK, owner_speaker("房主"))["ok"])
+        self.assertIn("花生过敏", "\n".join(s + "\n" + u for s, u in model.seen).split(ASK)[0])
+
+    def test_a_second_start_adds_nothing_and_what_was_removed_stays_removed(self):
+        rt = self.old_house()
+        d, _, _ = house(self, "common", rt=rt)
+        mid = next(r["id"] for r in d.list_memories(actor="sora", scope="private") if "花生" in r["text"])
+        d.forget_memory(actor="sora", scope="private", mem_id=mid)
+        d.close()
+        d, _, said = house(self, "common", rt=rt)
+        self.assertNotIn("花生", self.texts(d))
+        self.assertNotIn("搬进新库", said)
+        self.assertEqual(sorted(rt.glob("memory-common.db.bak-*")), [])
+
+    def test_an_old_file_that_cannot_be_read_does_not_stop_the_house(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rt = Path(tmp.name) / "rt"
+        rt.mkdir()
+        (rt / "memory.db").write_bytes(b"this is not a database " * 64)
+        d, _, said = house(self, "common", rt=rt)
+        self.assertIs(type(d.memory), CommonMemoryStore)
+        self.assertIn("旧记忆库", said)
+        self.assertEqual(self.texts(d), "")
+
+    def test_the_old_store_does_not_look_at_any_of_this(self):
+        rt = self.old_house()
+        d, _, said = house(self, None, rt=rt)
+        self.assertIs(type(d.memory), MemoryStore)
+        self.assertFalse((rt / "memory-common.db").exists())
+        self.assertNotIn("搬进新库", said)
+
+    def test_a_reset_removes_the_copies_the_carrying_over_kept(self):
+        d, rt, _ = house(self, "common")  # the new file exists first, so carrying over keeps a copy of it
+        d.close()
+        self.old_house(rt)
+        d, _, _ = house(self, "common", rt=rt)
+        self.assertIn("花生过敏", self.texts(d))
+        self.assertEqual(len(list(rt.glob("memory-common.db.bak-*"))), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            d.reset_house()
+        self.assertEqual([p.name for p in rt.iterdir() if p.name.startswith("memory")], [])
 
 
 if __name__ == "__main__":
