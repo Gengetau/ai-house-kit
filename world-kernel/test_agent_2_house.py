@@ -67,17 +67,28 @@ class HouseTurnTests(unittest.TestCase):
         self.assertIn(("chat", "sora", "agent/claude", 1), [r[:4] for r in rows])
         self.assertTrue(all(r[4] > 0 for r in rows if r[2] == "agent/claude"))
 
-    def test_promise_recorded_through_the_tool_reaches_the_intent_book(self):
+    def test_agent_turn_reaches_the_intent_book_through_memory_extraction_not_a_tool(self):
+        """Fails if an agent turn records a promise by itself (the tool is gone), if the chat an agent resident had is
+        not what memory extraction reads, or if the extracted promise does not reach the intent book (the errand for
+        a catalogue item must be visible to the kernel through `errands`)."""
         d, h = make_house(self)
         h.script = [[
             ("tool", "record_promise", {"summary": "买一盒牛奶", "kind": "errand", "item": "milk", "qty": 1}),
             ("tool", "send_message", {"text": "好，我一会儿去买牛奶。"}),
         ]]
-        d.converse("private:sora", "帮我买一盒牛奶吧", owner_speaker("房主"))
-        self.assertTrue(h.tool_results[0][1].get("recorded"), h.tool_results[0])
-        rows = [r for r in d.intents.list_intents(actor="sora") if r["kind"] == "errand"]
-        self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(rows[0]["item"], "milk")
+        now = d.clock.now()
+        res = d.converse("private:sora", "顺便帮家里买一盒牛奶吧", owner_speaker("房主"))
+        self.assertEqual(res["replies"][0]["text"], "好，我一会儿去买牛奶。")
+        self.assertIn("denied", h.tool_results[0][1])  # the old tool is not honoured any more
+        self.assertNotIn("recorded", h.tool_results[0][1])
+        self.assertEqual(d.intents.list_intents(actor="sora"), [])  # the turn itself records nothing
+        ops = [{"op": "intent", "text": "苍空买一盒牛奶", "kind": "promise", "for": ["房主"], "agreed": ["苍空"],
+                "scope": "world", "when": "vague", "quote": "顺便帮家里买一盒牛奶吧"}]
+        d.memory.extract(force=True, now=now + 5, llm_fn=lambda system, user: {"ops": ops})
+        got = d.intents.errands("sora", now + 10)
+        self.assertEqual([(e["item"], e["qty"], e["account"]) for e in got], [("milk", 1, "sora")])
+        rows = d.intents.list_intents(actor="sora")
+        self.assertEqual([r["state"] for r in rows], ["open"])
 
     def test_group_resident_may_stay_quiet_and_nothing_is_stored_for_her(self):
         d, h = make_house(self)

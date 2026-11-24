@@ -1,13 +1,16 @@
-"""Real-run batch 1 (38.5 virtual hours, gpt-4o-mini): defects of the promise ("约定") loop.
+"""Real-run batch 1 (38.5 virtual hours, gpt-4o-mini): defects of the promise ("约定") loop, on the shared promise code.
 
-Every case below is a sentence or event pair taken from that run's evidence. Each defect has fail-before/pass-after cases
-and a regression case showing that the genuine promise next to it is still recorded.
+The kit used to record promises by rule from the chat turn. Now a promise comes only from memory extraction and the
+shared module (`ai_house.common.intents`, through `CommonIntents`) decides who said yes and what closes it. What is
+still checked here is what the real run found and the shared code must keep:
 
-1. small talk was recorded as 「和房主聊到：…」 because the keyword scan also read the resident's reply, and unrelated
-   home events (a tea plan) later closed those rows as "completed";
-2. a resident who declined in her reply ("没法出门买鸡蛋") still got an errand and later an expiry notice;
-3. a single-character alias ("米") inside a name ("米娜") plus a "买" elsewhere in the sentence became a rice errand;
-4. "买不了" was glued onto the reply after the fact, and a follow-up got "我会尽快去买的" for something unbuyable.
+1. an unrelated home event or another trip does not close a promise; only the named place / activity does;
+2. a resident who declined in her reply is not recorded as having agreed (no accepted promise, no errand);
+3. a single-character alias ("米") inside a name ("米娜") plus a "买" elsewhere is not a rice errand (`buy_words`);
+4. "买不了" is glued onto the reply of an owner request for something the catalogue does not sell (`buy_words`).
+
+The old cases about rule-based recording, small talk by keyword, diet memos and reminder rows are retired with the rule
+code; see docs/_m2-cases-g1.md. A fake extraction model is the only "model"; nothing here uses the network.
 """
 from __future__ import annotations
 
@@ -30,183 +33,198 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
 
 from ai_house.chat_identity import owner_speaker  # noqa: E402
 from ai_house.daemon import HouseDaemon, JST  # noqa: E402
-from worldkernel import vocab_life1  # noqa: E402
-from worldkernel.intents_lite import CommitmentStore  # noqa: E402
+from worldkernel import buy_words, vocab_life1  # noqa: E402
+from test_m2_intents_adapter import line, standalone  # noqa: E402
 
 T0 = dt.datetime(2026, 11, 21, 14, 0, tzinfo=JST).timestamp()
 H = 3600.0
 PACK = str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3")
+NAMES = {k: str(v) for k, v in vocab_life1.NAMES.items()}
+KERNEL_ENV = {"INTENTS_KERNEL_MATCH": "on", "INTENTS_EXPIRY_V2": "1", "INTENTS_DECIDE_CTX": "1",
+              "WORLD_KERNEL_ERRANDS_FROM_INTENTS": "1"}
 
 
 class _StoreCase(unittest.TestCase):
-    """A `CommitmentStore` over the real life1 vocabulary (the one the long run used)."""
+    """The shared promise code over the real life1 vocabulary (the one the long run used), as the house runs it.
+
+    `chat()` feeds one memory batch to `apply_chat` with the ops a fake extraction model answered; `evidence()` puts a
+    row of the kernel's evidence stream where `sweep` reads it.
+    """
+
+    STREAM = "test#1"
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.db = str(Path(tmp.name) / "world.db")
-        self.store = CommitmentStore(self.db, vocab=vocab_life1.load_pack())
-        self.store.init()
-        self._n = 0
-
-    def say(self, actor: str, owner_text: str, reply: str, *, now: float = T0, group: bool = False,
-            intents: Optional[List[Dict[str, Any]]] = None, party: Optional[List[str]] = None) -> None:
-        self.store.enqueue_chat(
-            actor, owner_text, reply, where="group" if group else "private", now=now,
-            channel="group" if group else f"private:{actor}", intents=intents, party=party,
-        )
-
-    def rows(self, actor: Optional[str] = None) -> List[Dict[str, Any]]:
-        return self.store.list_intents(actor=actor)
-
-    def evidence(self, body: Dict[str, Any]) -> None:
-        self._n += 1
+        self.ci = standalone(self.db, KERNEL_ENV, clock=lambda: T0)
         with contextlib.closing(sqlite3.connect(self.db)) as c:
             with c:
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
-                    (f"k{self._n}", self._n, float(body.get("ended_at") or body["at"]), json.dumps(body)),
-                )
+                c.execute("create table if not exists kernel_bind(k text primary key, v text)")
+                c.execute("insert or replace into kernel_bind values('world', ?)", (self.STREAM,))
+        self._n = 0
+
+    def chat(self, consumer: str, said: List[Any], ops: List[Dict[str, Any]], *, now: float = T0,
+             group: bool = True) -> Dict[str, int]:
+        """said: [(who, text)] in order; who is a resident key or "owner". `consumer` is the resident whose memory runs."""
+        i = self.ci.intents_module
+        lines = []
+        for k, (who, text) in enumerate(said, 1):
+            if who == "owner":
+                lines.append(line("房主", 1, text, k))
+            else:
+                lines.append(line(NAMES[who] + ("(你)" if who == consumer else ""), i.ID.ACTOR_QQ[who], text, k))
+        return i.apply_chat(consumer, "group:1" if group else "private:1", not group, ops, lines, now=now,
+                            times=[now] * len(lines))
+
+    def rows(self, actor: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self.ci.list_intents(actor=actor, limit=50)
+
+    def evidence(self, body: Dict[str, Any]) -> str:
+        self._n += 1
+        key = f"{self.STREAM}#{self._n}"
+        body = {"key": key, "plan_id": f"plan-{self._n}", **body}
+        with contextlib.closing(sqlite3.connect(self.db)) as c:
+            with c:
+                c.execute("insert into intent_evidence values(?, ?, ?, ?, ?, 'queued')",
+                          (key, self.STREAM, self._n, float(body["at"]), json.dumps(body)))
+        return key
+
+    def sweep(self, now: float) -> Any:
+        return self.ci.sweep(now)
 
 
-class SmallTalkIsNotAPromise(_StoreCase):
-    # (resident, what the owner said, what the resident answered) -- all recorded by the long run, none is a plan
-    CHATTER = [
-        ("nell", "今天过得怎么样？晚饭好吃吗？", "今天过得很平静，晚饭的咖喱饭味道不错哦！"),
-        ("yuki", "好无聊啊，你们平时都喜欢干嘛？", "我喜欢在院子里看星星，或者一起去河岸散步。"),
-        ("wanda", "好无聊啊，你们平时都喜欢干嘛？", "不如来一场游戏大战吧！或者我们可以一起喝下午茶。"),
-        ("nell", "奈尔，说说你最近有什么开心的事，还有你最喜欢的一样东西吧。", "和大家一起做饭的时光总是很愉快。"),
-        ("kai", "凯，欢迎搬进来！介绍一下你自己吧。", "我喜欢户外、登山和摄影。如果你有兴趣，咱们可以一起去！"),
-        ("elsa", "大家知道我最近有什么打算吗？", "我想，你的打算可能与我们一起享受下午茶有关吧。"),
-        ("nell", "今天晚饭大家想吃什么？", "我今天准备了咖喱饭，如果大家有其他想吃的，我也很乐意一起讨论。"),
-        ("nell", "中午好，午饭吃了吗？", "我今天中午吃了咖喱饭，味道不错哦。"),
-        ("kai", "快到晚上十点了，大家今天辛苦了。", "今天真不错。明天一起去公园玩吧！"),
-        ("wanda", "这两天大家辛苦了，能说说这两天最开心的一件事吗？", "最开心的事就是和大家一起分享下午茶的甜点。"),
-        ("nell", "奈尔，咖喱饭好吃吗？你今天都做了什么？", "咖喱饭很好吃，今天我在厨房整理了一下。"),
-        ("mina", "米娜，昨天说好的逛街，后来去了吗？", "我昨天没去，下次我们一起去吧！"),
-    ]
-
-    def test_chatter_records_nothing(self) -> None:
-        for actor, said, reply in self.CHATTER:
-            with self.subTest(said=said):
-                self.setUp()
-                self.say(actor, said, reply)
-                self.assertEqual(self.rows(actor), [], [r["summary"] for r in self.rows(actor)])
-
-    def test_keyword_only_in_the_reply_records_nothing(self) -> None:
-        for kw in ("一起", "咖喱", "喝茶", "做饭", "散步", "出门"):
-            with self.subTest(kw=kw):
-                self.say("nell", "你今天心情怎么样", f"挺好的，{kw}真开心")
-                self.assertEqual(self.rows("nell"), [])
-
-    def test_real_invitations_and_requests_are_still_recorded(self) -> None:
-        cases = [
-            ("nell", "奈尔，今晚的晚饭能做咖喱饭吗？", "好的，房主，我会做咖喱饭的！"),
-            ("wanda", "婉妲，下午要不要一起喝下午茶呀？", "当然好呀！我已经准备好了甜点和茶。"),
-            ("yuki", "明天下午我们一起去公园玩好不好？", "听起来很不错呢，公园的阳光和微风会让人心情愉悦。"),
-            ("nell", "你今晚早点睡哦", "好的，我今晚早点睡"),
-            ("mina", "明天一起去散步吧", "好呀"),
-        ]
-        for actor, said, reply in cases:
-            with self.subTest(said=said):
-                self.setUp()
-                self.say(actor, said, reply)
-                rows = self.rows(actor)
-                self.assertEqual(len(rows), 1, said)
-                self.assertTrue(rows[0]["summary"].startswith("和房主聊到"))
-                self.assertEqual(rows[0]["state"], "open")
+def plan_ops(text: str, quote: str, **kw: Any) -> List[Dict[str, Any]]:
+    return [{"op": "intent", "text": text, "kind": "plan", "quote": quote, "scope": "world", "when": "vague", **kw}]
 
 
 class UnrelatedHomeEventsDoNotCloseOutings(_StoreCase):
-    TEA_PLAN_DONE = {"kind": "plan_finished", "actor": "wanda", "plan_id": "plan-388b6e7163a3", "place": "living",
-                     "outcome": "done", "members": ["wanda", "mina"]}
+    TEA_PLAN_DONE = {"kind": "plan_finished", "actor": "wanda", "place": "living", "outcome": "done",
+                     "members": ["wanda", "mina"]}
+
+    def promise(self, text: str = "婉妲下午去公园", quote: str = "下午去公园") -> None:
+        got = self.chat("wanda", [("wanda", f"我{quote}")], plan_ops(text, f"我{quote}"))
+        self.assertEqual(got["intents"], 1, got)
+        self.assertEqual([(r["state"], r["status"]) for r in self.rows("wanda")], [("open", "accepted")])
 
     def test_tea_at_home_does_not_close_an_outing(self) -> None:
-        for said in ("明天下午我们一起去公园玩好不好？", "婉妲，今天下午一起去街上逛逛怎么样？", "下午出门走走吧"):
-            with self.subTest(said=said):
+        """Fails if a plan that finished at home (a tea party) closes a promise to go to a named place, or if the
+        arrival at that place (the control, in the same scenario) does not close it."""
+        for name, place in (("公园", "place:park"), ("书店", "place:bookshop"), ("图书馆", "place:library")):
+            with self.subTest(place=place):
                 self.setUp()
-                self.say("wanda", said, "好呀，一起去吧")
-                self.assertEqual([r["kind"] for r in self.rows("wanda")], ["outing"])
+                self.promise(f"婉妲下午去{name}", f"下午去{name}")
                 self.evidence({**self.TEA_PLAN_DONE, "at": T0 + 2 * H})
-                self.store.sweep(T0 + 3 * H)
+                self.sweep(T0 + 3 * H)
                 self.assertEqual(self.rows("wanda")[0]["state"], "open")
+                self.evidence({"kind": "arrived", "actor": "wanda", "place": place, "at": T0 + 4 * H})
+                self.sweep(T0 + 5 * H)
+                self.assertEqual(self.rows("wanda")[0]["state"], "completed")
 
     def test_shopping_trip_does_not_close_a_park_outing(self) -> None:
-        self.say("wanda", "明天下午我们一起去公园玩好不好？", "好呀")
+        """Fails if arriving at the supermarket and finishing that trip closes a promise to go to the park, or if the
+        later arrival at the park does not close it."""
+        self.promise()
+        self.evidence({"kind": "arrived", "actor": "wanda", "place": "place:supermarket", "plan_id": "shopping-plan-1",
+                       "at": T0 + 2 * H})
         self.evidence({"kind": "plan_finished", "actor": "wanda", "plan_id": "shopping-plan-1",
-                       "place": "place:supermarket", "outcome": "done", "members": ["wanda"], "at": T0 + 2 * H})
-        self.store.sweep(T0 + 3 * H)
+                       "place": "place:supermarket", "outcome": "done", "members": ["wanda"], "at": T0 + 2.5 * H})
+        self.sweep(T0 + 3 * H)
         self.assertEqual(self.rows("wanda")[0]["state"], "open")
-
-    def test_arriving_at_the_named_place_still_closes(self) -> None:
-        self.say("wanda", "明天下午我们一起去公园玩好不好？", "好呀")
-        self.evidence({"kind": "arrived", "actor": "wanda", "place": "place:park", "at": T0 + 2 * H})
-        self.store.sweep(T0 + 3 * H)
+        self.evidence({"kind": "arrived", "actor": "wanda", "place": "place:park", "plan_id": "walk-1", "at": T0 + 4 * H})
+        self.sweep(T0 + 5 * H)
         self.assertEqual(self.rows("wanda")[0]["state"], "completed")
 
-    def test_finished_plan_away_from_home_still_closes_an_unnamed_outing(self) -> None:
-        self.say("wanda", "下午出门走走吧", "好呀")
-        self.evidence({"kind": "plan_finished", "actor": "wanda", "plan_id": "plan-x", "place": "place:takaosan",
-                       "outcome": "done", "members": ["wanda", "kai"], "at": T0 + 2 * H})
-        self.store.sweep(T0 + 3 * H)
-        self.assertEqual(self.rows("wanda")[0]["state"], "completed")
-
-    def test_together_tea_is_not_closed_by_a_different_activity_but_by_tea(self) -> None:
-        self.say("wanda", "婉妲，下午要不要一起喝下午茶呀？", "当然好呀")
-        self.assertEqual(self.rows("wanda")[0]["kind"], "together")
-        self.evidence({"kind": "invite_settled", "actor": "wanda", "plan_id": "plan-game", "activity": "gaming",
-                       "place": "living", "members": ["wanda", "mina"], "at": T0 + H})
-        self.evidence({"kind": "plan_finished", "actor": "wanda", "plan_id": "plan-game", "place": "living",
-                       "outcome": "done", "members": ["wanda", "mina"], "at": T0 + 2 * H})
-        self.store.sweep(T0 + 3 * H)
+    def test_someone_elses_arrival_at_the_named_place_does_not_close_it(self) -> None:
+        """Fails if the arrival of another resident at the park closes wanda's promise; the control is wanda's own
+        arrival, which closes it and is named as the evidence."""
+        self.promise()
+        self.evidence({"kind": "arrived", "actor": "mina", "place": "place:park", "at": T0 + 2 * H})
+        self.sweep(T0 + 3 * H)
         self.assertEqual(self.rows("wanda")[0]["state"], "open")
-        self.evidence({"kind": "invite_settled", "actor": "wanda", "plan_id": "plan-tea", "activity": "tea_party",
-                       "place": "living", "members": ["wanda", "mina"], "at": T0 + 3 * H})
-        self.evidence({"kind": "plan_finished", "actor": "wanda", "plan_id": "plan-tea", "place": "living",
-                       "outcome": "done", "members": ["wanda", "mina"], "at": T0 + 4 * H})
-        self.store.sweep(T0 + 5 * H)
+        key = self.evidence({"kind": "arrived", "actor": "wanda", "place": "place:park", "at": T0 + 4 * H})
+        self.sweep(T0 + 5 * H)
+        row = self.rows("wanda")[0]
+        self.assertEqual((row["state"], row["status"]), ("completed", "completed"))
+        self.assertEqual(row["evidence_key"], key)
+
+    def test_together_film_is_not_closed_by_a_different_activity_but_by_the_film(self) -> None:
+        """Fails if a game played by both at home closes a joint promise to watch a film, or if the film night of both
+        (the control) does not close it."""
+        said = [("wanda", "下午一起看电影吧"), ("yuki", "好呀，一起去")]
+        ops = [{"op": "intent", "text": "婉妲和由纪一起看电影", "kind": "joint", "with": ["由纪"],
+                "agreed": ["由纪", "婉妲"], "quote": "下午一起看电影吧", "scope": "world", "when": "vague"}]
+        self.assertEqual(self.chat("wanda", said, ops)["intents"], 1)
+        self.assertEqual([r["status"] for r in self.rows("wanda")], ["accepted"])
+
+        def activity(aid: str, plan: str, start: float) -> None:
+            for who in ("wanda", "yuki"):
+                self.evidence({"kind": "activity", "actor": who, "plan_id": plan, "activity": aid, "place": "living",
+                               "started_at": start, "ended_at": start + 1200, "outcome": "succeeded", "at": start + 1200})
+
+        activity("game_tournament", "plan-game", T0 + H)
+        self.sweep(T0 + 3 * H)
+        self.assertEqual(self.rows("wanda")[0]["state"], "open")
+        activity("movie_night", "plan-movie", T0 + 3 * H)
+        self.sweep(T0 + 5 * H)
         self.assertEqual(self.rows("wanda")[0]["state"], "completed")
 
 
 class DecliningReplyIsNotAnAgreement(_StoreCase):
     EGG = "谁方便的话，顺路帮我买两个鸡蛋回来吧，拜托啦"
+    REFUSAL = "我现在在家发呆，没法出门买鸡蛋。要不我等会儿去厨房看看有什么食材？"
 
-    def test_resident_who_refused_gets_no_errand(self) -> None:
-        self.say("alma", self.EGG, "我现在在家发呆，没法出门买鸡蛋。要不我等会儿去厨房看看有什么食材？", group=True)
-        self.assertEqual(self.rows("alma"), [])
+    def egg(self, name: str) -> List[Dict[str, Any]]:
+        return [{"op": "intent", "text": f"{name}买两个鸡蛋", "kind": "promise", "for": ["房主"], "agreed": [name],
+                 "quote": "顺路帮我买两个鸡蛋回来吧", "scope": "world", "when": "vague"}]
 
-    def test_resident_who_agreed_to_the_same_sentence_keeps_hers(self) -> None:
-        self.say("alma", self.EGG, "我现在在家发呆，没法出门买鸡蛋。", group=True, party=["alma", "nell"])
-        self.say("nell", self.EGG, "好呀，我下午去超市顺便带回来。", group=True, party=["alma", "nell"])
+    def test_resident_who_refused_gets_no_errand_and_the_one_who_agreed_keeps_hers(self) -> None:
+        """Fails if a promise is recorded for 阿尔玛 although the model lists her as agreed and her line refuses, if she
+        gets an errand, or if 奈尔, who said yes to the same sentence (the control), does not get hers."""
+        got = self.chat("alma", [("owner", self.EGG), ("alma", self.REFUSAL)], self.egg("阿尔玛"))
+        self.assertEqual((got["intents"], got["rejected"]), (0, 1), got)
+        got = self.chat("nell", [("owner", self.EGG), ("nell", "好呀，我下午去超市顺便带回来。"), ("alma", self.REFUSAL)],
+                        self.egg("奈尔"))
+        self.assertEqual(got["intents"], 1, got)
         self.assertEqual(self.rows("alma"), [])
-        eggs = self.rows("nell")
-        self.assertEqual([(r["kind"], r["item"], r["qty"]) for r in eggs], [("errand", "egg", 2)])
+        self.assertEqual([(r["actor"], r["status"]) for r in self.rows("nell")], [("nell", "accepted")])
+        self.assertEqual(self.ci.errands("alma", T0 + 60), [])
+        self.assertEqual([(e["item"], e["qty"]) for e in self.ci.errands("nell", T0 + 60)], [("egg", 2)])
 
-    def test_refusal_also_blocks_the_llm_tool_intent_and_other_plans(self) -> None:
-        self.say("alma", "帮我买两个鸡蛋", "抱歉，我现在去不了。", intents=[
-            {"text": "买鸡蛋", "kind": "errand", "item": "egg", "qty": 2, "答应了的": ["alma"]}])
-        self.assertEqual(self.rows("alma"), [])
-        self.say("mina", "米娜，明天一起去散步吧", "我明天上午有点事，能不能改成下午？")
-        self.assertEqual(self.rows("mina"), [])
-        self.say("nell", "奈尔，今晚的晚饭能做咖喱饭吗？", "不好意思，今晚我没办法做饭。")
+    def test_a_refusal_never_makes_an_accepted_plan_or_promise(self) -> None:
+        """Fails if 米娜's counter-question or 奈尔's "no way" is taken for a yes (an accepted row, or an errand-like
+        promise), or if 婉妲's plain yes to the same kind of invitation (the control) is not accepted."""
+        walk = [{"op": "intent", "text": "米娜和房主明天一起去散步", "kind": "joint", "with": ["房主"],
+                 "agreed": ["房主", "米娜"], "quote": "明天一起去散步吧", "scope": "world", "when": "vague"}]
+        self.chat("mina", [("owner", "米娜，明天一起去散步吧"), ("mina", "我明天上午有点事，能不能改成下午？")], walk)
+        curry = [{"op": "intent", "text": "奈尔今晚做咖喱饭", "kind": "promise", "for": ["房主"], "agreed": ["奈尔"],
+                  "quote": "今晚的晚饭能做咖喱饭吗", "scope": "world", "when": "vague"}]
+        got = self.chat("nell", [("owner", "奈尔，今晚的晚饭能做咖喱饭吗？"), ("nell", "不好意思，今晚我没办法做饭。")], curry)
+        self.assertEqual(got["rejected"], 1, got)
         self.assertEqual(self.rows("nell"), [])
+        self.assertEqual([(r["status"], r["agreed"]) for r in self.rows("mina")], [("proposed", ["owner"])])
+        yes = [{"op": "intent", "text": "婉妲和房主明天一起去散步", "kind": "joint", "with": ["房主"],
+                "agreed": ["房主", "婉妲"], "quote": "明天一起去散步吧", "scope": "world", "when": "vague"}]
+        self.chat("wanda", [("owner", "婉妲，明天一起去散步吧"), ("wanda", "好呀")], yes)
+        self.assertEqual([(r["status"], sorted(r["agreed"])) for r in self.rows("wanda")],
+                         [("accepted", ["owner", "wanda"])])
+        for who in ("mina", "nell", "wanda"):
+            self.assertEqual(self.ci.errands(who, T0 + 60), [])
 
-    def test_agreement_with_a_caveat_is_still_an_agreement(self) -> None:
-        self.say("nell", "帮我买一盒牛奶回来好吗？", "好的，我会买的，不过现在还没法出门，下午去。")
-        self.assertEqual([(r["item"], r["state"]) for r in self.rows("nell")], [("milk", "open")])
 
-    def test_diet_memo_is_not_a_promise_and_survives_a_refusing_tone(self) -> None:
-        self.say("nell", "我对花生过敏，你记一下哦。", "抱歉，我没法保证每次都想起来，但我会尽量。")
-        self.assertEqual([r["kind"] for r in self.rows("nell")], ["memo"])
+class NamesAndNounsAreNotIngredients(unittest.TestCase):
+    def detect(self, text: str) -> Optional[str]:
+        return buy_words.detect_errand_item(vocab_life1, text)[0]
 
-
-class NamesAndNounsAreNotIngredients(_StoreCase):
     def test_mina_is_not_rice(self) -> None:
-        self.say("mina", "米娜，明天上午陪我去逛街买衣服，可以吗？", "好呀，我陪你去")
-        self.assertEqual([r for r in self.rows("mina") if r["item"] == "rice"], [])
-        self.assertEqual([r for r in self.rows("mina") if r["kind"] == "errand"], [])
+        """Fails if the name 米娜 plus a 买 elsewhere ("买衣服") is read as a rice errand, or if a plain request for rice
+        (the control) is not read as one."""
+        self.assertIsNone(self.detect("米娜，明天上午陪我去逛街买衣服，可以吗？"))
+        self.assertEqual(self.detect("米娜，帮我买点米回来"), "rice")
 
     def test_single_char_alias_needs_to_be_the_thing_bought(self) -> None:
+        """Fails if a one-character item word inside a name or another word ("米娜", "鱼缸", "米价") is taken for the
+        item; the controls are the same words as real purchases."""
         none_of_these = [
             "米娜，明天上午陪我去逛街买衣服，可以吗？",
             "帮米娜买点东西",
@@ -216,21 +234,22 @@ class NamesAndNounsAreNotIngredients(_StoreCase):
         ]
         for text in none_of_these:
             with self.subTest(text=text):
-                item, _ = self.store._detect_errand_item(text)
-                self.assertNotIn(item, ("rice", "fish"))
+                self.assertNotIn(self.detect(text), ("rice", "fish"))
+        self.assertEqual(self.detect("帮我买条鱼"), "fish")
 
     def test_buying_rice_or_fish_still_works(self) -> None:
+        """Fails if a genuine request for rice or fish is not recognised."""
         for text, item in (("帮我买点米回来", "rice"), ("买米吧", "rice"), ("记得买两袋米", "rice"),
                            ("缺米了，补点", "rice"), ("帮我买条鱼", "fish"), ("路过超市买鱼回来", "fish"),
                            ("帮我买大米", "rice")):
             with self.subTest(text=text):
-                self.assertEqual(self.store._detect_errand_item(text)[0], item)
+                self.assertEqual(self.detect(text), item)
 
     def test_resident_names_are_not_matched_even_for_longer_aliases(self) -> None:
-        names = vocab_life1.load_pack().NAMES
-        self.assertIn("米娜", names.values())
-        item, _ = self.store._detect_errand_item("米娜帮我买点东西")
-        self.assertIsNone(item)
+        """Fails if a resident's name takes part in item matching; the control is the same sentence without the name."""
+        self.assertIn("米娜", vocab_life1.NAMES.values())
+        self.assertIsNone(self.detect("米娜帮我买点东西"))
+        self.assertEqual(self.detect("帮我买点米"), "rice")
 
 
 class _CapturingModel:
@@ -293,66 +312,26 @@ class _DaemonCase(unittest.TestCase):
         return res["replies"][0]["text"]
 
 
-class ResidentKnowsItCannotBuyBeforeAnswering(_DaemonCase):
-    def test_the_prompt_says_the_item_cannot_be_bought(self) -> None:
-        srv = self.boot("好的，我再想想")
-        self.talk("能帮我买个榴莲回来吗？")
-        prompt = srv.systems[-1]
-        self.assertIn("榴莲", prompt)
-        self.assertIn("买不了", prompt)
+class ReplyTailSaysItCannotBeBought(_DaemonCase):
+    TAIL = "不过「榴莲」我这边买不了，没法替你带回来。"
 
-    def test_a_purchasable_item_gets_no_such_hint(self) -> None:
-        srv = self.boot("好的")
-        self.talk("能帮我买两盒牛奶回来吗？")
-        self.assertNotIn("买不了", srv.systems[-1])
+    def test_a_request_for_something_not_sold_gets_the_tail_and_a_purchasable_one_does_not(self) -> None:
+        """Fails if the reply to "能帮我买个榴莲回来吗？" (not in the catalogue) lacks the tail, if the milk request (the
+        control, same daemon) gets any "买不了", or if unrelated chat afterwards gets the tail."""
+        self.boot("好的，我再想想")
+        text = self.talk("能帮我买个榴莲回来吗？")
+        self.assertIn(self.TAIL, text)
+        self.assertTrue(text.startswith("好的，我再想想"), text)
+        self.assertNotIn("买不了", self.talk("能帮我买两盒牛奶回来吗？"))
+        self.assertNotIn("买不了", self.talk("今天天气怎么样？"))
 
     def test_already_declining_reply_is_not_given_a_second_contradicting_tail(self) -> None:
+        """Fails if a reply that already says "买不了" gets the tail as well (two sentences saying the same, one of
+        them saying "没法替你带回来" after a promise); the control is the non-declining reply of the test above."""
         self.boot("榴莲我买不了，只能先记个提醒。")
         text = self.talk("能帮我买个榴莲回来吗？")
         self.assertEqual(text.count("买不了"), 1, text)
-
-    def test_followup_after_expiry_tells_her_it_expired_and_was_never_buyable(self) -> None:
-        srv = self.boot("好的，我再想想")
-        self.talk("能帮我买个榴莲回来吗？")
-        d = self.d
-        d.clock.advance(25 * H)
-        d.intents.sweep(d.clock.now())
-        self.assertEqual([r["state"] for r in d.intents.list_intents(actor="sora") if r["raw_item"] == "榴莲"], ["expired"])
-        self.talk("榴莲的事怎么样了？")
-        prompt = srv.systems[-1]
-        self.assertIn("榴莲", prompt)
-        self.assertIn("过期", prompt)
-        self.assertIn("买不了", prompt)
-
-    def test_followup_about_an_expired_catalog_errand_says_it_was_not_bought(self) -> None:
-        srv = self.boot("好的")
-        self.d.intents.enqueue_chat("sora", "帮我买两个鸡蛋回来", "好呀", where="private", now=self.d.clock.now())
-        self.d.clock.advance(25 * H)
-        self.d.intents.sweep(self.d.clock.now())
-        self.talk("鸡蛋买了吗？")
-        prompt = srv.systems[-1]
-        self.assertIn("鸡蛋", prompt)
-        self.assertIn("过期", prompt)
-        self.assertIn("没买成", prompt)
-
-    def test_unrelated_chat_gets_no_promise_hint(self) -> None:
-        srv = self.boot("好的")
-        self.talk("能帮我买个榴莲回来吗？")
-        self.talk("今天天气怎么样？")
-        self.assertNotIn("买不了", srv.systems[-1])
-        self.assertNotIn("榴莲", srv.systems[-1])
-
-    def test_expiry_notice_for_a_reminder_does_not_claim_a_promise_to_buy(self) -> None:
-        self.boot("好的，我再想想")
-        self.talk("能帮我买个榴莲回来吗？")
-        d = self.d
-        d.clock.advance(25 * H)
-        d.intents.sweep(d.clock.now())
-        d._run_post_step_jobs()
-        notes = [m for m in d.list_chat("private:sora", limit=80) if "过期" in m["text"]]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("榴莲", notes[0]["text"])
-        self.assertNotIn("答应你买", notes[0]["text"])
+        self.assertNotIn(self.TAIL, text)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,11 @@
 """
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
 import http.server
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -25,9 +28,135 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
 from ai_house.chat_identity import owner_speaker  # noqa: E402
 from ai_house.daemon import HouseDaemon  # noqa: E402
 from ai_house.llm import ModelRouter, _trim_to_last_sentence  # noqa: E402
-from worldkernel.intents_lite import reply_declines  # noqa: E402
+from ai_house.daemon import JST  # noqa: E402
+from worldkernel.buy_words import reply_declines  # noqa: E402
+from test_m2_intents_adapter import line, standalone  # noqa: E402
 
-from test_realrun_1_promises import PACK, T0, JST, _DaemonCase, _StoreCase  # noqa: E402,F401
+# Shared with test_realrun_8_round4 / test_realrun_9_leftovers (they import these from here, not from realrun_1).
+T0 = dt.datetime(2026, 11, 21, 14, 0, tzinfo=JST).timestamp()
+H = 3600.0
+PACK = str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# helpers (also used by test_realrun_8_round4 and test_realrun_9_leftovers)
+
+NAMES = {"alma": "阿尔玛", "elsa": "艾莎", "mina": "米娜", "nell": "奈尔", "wanda": "婉妲", "yuki": "由纪"}
+
+
+class _PromiseCase(unittest.TestCase):
+    """The promise code a house runs (`CommonIntents` on a fresh world.db), fed the way the memory store feeds it.
+
+    A promise exists only when an extraction answer (here: a made-up one) is applied to the chat lines of that batch.
+    `say` plays one batch for every resident who answered: the owner's line, then each answer, and for each of them the
+    extraction op "she agreed", exactly as a model that always claims agreement would write it. What is then recorded
+    is decided by the shared module's own checks of what the lines say.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db = str(Path(tmp.name) / "world.db")
+        # the switches the daemon sets for a house (so `errands` and the evidence gate work as in a running house)
+        self.ci = standalone(self.db, {"INTENTS_EVIDENCE_GATE": "1", "INTENTS_KERNEL_MATCH": "on",
+                                       "INTENTS_EXPIRY_V2": "1", "INTENTS_DECIDE_CTX": "1",
+                                       "WORLD_KERNEL_ERRANDS_FROM_INTENTS": "1"}, clock=lambda: T0)
+        self.i = self.ci.intents_module
+        self._n = 0
+        with contextlib.closing(sqlite3.connect(self.db)) as c:  # what the kernel's bridge keeps in a running house
+            with c:
+                c.execute("create table if not exists kernel_bind(k text primary key, v text not null)")
+                c.execute("insert or replace into kernel_bind values('world', 'ev')")
+
+    def say(self, owner_text: str, replies: Dict[str, str], *, group: bool = False, now: float = T0,
+            text: Optional[str] = None, kind: str = "promise", due: str = "", when: str = "vague") -> None:
+        lines = [line("房主", 1, owner_text, 1)]
+        for k, (actor, reply) in enumerate(replies.items()):
+            lines.append(line(f"{NAMES[actor]}", self.i.ID.ACTOR_QQ[actor], reply, k + 2))
+        for actor in replies:
+            op = {"op": "intent", "text": text or owner_text, "kind": kind, "for": ["房主"],
+                  "agreed": [NAMES[actor]], "scope": "world", "when": when, "quote": owner_text}
+            if due:
+                op["due"] = due
+            self.i.apply_chat(actor, "group:1" if group else "private:1", not group, [op], lines, now=now,
+                              times=[now] * len(lines))
+
+    def rows(self, actor: Optional[str] = None) -> List[Dict[str, Any]]:
+        """The `intents` table as the shared module wrote it (`listing` hides private rows' text)."""
+        with contextlib.closing(sqlite3.connect(self.db)) as c:
+            c.row_factory = sqlite3.Row
+            got = c.execute("SELECT * FROM intents ORDER BY id").fetchall()
+        return [dict(r) for r in got if actor is None or r["actor"] == actor]
+
+    def errands(self, actor: str, now: float = T0 + 60) -> List[Dict[str, Any]]:
+        return self.ci.errands(actor, now)
+
+    def evidence(self, body: Dict[str, Any]) -> None:
+        self._n += 1
+        with contextlib.closing(sqlite3.connect(self.db)) as c:
+            with c:
+                c.execute("INSERT INTO intent_evidence(key, stream, event_id, at, body, state) VALUES(?, 'ev', ?, ?, ?, 'queued')",
+                          (f"k{self._n}", self._n, float(body.get("ended_at") or body["at"]), json.dumps(body)))
+
+
+class _CapturingModel:
+    """Loopback OpenAI-compatible model that remembers the system prompts it was shown on chat turns."""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+        self.systems: List[str] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: Any) -> None:
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+                msgs = body.get("messages") or []
+                # only chat turns (the world step talks to the model too, with a different prompt)
+                if any("刚刚说" in str(m.get("content") or "") for m in msgs if m.get("role") == "user"):
+                    outer.systems.extend(str(m.get("content") or "") for m in msgs if m.get("role") == "system")
+                raw = json.dumps({
+                    "choices": [{"message": {"role": "assistant", "content": outer.reply}}],
+                    "usage": {"total_tokens": 10},
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base_url = f"http://127.0.0.1:{self.srv.server_address[1]}/v1"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class _DaemonCase(unittest.TestCase):
+    def boot(self, reply: str, start_ts: float = T0) -> _CapturingModel:
+        srv = _CapturingModel(reply)
+        self.addCleanup(srv.close)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = HouseDaemon(
+            tmp.name,
+            pack_dir=PACK,
+            env={"AI_HOUSE_API_KEY": "mock-key", "AI_HOUSE_BASE_URL": srv.base_url, "AI_HOUSE_MODEL": "mock-model"},
+            start_ts=start_ts,
+            virtual_clock=True,
+            allow_onboarding=False,
+        )
+        self.addCleanup(self.d.close)
+        return srv
+
+    def talk(self, text: str) -> str:
+        res = self.d.converse("private:sora", text, owner_speaker("房主"))
+        return res["replies"][0]["text"]
 
 EGG = "谁方便的话，顺路帮我买两个鸡蛋回来吧，拜托啦"
 
@@ -110,28 +239,65 @@ class RefusalPhrases(unittest.TestCase):
                 self.assertFalse(reply_declines(text))
 
 
-class SlackerRepliesMakeNoErrand(_StoreCase):
+class SlackerRepliesMakeNoErrand(_PromiseCase):
+    """Defect 1 on the new path: an extraction answer that says "she agreed" is checked against the lines of the batch.
+
+    The model here always claims agreement (see `_PromiseCase.say`); the shared module must still refuse it when her
+    reply does not say yes. Each case has its positive control in the same scenario: the same request, answered with a
+    real yes, does become an errand for the same resident.
+    """
+
+    YES = "好呀，我下午去超市顺便带回来。"
+    EGGS = "买2个鸡蛋"
+
+    def agrees_later(self, actor: str, expect_item: str = "egg") -> None:
+        """Control: the same owner asks again and she says yes -> one accepted promise and an errand for 2 eggs."""
+        later = T0 + 600
+        self.say(EGG, {actor: self.YES}, group=True, now=later, text=NAMES[actor] + self.EGGS)
+        self.assertEqual([r["status"] for r in self.rows(actor)], ["accepted"])
+        self.assertEqual([(e["item"], e["qty"]) for e in self.errands(actor, later + 60)], [(expect_item, 2)])
+
     def test_gemini_alma_overslept_and_is_not_going_out(self) -> None:
-        self.say("alma", EGG, REAL_REPLIES[8][0], group=True)
+        """Fails if a reply that only says she is not going out ("今天大概率不出门") is recorded as agreeing to fetch
+        eggs although the model claims she agreed, or if the control (the same request answered "好呀") gives nothing."""
+        self.say(EGG, {"alma": REAL_REPLIES[8][0]}, group=True, text="阿尔玛" + self.EGGS)
         self.assertEqual(self.rows("alma"), [])
+        self.assertEqual(self.errands("alma"), [])
+        self.agrees_later("alma")
 
     def test_terra_alma_gives_only_a_conditional_maybe(self) -> None:
-        self.say("alma", EGG, REAL_REPLIES[11][0], group=True)
+        """Fails if "暂时没打算出门；待会儿要是出去，可以顺路帮你买两个" (a maybe, not a yes) in either of its two real
+        wordings is recorded, or if the control (a real yes to the same request) gives nothing."""
+        self.say(EGG, {"alma": REAL_REPLIES[11][0]}, group=True, text="阿尔玛" + self.EGGS)
         self.assertEqual(self.rows("alma"), [])
-        self.say("alma", EGG, REAL_REPLIES[10][0], group=True)
+        self.say(EGG, {"alma": REAL_REPLIES[10][0]}, group=True, text="阿尔玛" + self.EGGS, now=T0 + 60)
         self.assertEqual(self.rows("alma"), [])
+        self.assertEqual(self.errands("alma", T0 + 120), [])
+        self.agrees_later("alma")
 
     def test_somebody_else_who_agrees_keeps_the_errand(self) -> None:
-        self.say("alma", EGG, REAL_REPLIES[8][0], group=True, party=["alma", "nell"])
-        self.say("nell", EGG, "好呀，我下午去超市顺便带回来。", group=True, party=["alma", "nell"])
+        """Fails if alma's refusal is recorded, if nell's yes to the same request is lost, if nell's promise shows up
+        for alma (or the other way round), or if the errand is not 2 eggs for nell alone."""
+        self.say(EGG, {"alma": REAL_REPLIES[8][0]}, group=True, text="阿尔玛" + self.EGGS)
+        self.say(EGG, {"nell": self.YES}, group=True, text="奈尔" + self.EGGS, now=T0 + 30)
         self.assertEqual(self.rows("alma"), [])
-        self.assertEqual([(r["item"], r["qty"]) for r in self.rows("nell")], [("egg", 2)])
+        self.assertEqual([(r["status"], r["party"]) for r in self.rows("nell")], [("accepted", '["nell"]')])
+        self.assertEqual([(e["item"], e["qty"]) for e in self.errands("nell", T0 + 90)], [("egg", 2)])
+        self.assertEqual(self.errands("alma", T0 + 90), [])
 
     def test_real_agreements_still_become_promises(self) -> None:
-        self.say("nell", "奈尔，帮我买一盒牛奶回来好吗？", REAL_REPLIES[0][0])
-        self.assertEqual([(r["item"], r["state"]) for r in self.rows("nell")], [("milk", "open")])
-        self.say("wanda", "婉妲，下午要不要一起喝下午茶呀？", REAL_REPLIES[16][0], group=True)
-        self.assertEqual([r["kind"] for r in self.rows("wanda")], ["together"])
+        """Fails if real agreements to buy milk (three of the evidence runs' wordings) are not recorded as accepted
+        errands for 1 box of milk, or if the shared gate lets a refusal of the same request ("我现在在家发呆，没法出门")
+        become one in the same scenario."""
+        for k in (0, 2, 3):
+            with self.subTest(reply=REAL_REPLIES[k][0][:20]):
+                self.setUp()
+                self.say("奈尔，帮我买一盒牛奶回来好吗？", {"nell": REAL_REPLIES[k][0]}, text="奈尔买1盒牛奶")
+                self.assertEqual([(r["status"], r["visibility"]) for r in self.rows("nell")], [("accepted", "private")])
+                self.assertEqual([(e["item"], e["qty"]) for e in self.errands("nell")], [("milk", 1)])
+        self.setUp()
+        self.say("奈尔，帮我买一盒牛奶回来好吗？", {"nell": REAL_REPLIES[9][0]}, text="奈尔买1盒牛奶")
+        self.assertEqual(self.rows("nell"), [])
 
 
 class UnbuyableItemGetsOneSentenceNotTwo(_DaemonCase):
@@ -139,7 +305,7 @@ class UnbuyableItemGetsOneSentenceNotTwo(_DaemonCase):
         self.boot(REAL_REPLIES[4][0])
         text = self.talk("艾莎，能帮我买个榴莲回来吗？")
         self.assertEqual(text, REAL_REPLIES[4][0])
-        self.assertNotIn("只先记个提醒", text)
+        self.assertNotIn("我这边买不了", text)
 
     def test_a_vague_reply_still_gets_the_honest_tail(self) -> None:
         self.boot("好的，我再想想")

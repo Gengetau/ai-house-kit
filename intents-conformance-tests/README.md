@@ -1,7 +1,8 @@
 # intents-conformance-tests
 
 私有部署自己的「约定」（意图与承诺）测试，对着 kit 里的公共模块（`src/ai_house/common/intents.py`）跑。
-它们通过，说明这份公共代码的行为与私有部署一致；它们不测 kit 自己的 `CommitmentStore`。
+它们通过，说明这份公共代码的行为与私有部署一致。kit 把这份代码接进小屋的那一层（`src/ai_house/intents_common.py`）
+由 `world-kernel/test_m2_intents_adapter.py` 等测。`test_presence_switch.py` 是 kit 自己加的：测 kit 在公共文件里加的那个开关。
 
 ```bash
 cd intents-conformance-tests

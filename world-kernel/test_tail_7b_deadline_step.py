@@ -100,12 +100,15 @@ class StepAfterReplyTests(Base):
         res = d.converse("private:" + d.vocab.ROSTER[0], "你好呀", owner_speaker("房主"))
         self.assertTrue(res["ok"])
         self._assert_step_ran_on_fresh_budget(d, srv)
-        # and the next steps keep asking (nothing is stuck degraded)
+        # and the next steps keep asking (nothing is stuck degraded). A chat turn no longer queues an extra
+        # decision by itself, so the next one is due at the normal free-time cadence (about 2 h): step up to 3 h.
         before = _life_hits(srv)
-        for _ in range(3):
+        for _ in range(18):
             d.clock.advance(600)
             d.authority.step()
-        self.assertGreater(_life_hits(srv), before)
+            if _life_hits(srv) > before:
+                break
+        self.assertGreater(_life_hits(srv), before, "no decision was asked within 3 virtual hours")
 
     def test_group_turn_with_slow_replies_does_not_starve_the_step(self) -> None:
         srv = self.server(_life_or_chat)

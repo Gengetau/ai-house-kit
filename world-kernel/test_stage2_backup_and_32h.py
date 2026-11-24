@@ -60,6 +60,18 @@ class _StatefulStage2MockServer:
                             "text": "房主可能对花生或芒果过敏",
                             "src": [1, 2],
                         })
+                    if "帮我买2个洋葱" in usr_txt:
+                        # the owner's errand and her yes, found by the extraction (the shared promise module checks the quote)
+                        ops.append({
+                            "op": "intent",
+                            "text": "苍空买2个洋葱",
+                            "kind": "promise",
+                            "for": ["房主"],
+                            "agreed": ["苍空"],
+                            "scope": "world",
+                            "when": "vague",
+                            "quote": "苍空今天出门顺便帮我买2个洋葱回来",
+                        })
                     if "大扫除" in usr_txt:
                         ops.append({
                             "op": "add",
@@ -89,6 +101,8 @@ class _StatefulStage2MockServer:
                         content = "我记得房主私下说自己对虾仁和腰果过敏，点菜时记得避开哦！"
                     elif parent.guess_reply:
                         content = "我也不太确定，好像可能是对花生或芒果有点忌口吧？"
+                    elif "帮我买2个洋葱" in usr_txt:
+                        content = "好呀，我出门时去买2个洋葱！"
                     else:
                         content = "好呀，我已经认真记下来并留意着啦。"
 
@@ -247,23 +261,11 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         )
         self.addCleanup(d.close)
 
-        # Day 1 09:00: private allergy secret + Issue #2 (errand + allergy memo)
+        # Day 1 09:00: private allergy secret + Issue #2 (errand found by extraction; the allergy is a memory)
         d.converse("private:sora", "我对虾仁和腰果过敏，先别在群里说", owner_speaker("房主"))
-        d.intents.enqueue_chat(
-            "sora",
-            "苍空今天顺便买2个洋葱好不好？",
-            "好呀，我出门时去买2个洋葱！",
-            where="group",
-            now=d.clock.now(),
-        )
-        d.intents.enqueue_chat(
-            "sora",
-            "记住我对虾仁过敏，晚饭别放虾",
-            "记牢了！做菜绝对避开虾仁。",
-            where="private",
-            intents=[{"text": "房主对虾仁过敏", "kind": "cook", "答应了的": ["sora"]}],
-            now=d.clock.now(),
-        )
+        d.converse("group", "苍空今天出门顺便帮我买2个洋葱回来", owner_speaker("房主"), actor="sora")
+        # the chat turn alone records no promise
+        self.assertEqual(d.intents.list_intents(actor="sora"), [])
 
         # Issue #4: Group member asks open question + bot guesses peanut/mango -> MUST NOT write fact
         mock_srv.guess_reply = True
@@ -278,6 +280,12 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         self.assertEqual(len(cleanup_claims), 1)
         self.assertEqual(cleanup_claims[0]["kind"], "claim")
         self.assertEqual(cleanup_claims[0]["trust"], "group_stated")
+
+        # the extraction found the errand (positive control for everything below) and the allergy as a memory
+        onion_rows = [r for r in d.intents.list_intents(actor="sora") if r["item"] == "onion"]
+        self.assertEqual([(r["state"], r["qty"]) for r in onion_rows], [("open", 2)])
+        allergy_mems = [m for m in d.memory.list_entries("sora", "private", now=d.clock.now()) if "虾仁" in m["text"]]
+        self.assertTrue(allergy_mems)
 
         # Daytime verbal mention "买好了" does NOT close onion errand
         d.converse("private:sora", "洋葱我已经买好啦", owner_speaker("房主"))
@@ -301,9 +309,9 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
         self.assertEqual(onion_after_32h["state"], "completed")
         self.assertTrue(str(onion_after_32h.get("evidence_key") or "").startswith("ai-house/"))
 
-        allergy_memo = [r for r in d.intents.list_intents(actor="sora") if "虾仁过敏" in r["summary"]][0]
-        self.assertEqual(allergy_memo["kind"], "memo")
-        self.assertEqual(allergy_memo["state"], "open")
+        # the allergy stays a memory (not a promise row) and is still there after 32 h
+        self.assertTrue([m for m in d.memory.list_entries("sora", "private", now=d.clock.now()) if "虾仁" in m["text"]])
+        self.assertFalse([r for r in d.intents.list_intents(actor="sora") if "虾仁" in r["summary"]])
 
         # Verify evening diaries generated with zero private allergy leaks
         diaries = d.diary.list_diaries()
@@ -343,11 +351,12 @@ class Stage2BackupAnd32hTests(unittest.TestCase):
                 )
         fails = verify_stage2_32h_invariants(d)
         self.assertTrue(any("问题#4失败" in f for f in fails))
-        with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
-            with wc:
-                wc.execute("UPDATE house_intents SET state='completed' WHERE kind='memo'")
+        # forgetting the allergy memory makes the checker report #2 (the diet note is gone)
+        for m in d.list_memories(actor="sora", scope="private", limit=50):
+            if "虾仁" in str(m.get("text") or "") or "过敏" in str(m.get("text") or ""):
+                d.forget_memory(actor="sora", scope="private", mem_id=m["id"])
         fails2 = verify_stage2_32h_invariants(d)
-        self.assertTrue(any("问题#2失败" in f for f in fails2))
+        self.assertTrue(any("问题#2失败：未记录房主饮食过敏" in f for f in fails2))
 
 
 if __name__ == "__main__":

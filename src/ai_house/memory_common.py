@@ -348,6 +348,7 @@ class CommonMemoryStore:
         self._residents: set = set(self._names)
         self._numbers_by_key: Dict[str, int] = {}
         self._mod: Any = None
+        self._attach: Optional[Callable[[Any], None]] = None  # see attach_intents
         self._msg_seq = 0
         self._closed = False
         self._ensure_adapter_tables()
@@ -589,8 +590,18 @@ class CommonMemoryStore:
                 new._extract_fails.update(old._extract_fails)
                 new._urgent_times.update(old._urgent_times)
                 loader.unload(old)
+            if self._attach is not None:
+                self._attach(new)
             self._mod = new
             self._closed = False
+
+    def attach_intents(self, bind: Callable[[Any], None]) -> None:
+        """The promise adapter (`intents_common.CommonIntents`) asks to be told about the loaded copy: `bind(module)`
+        is called at once and again after every reload of the copy (a new housemate, new names), so the extraction
+        hook of the current copy always reaches the promise code."""
+        with self._cfg_lock:
+            self._attach = bind
+            bind(self._mod)
 
     def _use(self, actor: str) -> Any:
         """The loaded copy, after making sure `actor` is one of its housemates (a new one costs a reload)."""

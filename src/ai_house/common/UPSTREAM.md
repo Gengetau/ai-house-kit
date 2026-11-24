@@ -3,7 +3,7 @@
 `memory.py`、`qq_identity.py`、`intents.py`（约定：意图与承诺）是私有部署里的同名文件，搬过来时只做了两类处理：
 
 1. **去私有化**（机械替换，不改逻辑）：真实号码换成同长度的假号，住客与房主的名字、昵称换成占位名，内部路径换成中性写法。
-2. **下面这张表里的改动**。除此之外逐行相同。`tools/drift_report.py` 可以随时量两边差了多少行（2026-11-24：`memory.py` 1957 行里 1805 行相同；公共文件现在 2502 行，多出来的主要是并入的可信度一段、没有向量时的关键词一段和含糊问句的兜底）。
+2. **下面这张表里的改动**。除此之外逐行相同。`tools/drift_report.py` 可以随时量两边差了多少行（2026-11-25，私有端的行数 / 其中逐行相同的：`memory.py` 1957 / 1802，公共文件 2524 行，多出来的主要是并入的可信度一段、没有向量时的关键词一段和含糊问句的兜底；`intents.py` 1161 / 1155；`qq_identity.py` 241 / 238）。
 
 `world_shim.py` 也是 kit 自己写的，见下面的专门一节。`roster.py`、`loader.py`、`__init__.py` 是 kit 自己写的：私有部署的花名册是一张手写的表，kit 的住客来自人物包，所以这里是空表加一个造表的函数。
 
@@ -44,7 +44,7 @@
 | `qq_identity.py` | `import roster` 同上处理 | 同上 |
 | `qq_identity.py` | 房主的别名不再写在这个文件里，改为读花名册 `OWNER["aliases"]`（没有就只认「房主」「owner」） | 别名是数据，不是逻辑 |
 | `intents.py` | 开头两行 `import world as W` / `import qq_identity as ID` 改成：在包里 `from . import world_shim as W, qq_identity as ID`，否则照旧 | 同一个文件两边都能用；私有端的 `world` 是它自己那个大模块，kit 里同名的那几样在 `world_shim.py` |
-| `intents.py` | **行为**：新增开关 `INTENTS_PRESENCE`（模块导入时读，和 `INTENTS_SHOW` 一样，默认 `1`）。关着时 `queue_world` 不再调用 `presence_from_chat`，`presence_from_chat` 自己也直接返回 `None`：不从聊天里推房主在哪个房间，也不往房主化身的队列里写东西；`owner_chat_queue` 照常写 | 维护者 2026-11-24 定（「从聊天里判断房主在哪」做成开关）。**默认开，私有端换用后行为不变**；kit 的守护进程以后自己决定开不开 |
+| `intents.py` | **行为**：新增开关 `INTENTS_PRESENCE`（模块导入时读，和 `INTENTS_SHOW` 一样，默认 `1`；模块里的变量叫 `PRESENCE_ON`，因为 `PRESENCE` 这个名字原文件已经用作建表语句）。关着时 `queue_world` 不再调用 `presence_from_chat`，`presence_from_chat` 自己也直接返回 `None`：不从聊天里推房主在哪个房间，也不往房主化身的队列里写东西；`owner_chat_queue` 照常写 | 维护者 2026-11-24 定（「从聊天里判断房主在哪」做成开关）。**默认开，私有端换用后行为不变**；kit 的守护进程以后自己决定开不开 |
 | `intents.py` | 除上面两条外逐行相同。注意 `_rules()`（找 `promise_rules` 和词表）按私有部署的目录去找旁边的 `world-kernel`，在 kit 的包里找不到这个目录：用的时候要么 `worldkernel` 已在 `sys.path` 上，要么适配层把 `_rules` 换成自己的（带上按包绑定的 `promise_rules.bound(vocab)`）。这里没改 | 不改共享文件；换法留给适配层 |
 
 ## `world_shim.py`：私有部署的 `world` 里，约定用到的那几样

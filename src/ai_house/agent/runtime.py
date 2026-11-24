@@ -97,7 +97,6 @@ class TurnResult:
     rotated: str = ""  # "", "too_long" or "unsent"
     partial: bool = False
     tool_calls: int = 0
-    recorded_intents: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class AgentRuntime:
@@ -455,7 +454,6 @@ class AgentRuntime:
         specs = [dict(s) for s in req.tool_specs if s.get("name") not in (SPEAK_TOOL_SPEC["name"], QUIET_TOOL_SPEC["name"])]
         turn = Turn(allow_quiet=req.allow_quiet, tool_names=[str(s.get("name") or "") for s in specs])
         sess = self._session(req)
-        recorded: List[Dict[str, Any]] = []
         t0 = self._mono()
         cf = asyncio.run_coroutine_threadsafe(self._turn(engine, sess, req, turn, specs), loop)
         budget = self.turn_budget_s
@@ -481,18 +479,16 @@ class AgentRuntime:
                             messages=list(turn.sent), quiet=turn.quiet, quiet_reason=turn.quiet_reason,
                             engine=engine.name, model=engine.default_model_label(), partial=True,
                             latency_ms=int((self._mono() - t0) * 1000), tool_calls=turn.tool_calls,
-                            recorded_intents=recorded,
                         )
                     raise LLMDeadlineError(f"住客大脑这一轮超过了 {budget:g} 秒")
                 continue
-            self._serve(call, req.tool_runner, recorded)
+            self._serve(call, req.tool_runner)
         res = cf.result()
-        res.recorded_intents = recorded
         res.latency_ms = int((self._mono() - t0) * 1000)
         return res
 
     @staticmethod
-    def _serve(call: Any, runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]], recorded: List[Dict[str, Any]]) -> None:
+    def _serve(call: Any, runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]]) -> None:
         name, args, loop, fut = call
         try:
             out: Any = runner(name, args) if runner is not None else {"error": "no_tool_runner"}
@@ -500,8 +496,6 @@ class AgentRuntime:
             out = {"error": mask_secrets(f"{type(exc).__name__}: {exc}")}
         if not isinstance(out, dict):
             out = {"result": out}
-        if name == "record_promise" and out.get("recorded") and out.get("intent"):
-            recorded.append(out["intent"])
 
         def _resolve() -> None:
             if not fut.done():

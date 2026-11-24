@@ -54,20 +54,6 @@ _BUILTIN_TOOL_SPECS: List[Dict[str, Any]] = [
             "required": ["query"],
         },
     },
-    {
-        "name": "record_promise",
-        "description": "记录答应房主去做的事或需要采购的食材（仅房主本人发言时有效）。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string", "description": "约定内容"},
-                "kind": {"type": "string", "enum": ["errand", "cook", "outing", "rest", "chat_promise"]},
-                "item": {"type": "string", "description": "需要采购的食材ID（可选）"},
-                "qty": {"type": "integer", "minimum": 1, "maximum": 3},
-            },
-            "required": ["summary"],
-        },
-    },
 ]
 
 
@@ -194,7 +180,7 @@ class RoommateChatAgent:
         tool_specs: Sequence[Dict[str, Any]],
         tool_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]],
     ) -> Dict[str, Any]:
-        """One chat turn run by an agent shell. Returns {"text", "quiet", "tool_intents", "engine", "model"}."""
+        """One chat turn run by an agent shell. Returns {"text", "quiet", "engine", "model"}."""
         assert self.agent_runtime is not None
         allow_quiet = where == "group"
         req = TurnRequest(
@@ -241,27 +227,12 @@ class RoommateChatAgent:
             "text": "\n".join(m.strip() for m in res.messages if m.strip()),
             "quiet": bool(res.quiet),
             "quiet_reason": res.quiet_reason,
-            "tool_intents": list(res.recorded_intents),
             "engine": engine,
             "model": res.model,
         }
 
     def _builtin_tool_specs(self) -> List[Dict[str, Any]]:
-        specs = json.loads(json.dumps(_BUILTIN_TOOL_SPECS, ensure_ascii=False))
-        ingredients = getattr(self.V, "INGREDIENTS", None) or {}
-        if ingredients:
-            pairs = [
-                f"{k}={str((v or {}).get('label') or k).split('（', 1)[0]}"
-                for k, v in ingredients.items()
-            ]
-            item_desc = "需要采购的食材英文ID（kind=errand 时必填；可用ID：" + ", ".join(pairs) + "）"
-        else:
-            item_desc = "需要采购的食材英文ID（kind=errand 时必填）"
-        for s in specs:
-            if s.get("name") == "record_promise":
-                s["description"] = "记录答应房主去做的具体行动或食材采购（仅房主本人发言时有效；纯喜好、过敏等事实备忘无需调用此工具）。"
-                s["parameters"]["properties"]["item"]["description"] = item_desc
-        return specs
+        return json.loads(json.dumps(_BUILTIN_TOOL_SPECS, ensure_ascii=False))
 
     def _endpoints(self, *, purpose: str = "chat", actor: str = "") -> List[Tuple[str, str, str]]:
         return [
@@ -286,7 +257,6 @@ class RoommateChatAgent:
         user: str,
         tool_specs: Sequence[Dict[str, Any]],
         tool_runner: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-        recorded_intents: List[Dict[str, Any]],
         *,
         actor_id: str = "",
     ) -> Tuple[str, int]:
@@ -326,8 +296,6 @@ class RoommateChatAgent:
                     except ValueError:
                         targs = {}
                     result = tool_runner(tname, targs)
-                    if tname == "record_promise" and isinstance(result, dict) and result.get("recorded") and result.get("intent"):
-                        recorded_intents.append(result["intent"])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id") or tname),
@@ -454,7 +422,6 @@ class RoommateChatAgent:
             )
             user += "\n\n" + att_section
 
-        recorded_intents: List[Dict[str, Any]] = []
         badge = f"{ctx['place_label']} · {ctx['doing']} · {ctx['wearing']}"
         agent_note = ""
         wanted_brain = self.brain_for(actor_id)
@@ -493,7 +460,6 @@ class RoommateChatAgent:
                         "mode": "quiet",
                         "engine": out["engine"],
                         "quiet_reason": out["quiet_reason"],
-                        "tool_intents": [],
                     }
                 cleaned = re.sub(r"^[\"'「『]+|[\"'」』]+$", "", out["text"]).strip()
                 if cleaned:
@@ -504,7 +470,6 @@ class RoommateChatAgent:
                         "context_badge": badge,
                         "mode": "live_api",
                         "engine": out["engine"],
-                        "tool_intents": out["tool_intents"],
                     }
                 agent_note = "住客大脑这一轮没有给出回复"
             except Exception as exc:  # noqa: BLE001
@@ -535,7 +500,7 @@ class RoommateChatAgent:
                     if tool_runner is not None and self.tools_enabled:
                         all_specs = [*self._builtin_tool_specs(), *extra_tools]
                         raw_text, _ = self._run_tool_loop(
-                            system, user, all_specs, tool_runner, recorded_intents, actor_id=actor_id
+                            system, user, all_specs, tool_runner, actor_id=actor_id
                         )
                     else:
                         raw_text, _ = self.router.complete_text(system, user, purpose="chat", actor=actor_id)
@@ -556,7 +521,6 @@ class RoommateChatAgent:
                         "text": cleaned,
                         "context_badge": f"{ctx['place_label']} · {ctx['doing']} · {ctx['wearing']}",
                         "mode": "live_api",
-                        "tool_intents": recorded_intents,
                         **({"brain_fallback": agent_note} if agent_note else {}),
                     }
                 # an empty live reply is a failure the user must see, never a silent switch to the demo persona
@@ -586,7 +550,6 @@ class RoommateChatAgent:
             "text": demo_text,
             "context_badge": f"{ctx['place_label']} · {ctx['doing']} · {ctx['wearing']}",
             "mode": "demo",
-            "tool_intents": recorded_intents,
         }
 
     def pick_group_responders(

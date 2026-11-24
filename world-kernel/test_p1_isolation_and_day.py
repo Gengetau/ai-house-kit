@@ -26,7 +26,7 @@ from test_p1_onebot import (  # noqa: E402
 from ai_house.chat_identity import member_speaker, owner_speaker  # noqa: E402
 
 PRIVATE_MARKER = "紫罗兰色的秘密暗号QX7"
-PROMISE_MARKER = "火锅暗号ZK9"  # contains a promise keyword, so the intent detector turns it into an open intent
+PROMISE_MARKER = "火锅暗号ZK9"  # words of a promise a fake extraction model records from the owner's private chat
 
 
 def all_prompts(model):
@@ -56,7 +56,6 @@ class GroupGenerationDoesNotSeePrivateContext(unittest.TestCase):
             self.assertNotIn(PRIVATE_MARKER, p)
             self.assertNotIn(PROMISE_MARKER, p)
             self.assertNotIn("只跟你说", p)
-            self.assertNotIn("和房主聊到", p)  # the intent summary text the detector writes
         # and what goes out to the group does not carry it either
         for a in h.fake.sent("send_group_msg"):
             self.assertNotIn(PRIVATE_MARKER, message_text(a))
@@ -81,16 +80,32 @@ class GroupGenerationDoesNotSeePrivateContext(unittest.TestCase):
             self.assertNotIn("橙子暗号YY2", p)
 
     def test_private_chat_state_only_reaches_group_through_world_state_not_text(self):
-        """What can legitimately differ between group turns is world state (where she is, mood), never chat text."""
-        h = Harness(self)
+        """What can legitimately differ between group turns is world state (where she is, mood), never chat text.
+        Fails if the state card, the redacted promise listing, or a later group prompt carries the private words.
+        Control in the same scenario: the promise row does exist in the database with the owner's words, and the
+        listing shows it (so a redaction that hid everything would not pass)."""
+        h = Harness(self, model=Model(lambda system, said: "好呀"))  # a plain yes, so the shared module counts her as agreed
         self._owner_private(h, f"{PROMISE_MARKER}，今晚做")
+        ops = [{"op": "intent", "text": f"奈尔今晚做{PROMISE_MARKER}", "kind": "promise", "for": ["房主"],
+                "agreed": ["奈尔"], "scope": "world", "when": "vague", "quote": f"{PROMISE_MARKER}，今晚做"}]
+        h.daemon.memory.extract(force=True, now=h.daemon.clock.now() + 5, llm_fn=lambda system, user: {"ops": ops})
         st = h.daemon.get_state()
         blob = json.dumps(st["residents"]["nell"], ensure_ascii=False)
         self.assertNotIn(PROMISE_MARKER, blob)  # the state card the group prompt is built from carries no chat text
         with contextlib.closing(sqlite3.connect(h.daemon.world_db)) as c:
-            n = c.execute("SELECT COUNT(*) FROM house_intents WHERE summary LIKE ?", (f"%{PROMISE_MARKER}%",)).fetchone()[0]
-        # documented limitation: the open intent itself does hold the owner's words in the database (life loop input)
-        self.assertGreaterEqual(n, 1)
+            rows = c.execute("SELECT visibility, text FROM intents WHERE text LIKE ?", (f"%{PROMISE_MARKER}%",)).fetchall()
+        # documented limitation: the promise itself holds the owner's words in the database (life loop input)
+        self.assertEqual([r[0] for r in rows], ["private"])
+        listed = h.daemon.intents.list_intents()
+        self.assertEqual(len(listed), 1)  # control: the promise is listed ...
+        self.assertNotIn(PROMISE_MARKER, json.dumps(listed, ensure_ascii=False))  # ... without the private words
+        n = len(h.model.calls)
+        h.fake.push(group_msg(GROUP, MEMBER, [at(90001), txt(" 你们今天在干嘛呀")]))
+        self.assertTrue(wait_until(lambda: h.fake.sent("send_group_msg")))
+        group_prompts = all_prompts(h.model)[n:]
+        self.assertTrue(group_prompts, "the group turn never reached the model")
+        for p in group_prompts:
+            self.assertNotIn(PROMISE_MARKER, p)
 
 
 class OneSimulatedDay(unittest.TestCase):

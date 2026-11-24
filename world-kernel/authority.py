@@ -71,8 +71,11 @@ class Authority:
                 try:
                     import intents as intents_mod
                 except ImportError:
-                    from worldkernel.intents_lite import IntentsLite
-                    intents_mod = IntentsLite(world_db, vocab=getattr(self.life, "V", vocab))
+                    # the promise code of the kit (shared module, adapted); this object is the authority, so the
+                    # chat feed to the kernel is on
+                    from ai_house.intents_common import CommonIntents
+                    intents_env = {**eff_env, "WORLD_KERNEL": "authority"}
+                    intents_mod = CommonIntents(world_db, vocab=getattr(self.life, "V", vocab), env=intents_env)
             intents_mod.init()
             self.promises = promises.Promises(self.life, world_db, self.proj, intents_mod, env=eff_env)
             self.life.promise_source = self.promises

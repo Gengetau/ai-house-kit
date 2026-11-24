@@ -29,7 +29,7 @@ log = logging.getLogger("intents")
 ON = os.environ.get("INTENTS", "0") == "1"
 SHOW = os.environ.get("INTENTS_SHOW", "0") == "1"
 EVIDENCE_GATE = os.environ.get("INTENTS_EVIDENCE_GATE", "1") == "1"
-PRESENCE = os.environ.get("INTENTS_PRESENCE", "1") == "1"  # infer the owner's room from chat; off: nothing inferred or queued
+PRESENCE_ON = os.environ.get("INTENTS_PRESENCE", "1") == "1"  # infer the owner's room from chat; off: nothing inferred or queued
 OPEN = ("proposed", "accepted")
 ENDED = ("completed", "declined", "expired", "cancelled", "missed")
 MAX_OPEN = 20  # per housemate, open intents she is in
@@ -432,7 +432,7 @@ def queue_world(consumer, chat, private, lines, now, times=None, ids=None):
         return False
     spoken = _speakers(lines)
     clip = lambda t: re.sub(r"\s+", " ", str(t or "")).strip()[:160]
-    if PRESENCE:
+    if PRESENCE_ON:
         try:  # owner card 11-06 「算，明确说在哪就进哪」: his own explicit words put him in a room / take him out
             presence_from_chat(spoken, chat, now, times, reader=actor, ids=ids)
         except Exception as e:  # noqa: BLE001
@@ -514,7 +514,7 @@ def presence_from_chat(spoken, chat, now, times=None, reader=None, ids=None):
     when nothing newer is known about where he is: a statement she read after it in this batch, a later statement of
     his she has not read in this chat (in another chat, any later one), or his page's enter/move (not failed) after
     it."""
-    if not PRESENCE:
+    if not PRESENCE_ON:
         return None
     said = [(i, t, presence_of(t)) for i, (w, t) in enumerate(spoken) if w == "owner"]
     said = [(i, _said_at(times, i, now), t, p) for i, t, p in said if p]
