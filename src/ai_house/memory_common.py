@@ -10,8 +10,9 @@ tables it keeps three small tables of its own: `kit_numbers` (the stable placeho
 `kit_channels` (kit channel ids that have no number of their own) and `kit_origin` (which rows were written in the
 kit's `world` scope).
 
-Accepted for compatibility but without effect: `recency_half_life_days`, `min_keyword_overlap`; `add(trust=,
-expires_at=, ttl_s=)`; `recall(about=, max_chars=)`.
+Accepted for compatibility but without effect: `recency_half_life_days`, `min_keyword_overlap`; `recall(about=,
+max_chars=)`. `add(trust=)` is kept only with `AI_HOUSE_MEMORY_TRUST=1` (the shared module's trust levels, off by
+default); `add(expires_at=, ttl_s=)` gives the memory a time after which it is gone.
 """
 from __future__ import annotations
 
@@ -248,6 +249,8 @@ class CommonMemoryStore:
         put("EVIDENCE_MIN_AGE_S", "MEMORY_EVIDENCE_MIN_AGE_S", lambda v: max(0, int(v)))
         put("EVIDENCE_VER_CHARS", "MEMORY_EVIDENCE_VERSION_CHARS", lambda v: max(0, int(v)))
         put("DIARY_PRIVATE", "MEMORY_DIARY_PRIVATE", lambda v: str(v).strip() == "1")
+        put("TRUST", "MEMORY_TRUST", lambda v: str(v).strip() == "1")
+        put("NO_MEMORY_NOTE_ON", "MEMORY_NO_MEMORY_NOTE", lambda v: str(v).strip() == "1")
         put("PUBLIC_EXPOSURE_GATE", "MEMORY_PUBLIC_EXPOSURE_GATE", lambda v: str(v).strip() == "1")
         return out
 
@@ -615,7 +618,14 @@ class CommonMemoryStore:
         scope = self._valid_scope(scope)
         resolved = self._resolve_channel(actor, scope, channel)
         mod = self._use(actor)
-        with mod.time.at(self._now(now)):
+        ts = self._now(now)
+        if expires_at is None and ttl_s is not None:
+            if float(ttl_s) <= 0:
+                raise ValueError("ttl_s 必须大于 0")
+            expires_at = ts + float(ttl_s)
+        if trust is None and kind == "claim":  # the old store's kind for what somebody merely said
+            trust = "group_stated"
+        with mod.time.at(ts):
             if kind == "diary":
                 # the housemate's own. Written from the house group, so the shared module keeps it as her own
                 # (not private) while its diary switch is off, and she finds it in every chat; with the switch on
@@ -624,7 +634,8 @@ class CommonMemoryStore:
             chat = self._chat_for(mod, scope, resolved)
             shared_row = scope == "world" or (scope == "group" and bool(shared))
             mid, how = mod.add(actor, chat, text, about=about if about is not None else "", kind=kind,
-                               scope="public" if shared_row else "own", source=source, merge=merge)
+                               scope="public" if shared_row else "own", source=source, merge=merge,
+                               trust=trust, expires_at=expires_at)
         if scope == "world" and how == "added":
             with self._adapter_conn() as c:
                 c.execute("insert or replace into kit_origin(mem_id, scope) values (?, 'world')", (int(mid),))
@@ -649,9 +660,11 @@ class CommonMemoryStore:
         scope, channel = self._kit_view(row, world)
         return {
             "id": int(row["id"]), "owner": "shared" if row["owner"] == "public" else row["owner"], "scope": scope,
-            "channel": channel, "about": row["about"], "kind": row["kind"], "trust": "", "text": row["text"],
+            "channel": channel, "about": row["about"], "kind": row["kind"],
+            "trust": row["trust"] if "trust" in row.keys() else "", "text": row["text"],
             "source": row["source"], "status": row["status"], "created": row["created"], "updated": row["updated"],
-            "last_used": row["last_used"], "uses": row["uses"], "expires_at": None,
+            "last_used": row["last_used"], "uses": row["uses"],
+            "expires_at": row["expires_at"] if "expires_at" in row.keys() else None,
         }
 
     def list_entries(
@@ -666,6 +679,8 @@ class CommonMemoryStore:
     ) -> List[Dict[str, Any]]:
         sc = self._valid_scope(scope)
         cap = max(1, min(int(limit), 200))
+        with self._mod.time.at(self._now(now)):
+            self._mod._sweep()  # what is past its time is not listed either
         clauses = ["status='active'"]
         params: List[Any] = []
         origin = "id in (select mem_id from kit_origin where scope='world')"

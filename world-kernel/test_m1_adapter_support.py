@@ -22,6 +22,9 @@ NAMES = {"nia": "妮娅", "xingli": "星璃"}
 
 SECRET_PLAN = "房主打算下个月辞职去开咖啡店，叮嘱妮娅保密。"
 ASK_PLAN = "妮娅，你知道房主打算下个月辞职去开咖啡店的事吗？"
+# what a recall says when a question about what she remembers finds nothing (the question above is one)
+NOTHING_FOUND = ("（你的记忆里没有找到和这个问题相关的内容。照实说你不记得、不知道，不要编、不要猜，"
+                 "也不要替别人回答；除非这件事就出现在你们这次对话的前文里。）")
 REPEAT_PLAN = "你说过房主打算下个月辞职去开咖啡店，我都记着呢。"
 OWNER_SAYS = "我打算下个月辞职去开咖啡店，千万别告诉别人哦。"
 

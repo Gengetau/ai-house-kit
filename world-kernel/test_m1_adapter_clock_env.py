@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from test_m1_adapter_support import (
-    ASK_PLAN, NAMES, OWNER_SAYS, SECRET_PLAN, T0, FakeModel, StoreCase, add_op, quiet_resource_warnings,
+    ASK_PLAN, NAMES, NOTHING_FOUND, OWNER_SAYS, SECRET_PLAN, T0, FakeModel, StoreCase, add_op, quiet_resource_warnings,
 )
 
 from ai_house.memory_common import CommonMemoryStore  # noqa: E402
@@ -138,7 +138,7 @@ class HostEnvironmentTests(StoreCase):
             self.assertTrue(dirty.db_path.exists())
             self.assertFalse(dirty.vector_enabled)  # MEMORY_EMBED_URL is not read
             dirty.add("nia", "private", SECRET_PLAN, now=T0)
-            self.assertEqual(dirty.recall("nia", "group", ASK_PLAN, channel="qq-group:111", now=T0), "")
+            self.assertEqual(dirty.recall("nia", "group", ASK_PLAN, channel="qq-group:111", now=T0), NOTHING_FOUND)
             # the group is checked (it is not listed here; the host's MEMORY_LEAK_FREE_CHATS did not exempt anything)
             self.assertEqual(len(dirty.check_outbound_leak("nia", "group", SECRET_PLAN, channel="qq-group:111", now=T0)), 1)
             self.assertFalse(dirty.leak_free_in("qq-group:111"))

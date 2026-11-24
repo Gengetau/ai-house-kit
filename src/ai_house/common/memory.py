@@ -81,6 +81,16 @@ PRIVATE_IN_GROUPS = os.environ.get("MEMORY_PRIVATE_IN_GROUPS", "0") == "1"
 # Default on; disabling restores the old ACL without rewriting existing scopes.
 DIARY_PRIVATE = os.environ.get("MEMORY_DIARY_PRIVATE", "1") == "1"
 PUBLIC_EXPOSURE_GATE = os.environ.get("MEMORY_PUBLIC_EXPOSURE_GATE", "1") == "1"
+# 2026-11-24 owner: when recall finds nothing and the question asks whether she remembers, it says so (a silent block
+# let the model guess "你对坚果过敏，我记得的"). Default on.
+NO_MEMORY_NOTE_ON = os.environ.get("MEMORY_NO_MEMORY_NOTE", "1") == "1"
+# 2026-11-24 owner: trust levels, off by default (off: no column, nothing read or written, recall as before). On: a
+# memory is verified (what the owner said), group_stated (what others said in a group) or hearsay; search weighs by it,
+# an unverified one that contradicts a verified one is pushed down and marked, a weaker text never merges over a stronger.
+TRUST = os.environ.get("MEMORY_TRUST", "0") == "1"
+TRUST_LEVELS = ("verified", "group_stated", "hearsay")
+TRUST_WEIGHTS = {"verified": 1.0, "group_stated": 0.78, "hearsay": 0.60}
+TRUST_RANK = {"verified": 3, "group_stated": 2, "hearsay": 1}
 # 2026-10-25 owner (#68): "硬检查也行，加个白名单，ai小屋那个群就不设限制了". A group message is checked against
 # her owner-DM memories before it goes (leak()); these chats are not checked.
 # 2026-11-24 owner: every other group is checked whatever MEMORY_UNIFIED / MEMORY_PRIVATE_IN_GROUPS say (a private
@@ -199,11 +209,45 @@ def init():
         for name, default in (("source_chat", ""), ("turn_id", ""), ("sensitivity", "unknown")):
             if name not in columns:
                 c.execute(f"alter table mem add column {name} text not null default '{default}'")
+        if TRUST and "trust" not in columns:  # 2026-11-24: only with the switch on
+            c.execute("alter table mem add column trust text not null default 'verified'")
+        if "expires_at" not in columns:  # 2026-11-24 owner: a memory may have a time after which it is gone (None = never)
+            c.execute("alter table mem add column expires_at real")
+        c.execute("create index if not exists mem_expiry on mem(expires_at) where status='active' and expires_at is not null")
         if EVIDENCE:
             try:
                 _evidence_init(c)
             except sqlite3.Error as e:  # an SQLite without FTS5: no evidence, the service still starts
                 log.error("memory evidence tables: %s", e)
+    for p in settings_problems():  # 2026-11-24 owner: say it, never refuse to start
+        log.warning("memory settings: %s", p)
+
+
+def settings_problems():
+    """Short Chinese sentences about the settings as they are now (not the environment), [] when all is well. A
+    wrong entry does not fail: it silently does nothing (an exempt group that is not exempt, a bot that is never
+    unified), which is why it is worth saying. A name check is skipped while CONSUMERS is empty (nothing to compare)."""
+    out, chat, named = [], r"(?:group|private):\d{1,20}", {"房主私聊": set(), "会话别名": set()}
+    for c in sorted(LEAK_FREE_CHATS):
+        if not re.fullmatch(r"group:\d{1,20}", c):
+            out.append(f"免查的会话「{c}」不是 group:<号码> 的写法，不会免查任何会话")
+    for k in sorted(OWNER_CHATS):
+        m = re.fullmatch(r"([^@]+)@private:\d{1,20}", k)
+        if m:
+            named["房主私聊"].add(m[1])
+        else:
+            out.append(f"房主私聊「{k}」不是 <名字>@private:<号码> 的写法，认不出是房主私聊")
+    for k, v in sorted(CHAT_ALIASES.items()):
+        m = re.fullmatch(r"([^@]+)@" + chat, k)
+        if m and re.fullmatch(chat, v):
+            named["会话别名"].add(m[1])
+        else:
+            out.append(f"会话别名「{k}={v}」不是 <名字>@<会话>=<会话> 的写法（会话写成 group:<号码> 或 private:<号码>），不会生效")
+    for what, got in {**named, "统一记忆": UNIFIED, "房主规矩": RULE_CONSUMERS, "最近观察": RECENT, "原话佐证": EVIDENCE_FOR,
+                      "公共记录员": PUBLIC_SCRIBES}.items():
+        for n in sorted(got - set(CONSUMERS)) if CONSUMERS else ():
+            out.append(f"{what}里的「{n}」不在记忆的名单（CONSUMERS）里，多半是写错了名字")
+    return out
 
 
 def canonical(consumer, chat):
@@ -223,6 +267,7 @@ def owner_rules(consumer, chat):
     """Prompt block of the owner's standing rules for this bot, for any chat ('' when none or off)."""
     if consumer not in RULE_CONSUMERS:
         return ""
+    _sweep()
     with db() as c:
         rows = c.execute("select * from mem where owner=? and kind='rule' and status='active' "
                          "order by updated desc limit ?", (consumer, RULES_MAX)).fetchall()
@@ -307,6 +352,7 @@ def leak(consumer, chat, text):
     text = str(text or "").strip()
     if owner_private(consumer, chat) or len(text) < 4 or (chat.startswith("group:") and chat in LEAK_FREE_CHATS):
         return []
+    _sweep()
     with db() as c:
         rows = c.execute("select id, text, vec from mem where owner=? and scope='private' and status='active' "
                          "and kind!='diary'", (consumer,)).fetchall()
@@ -356,6 +402,18 @@ def leak(consumer, chat, text):
 def _log(c, consumer, op, detail):
     c.execute("insert into log values (?,?,?,?)",
               (time.time(), consumer, op, json.dumps(detail, ensure_ascii=False)[:2000]))
+
+
+def _sweep():
+    """2026-11-24 owner: a memory past its expires_at is gone everywhere. Called where a read or a write starts, so no
+    query has to know: due rows become status='expired'. One indexed look when none is due, no write lock."""
+    now = time.time()
+    with db() as c:
+        if c.execute("select 1 from mem where status='active' and expires_at<=? limit 1", (now,)).fetchone():
+            n = c.execute("update mem set status='expired', updated=? where status='active' and expires_at<=?",
+                          (now, now)).rowcount
+            if n:
+                _log(c, "system", "sweep_expired", {"count": n})
 
 
 # ---- vectors --------------------------------------------------------------------
@@ -410,6 +468,88 @@ def _kw(qb, text):
     return len(qb & rb) / math.sqrt(len(rb) * min(len(qb), 4 * len(rb)))
 
 
+# ---- trust: does an unverified claim contradict a verified memory (MEMORY_TRUST) ---------------------------------
+# 2026-11-24 owner: ported as it was in the kit's own store. Only statements about the same person can conflict
+# ("苍空不喜欢咖喱" never contradicts "凛音喜欢咖喱"): opposite polarity on shared words, other weekday or date, other dish.
+
+_NEG_STRIP = re.compile(r"不(?:太|怎么|大|是很|是特别)?[喜偏]?欢|不(?:太|怎么|大)?爱(?:吃|喝)?|不能吃|不吃|不喝|别[放吃买喝]|"
+                        r"讨厌|厌恶|受不了|忌口|过敏|禁食|拒绝")
+_NEG_CUES = ("过敏", "忌口", "不能吃", "不吃", "不喜欢", "不太喜欢", "不爱吃", "不爱喝", "讨厌", "厌恶", "受不了", "别放", "别买", "不喝")
+_POS_CUES = ("最喜欢", "很喜欢", "超喜欢", "喜欢", "最爱", "爱吃", "能吃", "可以吃", "常吃", "爱喝", "随便吃", "都能吃")
+_DENY = re.compile(r"(?:并?不|没有?|无)(?:会|太|是|算)?(?:对[^，。,；;]{0,8}?)?(?:过敏|忌口)|不(?:用|必)忌口|不(?:怎么|太)?(?:讨厌|厌恶|排斥)")
+_FOODS = ("海鲜", "花生", "芒果", "牛奶", "乳糖", "鸡蛋", "小麦", "牛肉", "猪肉", "鱼", "蟹", "虾")
+_DISHES = ("寿喜锅", "麻辣火锅", "火锅", "咖喱", "乌冬", "拉面", "意面", "炒面",
+           "蛋包饭", "味噌汤", "炒饭", "松饼", "司康", "饺子", "烤肉", "寿司")
+_DAYS = re.compile(r"(?:周|星期|礼拜)[一二三四五六日天]|\d{1,2}月\d{1,2}日")
+_SUBJ_WRAP = re.compile(r"^(?:群里有人|群友|有人|大家|网友|听人|听说|据说)(?:说|称|表示|讲|觉得|认为|提到)?[，,：:]?")
+_SUBJ_END = re.compile(r"对|不|没|很|最|超|特别|其实|也|都|爱|喜欢|讨厌|厌恶|受不了|过敏|能|可以|常|只|从不|每|周|星期|礼拜|"
+                       r"明|今|后|下|要|会|将|准备|打算|想|在|去|是|有|的|\d|月")
+_PRONOUNS = ("他", "她", "它", "我", "你", "自己", "大家", "这", "那", "有人", "群友")
+_COMMON_BG = frozenset({"今天", "明天", "昨天", "后天", "前天", "今晚", "明晚", "昨晚", "早上", "上午", "中午", "下午", "晚上", "半夜",
+                        "周末", "大家", "我们", "你们", "她们", "他们", "自己", "群里", "家里", "屋内", "一起", "约好", "准备",
+                        "打算", "商量", "觉得", "知道", "可以", "时候"})
+
+
+def _pairs(text):
+    t = re.sub(r"[\W_]+", "", str(text or "").casefold())
+    return {t[i:i + 2] for i in range(len(t) - 1)} | ({t} if len(t) == 1 else set())
+
+
+def _polarity(text):
+    """(negative, positive) cues; a denial such as "不过敏" counts as positive."""
+    deny = bool(_DENY.search(text))
+    body = _DENY.sub(" ", text)
+    return (any(w in body for w in _NEG_CUES) or bool(_NEG_STRIP.search(body)),
+            deny or any(w in _NEG_STRIP.sub(" ", body) for w in _POS_CUES))
+
+
+def _subject_of(text):
+    """Leading subject of a statement ("群友说苍空不喜欢咖喱" -> "苍空"); '' when unknown or a pronoun."""
+    t = str(text or "").strip()
+    m = _SUBJ_WRAP.match(t)
+    t = t[m.end():] if m else t
+    m = _SUBJ_END.search(t)
+    subj = t[:m.start()].strip() if m and m.start() > 0 else ""
+    return "" if len(subj) > 6 or subj.startswith(_PRONOUNS) else subj
+
+
+def _same_name(a, b):
+    return a == b or (min(len(a), len(b)) >= 2 and (a in b or b in a))
+
+
+def _conflicts_with_verified(claim, verified):
+    """True when an unverified (group_stated / hearsay) memory contradicts an active verified one."""
+    if str(claim.get("trust") or "verified") not in ("group_stated", "hearsay") or not claim.get("text"):
+        return False
+    c_text = str(claim["text"])
+    c_bg = {b for b in _pairs(c_text) if b not in _COMMON_BG and len(b) >= 2}
+    c_about = {x for x in str(claim.get("about") or "").split("|") if x}
+    c_neg, c_pos = _polarity(c_text)
+    c_days = set(_DAYS.findall(c_text))
+    c_dishes = {d for d in _DISHES if d in c_text}
+    for v in verified:
+        if v["id"] == claim.get("id"):
+            continue
+        v_text = str(v["text"])
+        v_about = {x for x in str(v["about"] or "").split("|") if x}
+        c_subj, v_subj = _subject_of(c_text), _subject_of(v_text)  # false only when both name different people
+        if (c_subj and v_subj and not _same_name(c_subj, v_subj)) or \
+                (not (c_subj and v_subj) and c_about and v_about and not any(_same_name(x, y) for x in c_about for y in v_about)):
+            continue
+        shared = c_bg & {b for b in _pairs(v_text) if b not in _COMMON_BG and len(b) >= 2}
+        v_neg, v_pos = _polarity(v_text)
+        if ((c_pos and v_neg) or (c_neg and v_pos)) and (shared or (c_about & v_about)
+                                                         or any(t in c_text and t in v_text for t in _FOODS)):
+            return True
+        if len(shared) >= 2:
+            v_days, v_dishes = set(_DAYS.findall(v_text)), {d for d in _DISHES if d in v_text}
+            if c_days and v_days and c_days != v_days and not (c_days <= v_days or v_days <= c_days):
+                return True
+            if c_dishes and v_dishes and c_dishes.isdisjoint(v_dishes):
+                return True
+    return False
+
+
 # ---- search ---------------------------------------------------------------------
 
 def search(consumer, chat, query, about=(), k=RECALL_K, qvec=None, min_score=0.0):
@@ -417,6 +557,7 @@ def search(consumer, chat, query, about=(), k=RECALL_K, qvec=None, min_score=0.0
     Without vectors (embedding container down) only clear keyword overlap counts."""
     where, params = _visible_sql(consumer, chat)
     about = [a for a in (str(x).strip() for x in about) if a]
+    _sweep()
     with db() as c:
         rows = c.execute(f"select * from mem where {where}", params).fetchall()
     if not rows:
@@ -425,6 +566,8 @@ def search(consumer, chat, query, about=(), k=RECALL_K, qvec=None, min_score=0.0
         got = embed([query])
         qvec = got[0] if got else None
     qb = _bigrams(query)
+    verified = [dict(r) for r in rows if r["trust"] == "verified" and r["kind"] in ("fact", "preference", "person", "rule")] \
+        if TRUST else []
     scored = []
     for r in rows:
         cos = _cos(qvec, _vec(r["vec"])) if qvec is not None else None
@@ -435,6 +578,10 @@ def search(consumer, chat, query, about=(), k=RECALL_K, qvec=None, min_score=0.0
             s = 0.4 + 0.6 * kw if kw >= 0.15 else 0.0
         if about and any(a in r["about"] for a in about):
             s += 0.15
+        if TRUST:  # 2026-11-24: what others said counts less; what contradicts a verified memory counts for little
+            s *= TRUST_WEIGHTS.get(r["trust"], 1.0)
+            if r["trust"] != "verified" and _conflicts_with_verified(dict(r), verified):
+                s, r = s * 0.2, {**dict(r), "_conflict": True}
         if s >= min_score:
             scored.append((s, r))
     scored.sort(key=lambda x: -x[0])
@@ -483,6 +630,7 @@ def asked_days(query, now=None):
 def own_diaries(consumer, chat, days):
     """Her own diaries of these days that she may see here, newest first (at most DIARY_FULL)."""
     where, params = _visible_sql(consumer, chat)
+    _sweep()
     with db() as c:
         rows = c.execute(f"select * from mem where {where} and kind='diary' and owner=? order by created desc limit 60",
                          (*params, consumer)).fetchall()
@@ -499,7 +647,13 @@ def _fmt(r, full=False):
     about = f" 关于{_about_shown(r['about'])}" if r["about"] else ""
     pub = "·公共" if r["scope"] == "public" else ("·私密" if r["scope"] == "private" else "")
     text = r["text"] if full or r["kind"] != "diary" or len(r["text"]) <= 100 else r["text"][:100] + "…"
-    return f"#{r['id']} [{KIND_ZH.get(r['kind'], r['kind'])}{pub}{about}] {text}（{day}）"
+    head = f"{KIND_ZH.get(r['kind'], r['kind'])}{pub}"
+    if TRUST:  # 2026-11-24: an unverified memory says so in the line, in the words the kit's own store used
+        if "_conflict" in r.keys():
+            head = "群聊未核实传言·与已知事实冲突，勿采信"
+        elif r["trust"] in ("group_stated", "hearsay"):
+            head = "推断·未核实" if r["scope"] == "private" else "群聊陈述·未核实"
+    return f"#{r['id']} [{head}{about}] {text}（{day}）"
 
 
 def _about_shown(about):
@@ -657,6 +811,26 @@ def _speaker_card(c, where, params, uid, names):
     return rows[0] if rows else None
 
 
+# 2026-11-24 owner: asked 「你记得我对什么过敏吗」 with nothing found, a silent block lets the model guess; recall says so.
+_PROBE_WORD, _PROBE_SUBJECT = re.compile(r"记得|记着|记不记|忘了|知道|听说|告诉过|说过|提过"), re.compile(r"我|房主|咱")
+_PROBE_QUESTION = re.compile(r"[?？吗呢吧]|什么|哪|谁|几|多少|是不是|有没有")
+NO_MEMORY_NOTE = ("（你的记忆里没有找到和这个问题相关的内容。照实说你不记得、不知道，不要编、不要猜，"
+                  "也不要替别人回答；除非这件事就出现在你们这次对话的前文里。）")
+
+
+def _asks_if_remembered(lines, me):
+    """Is the last line that is not her own a question about whether she remembers / knows something of the speaker?
+    A line without a sender header counts as plain text."""
+    for ln in reversed(lines):
+        if ID.is_self(ln, me):
+            continue
+        p = ID.parse(ln)
+        body = (ID.body(p[3]) if p else LINE_HEAD.sub("", str(ln))).strip()
+        if body:
+            return all(x.search(body) for x in (_PROBE_WORD, _PROBE_SUBJECT, _PROBE_QUESTION))
+    return False
+
+
 def recall(consumer, chat, lines, *, with_exposure=False):
     """Prompt block for a batch of rendered chat lines ('' when nothing fits)."""
     chat = _valid_chat(chat)
@@ -692,7 +866,8 @@ def recall(consumer, chat, lines, *, with_exposure=False):
     if not rows:
         evidence = _evidence_block(consumer, chat, text, lines, []) if evidence_for(consumer) else ""
         exposed = exposed or (bool(evidence) and owner_private(consumer, chat))
-        return result("\n\n".join(part for part in (rules, evidence, recent) if part))
+        block = "\n\n".join(part for part in (rules, evidence, recent) if part)
+        return result(block or (NO_MEMORY_NOTE if NO_MEMORY_NOTE_ON and _asks_if_remembered(lines, me) else ""))
     body, ids, used = [], [], 0
     for r in rows:
         line = "- " + _fmt(r)
@@ -736,10 +911,12 @@ def _bad(text):
 
 
 def add(consumer, chat, text, *, about="", kind="fact", scope="own", source="self", dedupe=0.92,
-        turn_id="", sensitivity=None, merge=True):
+        turn_id="", sensitivity=None, merge=True, trust=None, expires_at=None):
     """Insert or merge one memory. Returns (id, 'added'|'merged'|'same'). merge=False (#148 R148-01): always a new
     row, even when an active one has the same text; for a writer that keys its own idempotency on `source` (each
-    finished game is its own memory, two games can read the same)."""
+    finished game is its own memory, two games can read the same).
+    2026-11-24 owner: expires_at (a time; None = never) after which it is gone; trust (with MEMORY_TRUST, None =
+    verified): a weaker text never merges over a stronger row, and a merge keeps the stronger level."""
     about, chat = _about(about), _valid_chat(chat)
     kind = kind if kind in KINDS else "fact"
     if kind == "rule" and not rules_on(consumer, chat):
@@ -764,13 +941,21 @@ def add(consumer, chat, text, *, about="", kind="fact", scope="own", source="sel
     vecs = embed([text])
     vec = vecs[0] if vecs else None
     now = time.time()
+    if expires_at is not None and float(expires_at) <= now:
+        raise ValueError("expires_at 必须晚于当前时间")
+    trust = trust if trust in TRUST_LEVELS else "verified"
+    _sweep()
     with db() as c:
         best = None  # same owner, scope and chat: merge near-duplicates instead of piling up
         rows = c.execute("select * from mem where status='active' and owner=? and scope=? and chat=? "
                          "and kind!='diary'", (owner, scope, canon)) if merge else ()
         for r in rows:
             if r["text"] == text:
+                if expires_at is not None and r["expires_at"] is not None and float(expires_at) > r["expires_at"]:
+                    c.execute("update mem set expires_at=? where id=?", (float(expires_at), r["id"]))  # only later, never new
                 return r["id"], "same"
+            if TRUST and TRUST_RANK[r["trust"]] > TRUST_RANK[trust]:
+                continue
             s = _cos(vec, _vec(r["vec"]))
             if s is not None and s >= dedupe and (best is None or s > best[0]):
                 best = (s, r)
@@ -780,6 +965,10 @@ def add(consumer, chat, text, *, about="", kind="fact", scope="own", source="sel
                       "sensitivity=? where id=?",
                       (text, _about([*r["about"].split("|"), *about.split("|")]), r["text"], now,
                        vec.tobytes() if vec else r["vec"], chat, turn_id, sensitivity, r["id"]))
+            if expires_at is not None:
+                c.execute("update mem set expires_at=? where id=?", (float(expires_at), r["id"]))
+            if TRUST:  # the rows left in `best` rank no higher than this text: it takes the level
+                c.execute("update mem set trust=? where id=?", (trust, r["id"]))
             _log(c, consumer, "merge", {"id": r["id"], "text": text})
             if EVIDENCE:
                 _ver_add(c, r["id"], r["text"], r["updated"] or r["created"], now, text)
@@ -789,6 +978,10 @@ def add(consumer, chat, text, *, about="", kind="fact", scope="own", source="sel
                         (owner, scope, canon, about, kind, text, source, now, now, vec.tobytes() if vec else None))
         c.execute("update mem set source_chat=?, turn_id=?, sensitivity=? where id=?",
                   (chat, turn_id, sensitivity, cur.lastrowid))
+        if expires_at is not None:
+            c.execute("update mem set expires_at=? where id=?", (float(expires_at), cur.lastrowid))
+        if TRUST:
+            c.execute("update mem set trust=? where id=?", (trust, cur.lastrowid))
         _log(c, consumer, "add", {"id": cur.lastrowid, "scope": scope, "text": text})
         _trim(c, owner)
         return cur.lastrowid, "added"
@@ -863,6 +1056,7 @@ def today(consumer, chat, max_lines_chars=4000, public=False):
                          [canonical(consumer, chat), consumer])
     else:
         where, params = _visible_sql(consumer, chat)
+    _sweep()
     with db() as c:
         mems = c.execute(f"select * from mem where {where} and kind!='diary' and created>=? order by created",
                          params + [t0]).fetchall()
@@ -964,6 +1158,7 @@ def _own_row(consumer, chat, mid):
     except ValueError:
         raise ValueError("编号不对") from None
     where, params = _writable_sql(consumer, _valid_chat(chat))
+    _sweep()
     with db() as c:
         row = c.execute(f"select * from mem where id=? and {where}", [mid] + params).fetchone()
     if not row:
@@ -1555,9 +1750,25 @@ def _system(consumer, private, scribe, source_kind):
 - 没有值得记的就输出 {{"ops": []}}。寒暄闲聊照旧一条不记，一段聊天通常 0–5 条；但这段里有约定、改口、纠正、矛盾、故事进展或「{me}」给出的具体内容时，该记的都要记，最多 8 条，不要为了少而漏掉。"""
 
 
-def _apply(consumer, chat, ops, private, scribe, source, src=None):
+def _op_trust(consumer, private, rows, op_src, batch):
+    """MEMORY_TRUST (rows: the batch's seen rows, None = off): the level of what the extractor writes. The owner's
+    private chat: verified. A group: verified only when every line it rests on is the owner's by number (the lines
+    the op's "src" names, else the whole batch; her own lines do not count), else group_stated. 2026-11-24 owner:
+    not carried over from the kit's own store: the check that the text says what the owner's line says, hearsay
+    for a relayed line, a private-chat memory the owner's words do not back."""
+    if rows is None:
+        return None
+    if private:
+        return "verified"
+    ids = _src_lines(op_src, batch) if batch is not None and op_src is not None else []
+    me = _me(consumer)
+    said = [ID.speaker(r["line"], me) for r in rows if (not ids or r["id"] in ids) and not ID.is_self(r["line"], me)]
+    return "verified" if said and all(w == "owner" for w in said) else "group_stated"
+
+
+def _apply(consumer, chat, ops, private, scribe, source, src=None, rows=None):
     """src (MEMORY_EVIDENCE): the seen ids of the batch in the order the extractor saw them, so that an op's
-    "src" line numbers can be kept with the memory. None: "src" is not looked at."""
+    "src" line numbers can be kept with the memory. None: "src" is not looked at. rows (MEMORY_TRUST): see _op_trust."""
     done = {"added": 0, "merged": 0, "updated": 0, "forgot": 0, "rejected": 0}
     for op in (ops or [])[:20]:
         if not isinstance(op, dict):
@@ -1567,12 +1778,23 @@ def _apply(consumer, chat, ops, private, scribe, source, src=None):
             if kind == "add":
                 scope = "public" if (scribe and not private and op.get("scope") == "public") else "own"
                 mid, how = add(consumer, chat, op.get("text"), about=op.get("about") or "", kind=op.get("kind"),
-                               scope=scope, source=source)
+                               scope=scope, source=source, trust=_op_trust(consumer, private, rows, op.get("src"), src))
                 if how != "same":
                     done["added" if how == "added" else "merged"] += 1
                 if src is not None and op.get("src") is not None:
                     _src_add(mid, op.get("src"), src)
             elif kind == "update":
+                trust = _op_trust(consumer, private, rows, op.get("src"), src)
+                old = _own_row(consumer, chat, op.get("id")) if trust not in (None, "verified") else None
+                if old is not None and old["trust"] == "verified" and old["kind"] != "diary":
+                    # 2026-11-24 owner: only the owner rewrites a verified memory; another's version goes in beside it
+                    mid, how = add(consumer, chat, op.get("text"), about=op.get("about") or old["about"],
+                                   kind=old["kind"], source=source, trust=trust)
+                    if how != "same":
+                        done["added" if how == "added" else "merged"] += 1
+                    if src is not None and op.get("src") is not None:
+                        _src_add(mid, op.get("src"), src)
+                    continue
                 update(consumer, chat, op.get("id"), op.get("text"))
                 done["updated"] += 1
                 if src is not None and op.get("src") is not None:
@@ -1657,7 +1879,7 @@ def extract(consumer, chat, private, most=None, again=False):
         raise ValueError("no ops list in memory model answer")
     if marked:
         ops = _unnote(ops)
-    done = _apply(consumer, chat, ops, bool(private), scribe, "auto",
+    done = _apply(consumer, chat, ops, bool(private), scribe, "auto", rows=selected if TRUST else None,
                   **({"src": [r["id"] for r in selected]} if marked else {}))
     if INTENTS:
         try:  # the intents of this batch, checked against its lines; a failure never holds the memories back

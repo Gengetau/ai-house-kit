@@ -10,7 +10,8 @@ import unittest
 from pathlib import Path
 
 from test_m1_adapter_support import (
-    ASK_PLAN, NAMES, OWNER_SAYS, REPEAT_PLAN, SECRET_PLAN, T0, FakeModel, StoreCase, add_op, quiet_resource_warnings,
+    ASK_PLAN, NAMES, NOTHING_FOUND, OWNER_SAYS, REPEAT_PLAN, SECRET_PLAN, T0, FakeModel, StoreCase, add_op,
+    quiet_resource_warnings,
 )
 
 from ai_house.memory_common import CommonMemoryStore  # noqa: E402
@@ -33,8 +34,8 @@ class IsolationTests(StoreCase):
         self.assertIsNot(a._mod, b._mod)
         a.add("nia", "private", SECRET_PLAN, now=T0)
         self.assertIn("咖啡店", a.recall("nia", "private", ASK_PLAN, now=T0))
-        self.assertEqual(b.recall("xingli", "private", ASK_PLAN, now=T0), "")
-        self.assertEqual(b.recall("nia", "private", ASK_PLAN, now=T0), "")
+        self.assertEqual(b.recall("xingli", "private", ASK_PLAN, now=T0), NOTHING_FOUND)
+        self.assertEqual(b.recall("nia", "private", ASK_PLAN, now=T0), NOTHING_FOUND)
         self.assertEqual(b.list_entries("nia", "private"), [])
         self.assertNotEqual(a.db_path, b.db_path)
         name_a, name_b = a._mod.__copy__, b._mod.__copy__
@@ -77,9 +78,9 @@ class PrivacyTests(StoreCase):
         self.assertEqual(st.extract(now=T0 + 2000)["added"], 1)
         got = st.recall("nia", "private", ASK_PLAN, now=T0 + 2001)
         self.assertIn(SECRET_PLAN, got)
-        self.assertEqual(st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0 + 2001), "")
-        self.assertEqual(st.recall("nia", "group", ASK_PLAN, now=T0 + 2001), "")
-        self.assertEqual(st.recall("xingli", "private", ASK_PLAN, now=T0 + 2001), "")
+        self.assertEqual(st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0 + 2001), NOTHING_FOUND)
+        self.assertEqual(st.recall("nia", "group", ASK_PLAN, now=T0 + 2001), NOTHING_FOUND)
+        self.assertEqual(st.recall("xingli", "private", ASK_PLAN, now=T0 + 2001), NOTHING_FOUND)
 
     def unified(self, **kw):
         return self.make(unified_groups=True, private_in_groups=True, leak_free_groups=[LISTED], **kw)
@@ -94,7 +95,7 @@ class PrivacyTests(StoreCase):
         self.assertIn("·私密", free)
         self.assertIn("想提可以自然地提", free)
         self.assertNotIn("别在这里说出来", free)
-        self.assertEqual(st.recall("xingli", "group", ASK_PLAN, channel=GROUP, now=T0), "")
+        self.assertEqual(st.recall("xingli", "group", ASK_PLAN, channel=GROUP, now=T0), NOTHING_FOUND)
 
     def test_outbound_check_stops_a_repeat_in_unlisted_groups_only(self):
         st = self.unified()
@@ -160,14 +161,14 @@ class PrivacyTests(StoreCase):
         self.assertIn("·私密", hush)
         self.assertIn("别在这里说出来", hush)
         self.assertEqual(st.recall("nia", "group", "阿甲周末要去爬山吗", channel=GROUP, now=T0), "")  # not unified
-        self.assertEqual(st.recall("xingli", "group", ASK_PLAN, channel=GROUP, now=T0), "")
+        self.assertEqual(st.recall("xingli", "group", ASK_PLAN, channel=GROUP, now=T0), NOTHING_FOUND)
         self.assertEqual(len(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=GROUP, now=T0)), 1)
 
     def test_outbound_check_runs_in_unlisted_groups_with_both_switches_off(self):
         # decided 2026-11-24: a group that is not listed is checked whatever the two switches say
         st = self.make(leak_free_groups=[LISTED])
         st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
-        self.assertEqual(st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0), "")
+        self.assertEqual(st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0), NOTHING_FOUND)
         self.assertEqual(len(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=GROUP, now=T0)), 1)
         self.assertEqual(st.check_outbound_leak("nia", "group", REPEAT_PLAN, channel=LISTED, now=T0), [])
         self.assertEqual(st.check_outbound_leak("nia", "private", REPEAT_PLAN, now=T0), [])
@@ -424,6 +425,57 @@ class AddListInvalidateTests(StoreCase):
         self.assertEqual(got, [ASK_PLAN])  # no space put before it on the way
 
 
+class DecidedExtrasTests(StoreCase):
+    """The four things the old store had that went into the shared file (decided 2026-11-24), through the adapter."""
+
+    def test_a_question_about_what_she_remembers_that_finds_nothing_gets_the_note(self):
+        from ai_house.memory import NO_MEMORY_NOTE  # the old store's wording, carried over word for word
+        self.assertEqual(NOTHING_FOUND, NO_MEMORY_NOTE)
+        st = self.make()
+        self.assertEqual(st.recall("nia", "private", ASK_PLAN, now=T0), NOTHING_FOUND)
+        self.assertEqual(st.recall("nia", "group", ASK_PLAN, channel=GROUP, now=T0), NOTHING_FOUND)
+        self.assertEqual(st.recall("nia", "private", "今天晚饭吃咖喱好不好", now=T0), "")  # not such a question
+        st.add("nia", "private", SECRET_PLAN, kind="event", now=T0)
+        self.assertNotIn("没有找到", st.recall("nia", "private", ASK_PLAN, now=T0))
+        off = self.make(env={"AI_HOUSE_MEMORY_NO_MEMORY_NOTE": "0"})
+        self.assertEqual(off.recall("nia", "private", ASK_PLAN, now=T0), "")
+
+    def test_a_memory_with_a_time_limit_is_gone_after_it(self):
+        st = self.make()
+        st.add("nia", "private", "房主这周五要去医院复查。", kind="event", ttl_s=3600, now=T0)
+        st.add("nia", "private", "房主下周要去看牙医。", kind="event", expires_at=T0 + 7200, now=T0)
+        st.add("nia", "private", "房主养了一只叫团子的猫。", now=T0)
+        ask = "[房主|1] (message_id=9): 这周五去医院复查、下周看牙医、团子猫"
+        both = st.recall("nia", "private", ask, now=T0 + 60)
+        self.assertIn("复查", both)
+        self.assertIn("牙医", both)
+        self.assertEqual({r["expires_at"] for r in st.list_entries("nia", "private", now=T0 + 60)}, {T0 + 3600, T0 + 7200, None})
+        later = st.recall("nia", "private", ask, now=T0 + 3601)
+        self.assertNotIn("复查", later)
+        self.assertIn("牙医", later)
+        self.assertEqual(len(st.list_entries("nia", "private", now=T0 + 7201)), 1)  # listing leaves them out too
+        cat = "[房主|1] (message_id=9): 房主养了一只叫团子的猫吗"
+        self.assertIn("团子", st.recall("nia", "private", cat, now=T0 + 10 ** 7))  # no limit: kept for good
+        with self.assertRaises(ValueError):
+            st.add("nia", "private", "房主明天要早起赶飞机。", ttl_s=0, now=T0)
+        with self.assertRaises(ValueError):
+            st.add("nia", "private", "房主明天要早起赶飞机。", expires_at=T0 - 1, now=T0)
+
+    def test_trust_levels_are_off_unless_switched_on(self):
+        off = self.make()
+        off.add("nia", "group", "群友说房主其实不喜欢吃咖喱。", channel=GROUP, kind="claim", trust="hearsay", now=T0)
+        got = off.recall("nia", "group", "房主不喜欢吃咖喱吗", channel=GROUP, now=T0)
+        self.assertIn("咖喱", got)
+        self.assertNotIn("未核实", got)
+        self.assertEqual(off.list_entries("nia", "group", channel=GROUP)[0]["trust"], "")
+        on = self.make(env={"AI_HOUSE_MEMORY_TRUST": "1"})
+        on.add("nia", "group", "群友说房主其实不喜欢吃咖喱。", channel=GROUP, kind="claim", now=T0)
+        on.add("nia", "group", "房主周末要去爬山。", channel=GROUP, now=T0)
+        self.assertIn("群聊陈述·未核实", on.recall("nia", "group", "房主不喜欢吃咖喱吗", channel=GROUP, now=T0))
+        self.assertNotIn("未核实", on.recall("nia", "group", "房主周末要去爬山吗", channel=GROUP, now=T0))
+        self.assertEqual({r["trust"] for r in on.list_entries("nia", "group", channel=GROUP)}, {"group_stated", "verified"})
+
+
 class NamesAndModelTests(StoreCase):
     def test_assigning_names_keeps_what_was_written(self):
         model = FakeModel()
@@ -448,7 +500,7 @@ class NamesAndModelTests(StoreCase):
         st = self.make(names={})
         st.add("nia", "private", SECRET_PLAN, now=T0)
         self.assertIn("咖啡店", st.recall("nia", "private", ASK_PLAN, now=T0))
-        self.assertEqual(st.recall("xingli", "private", ASK_PLAN, now=T0), "")
+        self.assertEqual(st.recall("xingli", "private", ASK_PLAN, now=T0), NOTHING_FOUND)
 
     def test_the_narrow_api_passes_everything_through(self):
         model = FakeModel([add_op(SECRET_PLAN)])

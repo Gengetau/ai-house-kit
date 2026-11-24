@@ -3,7 +3,7 @@
 `memory.py`、`qq_identity.py` 是私有部署里的同名文件，搬过来时只做了两类处理：
 
 1. **去私有化**（机械替换，不改逻辑）：真实号码换成同长度的假号，住客与房主的名字、昵称换成占位名，内部路径换成中性写法。
-2. **下面这张表里的改动**。除此之外逐行相同。`tools/drift_report.py` 可以随时量两边差了多少行（2026-11-24：`memory.py` 1957 行里 1831 行相同）。
+2. **下面这张表里的改动**。除此之外逐行相同。`tools/drift_report.py` 可以随时量两边差了多少行（2026-11-24：`memory.py` 1957 行里 1823 行相同；公共文件现在 2101 行，多出来的主要是并入的可信度一段）。
 
 `roster.py`、`loader.py`、`__init__.py` 是 kit 自己写的：私有部署的花名册是一张手写的表，kit 的住客来自人物包，所以这里是空表加一个造表的函数。
 
@@ -21,6 +21,10 @@
 | `memory.py` | **行为**：“私聊记忆进群”不再依附“统一记忆”（`_visible_sql`、`_private_note`、`recent_block`）。没开统一记忆的住客在群里读到：这个群自己的记忆，加上她和房主私聊里的 | 维护者 2026-11-24 定。两个开关各管各的。私有端实际行为不变（理由同上） |
 | `memory.py` | **行为**：密钥过滤（`SECRETS`、`DIARY_SECRETS`）多认两个关键词（`secret key`、`bridge key`）和两种不带关键词的写法（`sk-…`、`agw_…`） | 维护者 2026-11-24 定：把 kit 原来多拦的并进来。只会多拦，不会少拦 |
 | `memory.py` | **行为**：日记开关关闭时，没开统一记忆的住客也能在每个会话里想起自己的日记（范围为 `own` 的那些；别人的仍看不到） | 维护者 2026-11-24 定。开了统一记忆的本来就如此（2026-11-03）。私有端各住客都是统一记忆，实际行为不变 |
+| `memory.py` | **行为**：`recall()` 什么都没找到、而最后一句不是她自己说的话问的是“你记得吗”这类问题时，返回一句“照实说不记得，别编”（`NO_MEMORY_NOTE`），不再返回空。开关 `MEMORY_NO_MEMORY_NOTE`，默认开 | 维护者 2026-11-24 定，从 kit 原来的记忆库并入。空着会让模型自己猜。**默认开，私有端换用后行为就是这样**；要保持原样设 `MEMORY_NO_MEMORY_NOTE=0` |
+| `memory.py` | **行为**：新增 `settings_problems()`（按模块当前的设置检查：免查的会话、房主私聊、会话别名的写法，以及各名单里的名字是否都在 `CONSUMERS` 里），`init()` 里把每条问题记成 `warning`，不拒绝启动 | 维护者 2026-11-24 定。写错的项不会报错，只会悄悄不起作用。`CONSUMERS` 为空时不查名字。只多几行日志 |
+| `memory.py` | **行为**：新增信任等级（`MEMORY_TRUST=1` 才生效，默认关）：`mem.trust`（verified / group_stated / hearsay）、`add(trust=)`、检索按等级降权、与已核实记忆矛盾的未核实说法被压低并标注、召回行写明“群聊陈述·未核实”等、合并时弱的不覆盖强的、抽取器按谁说的定等级。关着时不加列、输出与原来逐字相同 | 维护者 2026-11-24 定，从 kit 原来的记忆库并入。抽取器只用简化规则（见 `world-kernel/test_m1_common_extras.py`）：房主私聊里的是 verified；群里只有每条依据的原话都是房主（按号码）说的才是 verified，否则 group_stated；他人对 verified 记忆的改写另存一条。没搬：转述识别（hearsay）、文本与原话的实词对照、私聊里“房主原话撑不住”的降级 |
+| `memory.py` | **行为**：`add(expires_at=)`（一个时间，`None` = 永不过期，与原来一致）、`mem.expires_at` 列、`_sweep()`：过期的记忆在每次读写开头被标成 `status='expired'`，之后搜索、召回、名片、规矩、日记材料、泄露检查、改与忘都找不到它 | 维护者 2026-11-24 定，从 kit 原来的记忆库并入。没有默认寿命；没有过期行时每次读只多一次走索引的空查询。`ttl_s` 由适配层换算成 `expires_at` |
 | `qq_identity.py` | `import roster` 同上处理 | 同上 |
 | `qq_identity.py` | 房主的别名不再写在这个文件里，改为读花名册 `OWNER["aliases"]`（没有就只认「房主」「owner」） | 别名是数据，不是逻辑 |
 
@@ -34,7 +38,7 @@
   - `test_memory_guard.py`：原 `test_off_when_owner_dm_memories_never_reach_groups`（关掉“私聊记忆进群”后群里不查）改为 `test_a_group_is_checked_whatever_the_two_switches_say`。
   - `test_memory_recent.py`：原 `test_group_private_requires_both_permissions_and_owner` 改为 `test_group_private_requires_its_permission_and_owner`（不开统一记忆时群里仍带得出房主私聊里刚说的话，带不出别的群的）。
   - `test_memory_recent.py`：`test_pending_leak_permissions_allowlist_and_private_chat_are_unchanged` 里“统一记忆关”“私聊记忆进群关”两种情况从“不查”改为“查”。
-- 这些行为改动另有 kit 自己写的用例：`world-kernel/test_m1_common_changes.py`。
+- 这些行为改动另有 kit 自己写的用例：`world-kernel/test_m1_common_changes.py`、`world-kernel/test_m1_common_extras.py`（并入的四样）。
 - **私有端换用本目录的文件时**，上面这四个用例要一起换；它自己的那份在新代码下会失败。
 
 ## 约定
