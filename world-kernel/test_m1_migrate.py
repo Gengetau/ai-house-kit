@@ -356,6 +356,12 @@ class ReportTests(MigrateCase):
         self.assertTrue(self.new_path.exists())
 
 
+def files(folder) -> List[str]:
+    """What is in the folder, without SQLite's own `-wal`/`-shm`: they come and go as connections open and close
+    (a reader makes them, the last one to close may drop them), which is not the tool writing anything."""
+    return sorted(f for f in os.listdir(folder) if not f.endswith(("-wal", "-shm")))
+
+
 class AgainTests(MigrateCase):
     def dump(self) -> Dict[str, List[tuple]]:
         return {t: table(self.new_path, f"select * from {t} order by 1, 2") for t in
@@ -365,10 +371,10 @@ class AgainTests(MigrateCase):
 
     def test_the_second_run_changes_nothing(self):
         self.run_migrate()
-        before, listing, main_bytes = self.dump(), sorted(os.listdir(self.dir)), sha(self.new_path)
+        before, listing, main_bytes = self.dump(), files(self.dir), sha(self.new_path)
         rep = self.run_migrate(now=NOW + 99)
         self.assertEqual(self.dump(), before)
-        self.assertEqual(sorted(os.listdir(self.dir)), listing)          # no backup either
+        self.assertEqual(files(self.dir), listing)          # no backup either
         self.assertEqual(sha(self.new_path), main_bytes)
         self.assertFalse(rep["wrote"])
         m = rep["memories"]
@@ -464,9 +470,9 @@ class ResumeTests(MigrateCase):
 
 class DryRunTests(MigrateCase):
     def test_a_dry_run_writes_nothing_anywhere_and_reports_what_a_real_run_reports(self):
-        listing, before = sorted(os.listdir(self.dir)), sha(self.old_path)
+        listing, before = files(self.dir), sha(self.old_path)
         dry = self.run_migrate(dry_run=True)
-        self.assertEqual(sorted(os.listdir(self.dir)), listing)
+        self.assertEqual(files(self.dir), listing)
         self.assertFalse(self.new_path.exists())
         self.assertTrue(dry["dry_run"] and not dry["wrote"])
         real = self.run_migrate()
