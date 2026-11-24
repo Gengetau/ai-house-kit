@@ -1,4 +1,4 @@
-"""M1 step 3: `ai_house.memory_migrate` carries a house's memories from `memory.db` (old `MemoryStore`) into
+"""M1 step 3: `ai_house.memory_migrate` carries a house's memories from `memory.db` (the earlier store) into
 `memory-common.db` (`CommonMemoryStore`).
 
 The old house is built with the real old store through its public calls; what comes out is checked through the new
@@ -22,7 +22,7 @@ from unittest import mock
 from test_m1_adapter_support import NAMES, NOTHING_FOUND, T0, FakeModel, add_op, quiet_resource_warnings
 
 from ai_house import memory_migrate
-from ai_house.memory import MemoryStore
+from legacy_memory_store import MemoryStore  # the earlier store, kept only to write old-format files
 from ai_house.memory_common import CommonMemoryStore
 from ai_house.memory_migrate import describe, id_map, migrate
 
@@ -236,8 +236,8 @@ class CarryTests(MigrateCase):
         mine = sorted(table(self.new_path, f"select {cols} from mem where status='active'"))
         want = sorted(table(Path(ref.db_path), f"select {cols} from mem where status='active'"))
         self.assertEqual(mine, want)
-        self.assertEqual(sorted(table(self.new_path, "select * from kit_origin where scope='world' order by mem_id")
-                                and [("world",)]), [("world",)])
+        # the one world memory that is not a diary sits in the place kept for world memories
+        self.assertEqual(table(self.new_path, "select text from mem where chat='group:0'"), [("小屋的钟在整点会敲三下。",)])
 
     def test_times_counts_expiry_and_kind_are_kept(self):
         self.run_migrate()
@@ -365,7 +365,7 @@ def files(folder) -> List[str]:
 class AgainTests(MigrateCase):
     def dump(self) -> Dict[str, List[tuple]]:
         return {t: table(self.new_path, f"select * from {t} order by 1, 2") for t in
-                ("mem", "seen", "log", "kit_numbers", "kit_channels", "kit_origin")} | {
+                ("mem", "seen", "log", "kit_numbers", "kit_channels")} | {
             "map": table(self.new_path, "select what, old_id, new_id, state, outcome, reason, old_trust, "
                                         "trust_applied from kit_migrated order by 1, 2")}
 
@@ -428,8 +428,7 @@ class ResumeTests(MigrateCase):
     def snapshot(p: Path) -> Dict[str, List[tuple]]:
         return {"mem": table(p, "select * from mem order by id"), "seen": table(p, "select * from seen order by id"),
                 "map": table(p, "select what, old_id, new_id, state, outcome, reason, old_trust, trust_applied "
-                                "from kit_migrated order by 1, 2"),
-                "origin": table(p, "select * from kit_origin order by 1")}
+                                "from kit_migrated order by 1, 2")}
 
     def interrupted(self, method: str, after: int, *, real_call_first: bool) -> None:
         real = getattr(CommonMemoryStore, method)

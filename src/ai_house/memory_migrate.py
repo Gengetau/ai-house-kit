@@ -1,5 +1,5 @@
-"""Carry an existing house's memories from the old store (`memory.db`, `MemoryStore`) into the new one
-(`memory-common.db`, `CommonMemoryStore`).
+"""Carry an existing house's memories from the old store (`memory.db`, written by the earlier self-contained
+implementation) into the present one (`memory-common.db`, `CommonMemoryStore`).
 
     python3 -m ai_house.memory_migrate <data_dir> [--dry-run]
 
@@ -41,7 +41,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .memory import MemoryStore
 from .memory_common import CommonMemoryStore
 
 log = logging.getLogger("ai_house.memory_migrate")
@@ -278,12 +277,12 @@ class _Run:
         if actor is None:
             return self._skip(con, "mem", oid, "no_resident_for_shared_row", old_trust, old_kind)
         try:
-            MemoryStore._valid_actor(actor)
+            CommonMemoryStore._valid_actor(actor)
         except ValueError:
             return self._skip(con, "mem", oid, "invalid_actor", old_trust, old_kind)
         try:
-            MemoryStore._valid_scope(scope)
-            MemoryStore._resolve_channel(actor, scope, channel)
+            CommonMemoryStore._valid_scope(scope)
+            CommonMemoryStore._resolve_channel(actor, scope, channel)
         except ValueError:
             return self._skip(con, "mem", oid, "invalid_channel", old_trust, old_kind)
 
@@ -398,12 +397,12 @@ class _Run:
         oid = int(r["id"])
         actor, scope, channel = str(r["actor"]), str(r["scope"]), str(r["channel"] or "")
         try:
-            MemoryStore._valid_actor(actor)
+            CommonMemoryStore._valid_actor(actor)
         except ValueError:
             return self._skip(con, "seen", oid, "invalid_actor")
         try:
-            MemoryStore._valid_scope(scope)
-            MemoryStore._resolve_channel(actor, scope, channel)
+            CommonMemoryStore._valid_scope(scope)
+            CommonMemoryStore._resolve_channel(actor, scope, channel)
         except ValueError:
             return self._skip(con, "seen", oid, "invalid_channel")
         role = str(r["speaker_role"] or "member").strip().lower()
@@ -475,7 +474,7 @@ def _shared_actor(names: Mapping[str, str], eligible: Sequence[Mapping[str, Any]
     for pool in (sorted(names), sorted({str(r["owner"]) for r in eligible if str(r["owner"]) != "shared"})):
         for a in pool:
             try:
-                MemoryStore._valid_actor(a)
+                CommonMemoryStore._valid_actor(a)
                 return a
             except ValueError:
                 continue
@@ -496,7 +495,7 @@ def _process(new_path: Path, plan: Dict[str, Any], old_mem: Dict[int, Dict[str, 
     full: Dict[str, str] = {}
     for a in sorted(actors):
         try:
-            MemoryStore._valid_actor(a)
+            CommonMemoryStore._valid_actor(a)
         except ValueError:
             continue
         full[a] = str(names.get(a, a))

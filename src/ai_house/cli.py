@@ -28,11 +28,11 @@ from .daemon import (
     DaemonLockError,
     HouseDaemon,
     make_http_server,
-    memory_backend,
-    memory_backend_problem,
+    memory_backend_note,
 )
 from .llm import explain_llm_error
-from .memory import LEAK_FREE_GROUPS_ENV, PRIVATE_IN_GROUPS_ENV, parse_leak_free_groups
+from .memory import LEAK_FREE_GROUPS_ENV, PRIVATE_IN_GROUPS_ENV, HttpOpenAIEmbedder, parse_leak_free_groups
+from .memory_common import embed_settings
 from .plugin_api import PluginRegistry
 
 
@@ -104,7 +104,6 @@ def cmd_up(args: argparse.Namespace) -> int:
     problem = (
         _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, ""))
         or _private_in_groups_problem(os.environ.get(PRIVATE_IN_GROUPS_ENV, ""))
-        or memory_backend_problem(os.environ.get(MEMORY_BACKEND_ENV, ""))
     )
     if problem:
         print(f"[ai-house] 配置有问题，没有启动：{problem}", file=sys.stderr, flush=True)
@@ -317,6 +316,40 @@ def cmd_token(args: argparse.Namespace) -> int:
     return 1
 
 
+def _vector_service_check(env: Dict[str, str], ping: bool) -> Dict[str, Any]:
+    """The doctor's line about the memory's vector service: what the settings point at and, with `ping`, whether it
+    answers. The address is shown as host and port only; no text of the house is sent (one fixed word)."""
+    cfg = embed_settings(env)
+    name = "memory_vectors"
+    plain = "回想只按字面找，换个说法问可能想不起来"
+    if cfg["source"] == "off":
+        return {"name": name, "ok": True, "detail": f"记忆的向量服务已关掉（AI_HOUSE_MEMORY_EMBED_URL=off）：{plain}"}
+    if cfg["source"] == "none":
+        return {"name": name, "ok": not ping, "detail": (
+            f"没有配记忆的向量服务：{plain}。用 docker compose 启动会自带一个；自己装见 docs/DEPLOY.md 1.3"
+            + ("（指定了 --embed-ping，但没有可问的地址）" if ping else ""))}
+    from urllib.parse import urlparse
+
+    parsed = urlparse(cfg["url"] if "://" in cfg["url"] else "http://" + cfg["url"])
+    where = f"{parsed.hostname or '?'}" + (f":{parsed.port}" if parsed.port else "")
+    which = "随 compose 带的本地服务" if cfg["source"] == "bundled" else "AI_HOUSE_MEMORY_EMBED_URL 指的服务"
+    if not ping:
+        return {"name": name, "ok": True, "detail": f"记忆的向量服务：{which}（{where}；加 --embed-ping 实际问一次）"}
+    client = HttpOpenAIEmbedder(cfg["url"], api_key=cfg["api_key"], model=cfg["model"], timeout_s=6.0)
+    try:
+        vec = client.ask(["你好"])[0]
+        return {"name": name, "ok": True, "detail": f"记忆的向量服务：{which}（{where}）答复正常，向量 {len(vec)} 维"}
+    except Exception as exc:  # noqa: BLE001
+        code = getattr(exc, "code", None)
+        if code == 503:
+            why = "服务在，模型还没载入好（第一次要下载模型文件）；过一两分钟再试。这期间回想按字面找"
+        elif code:
+            why = f"服务答了 HTTP {code}"
+        else:
+            why = f"连不上（{type(exc).__name__}）"
+        return {"name": name, "ok": False, "detail": f"记忆的向量服务：{which}（{where}）{why}"}
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     env_path = Path(args.env_file)
     parsed, env_errs, env_warns = _parse_dotenv_file(env_path)
@@ -414,17 +447,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "detail": pig_problem or ("住客在群里想得起房主私聊里说的事" if pig_raw == "1" else "私聊记忆不进群"),
         })
 
-    mb_raw = eff_env.get(MEMORY_BACKEND_ENV, "").strip()
-    if mb_raw:
-        mb_problem = memory_backend_problem(mb_raw)
-        checks.append({
-            "name": "memory_backend",
-            "ok": not mb_problem,
-            "detail": mb_problem or (
-                "记忆用与私有部署共用代码的那一套（试用；库文件 memory-common.db，原来 memory.db 里的记忆不会自动带过来）"
-                if memory_backend(eff_env) == "common" else "记忆用原来的那一套"
-            ),
-        })
+    mb_note = memory_backend_note(eff_env.get(MEMORY_BACKEND_ENV, ""))
+    if mb_note:  # an obsolete setting: said, not counted as a fault
+        checks.append({"name": "memory_backend", "ok": True, "detail": mb_note})
+
+    checks.append(_vector_service_check(eff_env, bool(getattr(args, "embed_ping", False))))
 
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -647,6 +674,10 @@ def main(argv: list[str] | None = None) -> int:
     p_doc.add_argument(
         "--onebot-ping", action="store_true",
         help="实际连一次 ONEBOT_WS_URL 指向的 OneBot 协议端，检查令牌和登录状态（不发任何消息）",
+    )
+    p_doc.add_argument(
+        "--embed-ping", action="store_true",
+        help="实际问一次记忆的向量服务（只发一个固定的词），看它在不在、模型载入了没有",
     )
     p_doc.set_defaults(func=cmd_doctor)
 

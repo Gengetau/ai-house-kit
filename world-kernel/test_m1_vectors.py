@@ -1,7 +1,7 @@
 """M1: the bundled vector service and how the store sharing the private deployment's code uses it.
 
 - `deploy/embedding/server.py`, run here with a fake model (no download, no network);
-- the new store reads the bundled service's address, the old store does not;
+- the store reads the bundled service's address unless told otherwise;
 - recall is told who is asking, so what is about the asker ranks as it does in the private deployment;
 - the house hands that over and gives late vectors to memories written while the service was not answering.
 
@@ -14,7 +14,10 @@ import importlib.util
 import io
 import json
 import math
+import os
+import socket
 import sys
+import tempfile
 import threading
 import unittest
 import unittest.mock
@@ -31,7 +34,7 @@ from test_m1_adapter_support import NAMES, T0, StoreCase, quiet_resource_warning
 from test_m1_wiring import house  # noqa: E402
 
 from ai_house.chat_identity import owner_speaker  # noqa: E402
-from ai_house.memory import HttpOpenAIEmbedder, MemoryStore  # noqa: E402
+from ai_house.memory import HttpOpenAIEmbedder  # noqa: E402
 from ai_house.memory_common import EMBED_DEFAULT_ENV, CommonMemoryStore  # noqa: E402
 
 SERVER = ROOT / "deploy" / "embedding" / "server.py"
@@ -184,14 +187,6 @@ class WhichStoreUsesItTests(StoreCase):
             self.assertFalse(self.make(env={EMBED_DEFAULT_ENV: BUNDLED, "AI_HOUSE_MEMORY_EMBED_URL": off}).vector_enabled)
         self.assertFalse(self.make(env={}).vector_enabled)
 
-    def test_the_old_store_does_not_read_the_bundled_address(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            old = MemoryStore(tmp, names=NAMES, env={EMBED_DEFAULT_ENV: BUNDLED})
-            self.addCleanup(old.close)
-            self.assertFalse(old.vector_enabled)
-
 
 def near(cos):
     """A vector plugin: questions (ending in ？) point one way, everything else `cos` away from it."""
@@ -256,24 +251,91 @@ class TheHouseTests(unittest.TestCase):
         d.memory.recall = recall
         return seen
 
-    def test_the_house_tells_the_new_store_who_asks_and_the_old_one_nothing_new(self):
-        for backend, want in (("common", {"speaker_role": "owner", "speaker_id": "user:owner"}), (None, {})):
-            d, _, _ = house(self, backend)
-            seen = self.spy(d)
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertTrue(d.converse("private:sora", "你还记得我对什么过敏吗？", owner_speaker("房主"))["ok"])
-            self.assertTrue(seen, backend)
-            got = {k: v for k, v in seen[0].items() if k.startswith("speaker") and k != "speaker"}
-            self.assertEqual(got, want, backend)
+    def test_the_house_tells_the_store_who_asks(self):
+        d, _, _ = house(self)
+        seen = self.spy(d)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(d.converse("private:sora", "你还记得我对什么过敏吗？", owner_speaker("房主"))["ok"])
+        self.assertTrue(seen)
+        got = {k: v for k, v in seen[0].items() if k.startswith("speaker") and k != "speaker"}
+        self.assertEqual(got, {"speaker_role": "owner", "speaker_id": "user:owner"})
 
-    def test_the_periodic_job_gives_late_vectors_on_the_new_store_only(self):
-        for backend, want in (("common", 1), (None, 0)):
-            d, _, _ = house(self, backend)
-            calls = []
-            d.memory.backfill_vectors = lambda *a, **k: calls.append(1) or 0
-            with contextlib.redirect_stdout(io.StringIO()):
-                d._run_post_step_jobs()
-            self.assertEqual(len(calls), want, backend)
+    def test_the_periodic_job_gives_late_vectors(self):
+        d, _, _ = house(self)
+        calls = []
+        d.memory.backfill_vectors = lambda *a, **k: calls.append(1) or 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            d._run_post_step_jobs()
+        self.assertEqual(len(calls), 1)
+
+
+class DoctorTests(unittest.TestCase):
+    """`ai-house doctor` says what the settings point at; `--embed-ping` asks the service once."""
+
+    VARS = ("AI_HOUSE_MEMORY_EMBED_URL", "MEMORY_EMBED_URL", EMBED_DEFAULT_ENV, "AI_HOUSE_MEMORY_EMBED_API_KEY",
+            "AI_HOUSE_API_KEY")
+
+    def doctor(self, settings, *flags):
+        from unittest.mock import patch
+
+        from ai_house import cli
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env_file = Path(tmp.name) / ".env"
+        env_file.write_text("".join(f"{k}={v}\n" for k, v in settings.items()), encoding="utf-8")
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(out):
+            for name in self.VARS:
+                os.environ.pop(name, None)
+            cli.main(["doctor", "--env-file", str(env_file), "--data-dir", str(Path(tmp.name) / "rt"), "--json", *flags])
+        return {c["name"]: c for c in json.loads(out.getvalue())["checks"]}["memory_vectors"]
+
+    def test_nothing_set_is_said_plainly_and_is_not_a_fault(self):
+        got = self.doctor({})
+        self.assertTrue(got["ok"])
+        self.assertIn("按字面", got["detail"])
+        self.assertFalse(self.doctor({}, "--embed-ping")["ok"])  # asked to ping, nothing to ping
+        off = self.doctor({"AI_HOUSE_MEMORY_EMBED_URL": "off", EMBED_DEFAULT_ENV: BUNDLED}, "--embed-ping")
+        self.assertTrue(off["ok"])
+        self.assertIn("关掉", off["detail"])
+
+    def test_without_the_flag_nothing_is_asked(self):
+        mod, url = ServiceTests.serve(self, FakeModel)
+        got = self.doctor({EMBED_DEFAULT_ENV: url})
+        self.assertTrue(got["ok"])
+        self.assertIn(url.split("//")[1], got["detail"])
+        self.assertEqual(mod._state["status"], "idle")
+
+    def test_the_ping_tells_loading_from_ready_from_gone(self):
+        gate = threading.Event()
+
+        def load():
+            gate.wait(10)
+            return FakeModel()
+
+        mod, url = ServiceTests.serve(self, load)
+        loading = self.doctor({EMBED_DEFAULT_ENV: url}, "--embed-ping")
+        self.assertFalse(loading["ok"])
+        self.assertIn("还没载入", loading["detail"])
+        gate.set()
+        ServiceTests.wait_ready(self, mod)
+        ready = self.doctor({EMBED_DEFAULT_ENV: url}, "--embed-ping")
+        self.assertTrue(ready["ok"], ready)
+        self.assertIn("2 维", ready["detail"])
+        with socket.socket() as s:  # a port nothing listens on
+            s.bind(("127.0.0.1", 0))
+            dead = f"http://127.0.0.1:{s.getsockname()[1]}"
+        gone = self.doctor({EMBED_DEFAULT_ENV: dead}, "--embed-ping")
+        self.assertFalse(gone["ok"])
+        self.assertIn("连不上", gone["detail"])
+
+    def test_only_the_host_and_port_of_an_address_are_shown(self):
+        got = self.doctor({"AI_HOUSE_MEMORY_EMBED_URL": "http://someone:placeholder@vectors.example:8443/v1/hidden-path",
+                           "AI_HOUSE_MEMORY_EMBED_API_KEY": "made-up-value"})
+        self.assertIn("vectors.example:8443", got["detail"])
+        for hidden in ("placeholder", "someone", "hidden-path", "made-up-value"):
+            self.assertNotIn(hidden, got["detail"])
 
 
 if __name__ == "__main__":

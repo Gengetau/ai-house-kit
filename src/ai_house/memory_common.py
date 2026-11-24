@@ -1,14 +1,14 @@
-"""`CommonMemoryStore`: the `MemoryStore` interface on top of the shared memory module (`ai_house.common`).
+"""`CommonMemoryStore`: the house's memory store, on top of the shared memory module (`ai_house.common`).
 
-Not wired into the daemon yet. The shared module speaks in "consumer + chat + rendered QQ lines" and keeps its
+The shared module speaks in "consumer + chat + rendered QQ lines" and keeps its
 settings in module globals; the kit speaks in "actor + scope + channel + plain text" and has one store per house.
 This class is the translation, and nothing else: every memory decision (what is stored, who may see it, what a
 recall says) is made by the loaded copy of the shared module.
 
 Own database `<data_dir>/memory-common.db`; it never touches the old `memory.db`. Besides the shared module's own
-tables it keeps three small tables of its own: `kit_numbers` (the stable placeholder number of each housemate),
-`kit_channels` (kit channel ids that have no number of their own) and `kit_origin` (which rows were written in the
-kit's `world` scope).
+tables it keeps two small tables of its own: `kit_numbers` (the stable placeholder number of each housemate) and
+`kit_channels` (kit channel ids that have no number of their own). Memories of the kit's `world` scope (the house's
+own doings, said in no chat) live in a chat of their own, `group:0`, where nobody ever speaks.
 
 Accepted for compatibility but without effect: `recency_half_life_days`, `min_keyword_overlap`; `recall(about=,
 max_chars=)`. `add(trust=)` is kept only with `AI_HOUSE_MEMORY_TRUST=1` (the shared module's trust levels, off by
@@ -16,6 +16,7 @@ default); `add(expires_at=, ttl_s=)` gives the memory a time after which it is g
 """
 from __future__ import annotations
 
+import array
 import contextlib
 import logging
 import os
@@ -35,12 +36,19 @@ from .memory import (
     KINDS,
     LEAK_FREE_GROUPS_ENV,
     PRIVATE_IN_GROUPS_ENV,
+    SCOPES,
     MemoryRefusedError,
-    MemoryStore,
     NarrowMemoryAPI,
+    VectorEmbedder,
+    _ACTOR_RE,
+    _CHANNEL_BAD_RE,
+    _RESERVED_OWNERS,
     _clean_line,
     _clean_speaker,
     _clean_text,
+    _normalize_vec,
+    _openai_json_extractor,
+    _parse_ops_json,
     parse_leak_free_groups,
 )
 
@@ -50,7 +58,8 @@ OWNER_NUMBER = 1  # the owner, inside the database only
 OWNER_PRIVATE_CHAT = f"private:{OWNER_NUMBER}"
 WEB_GROUP_CHAT = "group:1"  # the kit's web group channel `group`
 EMBED_DEFAULT_ENV = "AI_HOUSE_MEMORY_EMBED_URL_DEFAULT"
-WORLD_LEAK_CHAT = "group:0"  # world-scope outbound checks: a group nobody can list as leak-free
+WORLD_CHAT = "group:0"  # where `world` memories live: a group nobody is in and nobody can list as leak-free
+WORLD_LEAK_CHAT = WORLD_CHAT  # outbound checks with no usable group are made from there: never exempt
 HOUSEMATE_NUMBERS = (1000, 8999)
 STRANGER_NUMBERS = (9000, 9999)
 _REAL_QQ_MIN = 10000  # below this a number is ours: a claimed `qq:` id in that range is not believed
@@ -123,33 +132,164 @@ def _flag(raw: Any, default: bool) -> bool:
     return default if raw is None or str(raw).strip() == "" else str(raw).strip() == "1"
 
 
-class CommonMemoryStore:
-    """Same calls as `ai_house.memory.MemoryStore`, answered by a private copy of the shared memory module."""
+def embed_settings(env: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """What the settings alone say about the vector service. `source` is `named` (`AI_HOUSE_MEMORY_EMBED_URL`, with
+    its optional key and model), `bundled` (the service the compose file brings, `AI_HOUSE_MEMORY_EMBED_URL_DEFAULT`;
+    no key is sent to it), `off` (switched off by name) or `none`; `url` is empty for the last two."""
+    e = env or {}
+    named = str(e.get("AI_HOUSE_MEMORY_EMBED_URL") or e.get("MEMORY_EMBED_URL") or "").strip()
+    if named.lower() in ("off", "none", "0"):
+        return {"source": "off", "url": "", "api_key": "", "model": ""}
+    if named:
+        return {"source": "named", "url": named,
+                "api_key": str(e.get("AI_HOUSE_MEMORY_EMBED_API_KEY") or e.get("AI_HOUSE_API_KEY") or "").strip(),
+                "model": str(e.get("AI_HOUSE_MEMORY_EMBED_MODEL") or "").strip()}
+    bundled = str(e.get(EMBED_DEFAULT_ENV) or "").strip()
+    if bundled:
+        return {"source": "bundled", "url": bundled, "api_key": "", "model": ""}
+    return {"source": "none", "url": "", "api_key": "", "model": ""}
 
-    # Reused from the old store so the rules cannot drift apart: validation, the two switches, the model and vector
-    # plug-ins. They only read plain attributes set in __init__.
-    _valid_actor = MemoryStore.__dict__["_valid_actor"]
-    _valid_scope = MemoryStore.__dict__["_valid_scope"]
-    _clean_channel = MemoryStore.__dict__["_clean_channel"]
-    _resolve_channel = MemoryStore.__dict__["_resolve_channel"]
-    private_readable_in = MemoryStore.private_readable_in
-    leak_free_in = MemoryStore.leak_free_in
-    def _init_embedder(self, plugin: Any) -> Any:
-        """The vector service: a plugin handed in, else the one the settings name (`AI_HOUSE_MEMORY_EMBED_URL`; `off`
-        for none), else the bundled one the compose file points to (`AI_HOUSE_MEMORY_EMBED_URL_DEFAULT`). Only this
-        store reads the bundled one: the shared code's thresholds are tuned for exactly that service, the old
-        store's are not. No key is sent to it."""
-        if plugin is None:
-            named = str(self._env.get("AI_HOUSE_MEMORY_EMBED_URL") or self._env.get("MEMORY_EMBED_URL") or "").strip()
-            if named.lower() in ("off", "none", "0"):
+
+class CommonMemoryStore:
+    """The house's memory store (also importable as `ai_house.memory.MemoryStore`): the kit's calls, answered by a
+    private copy of the shared memory module."""
+
+    @staticmethod
+    def _valid_actor(actor: str) -> str:
+        a = str(actor or "").strip()
+        if not _ACTOR_RE.fullmatch(a) or a.lower() in _RESERVED_OWNERS:
+            raise ValueError(f"非法室友标识: {actor!r}")
+        return a
+
+    @staticmethod
+    def _valid_scope(scope: str) -> str:
+        s = str(scope or "").strip().lower()
+        if s not in SCOPES:
+            raise ValueError(f"scope 必须是 {SCOPES} 之一，收到: {scope!r}")
+        return s
+
+    @staticmethod
+    def _clean_channel(channel: object) -> str:
+        return _CHANNEL_BAD_RE.sub("", str(channel or "").strip())[:64]
+
+    def private_readable_in(self, channel: object) -> bool:
+        """Switch one (`AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=1`): may a roommate recall her own private memories while
+        talking in this group channel? Any group, never a private room. Says nothing about what she may say out loud."""
+        if not self.private_in_groups:
+            return False
+        ch = self._clean_channel(channel) or "group"
+        return not ch.lower().startswith("private")
+
+    def leak_free_in(self, channel: object) -> bool:
+        """Switch two (`AI_HOUSE_MEMORY_LEAK_FREE_GROUPS`): the ONE decision point for the outbound side. True only for a
+        group channel id listed there, spelled exactly as the house spells it (`group`, `qq-group:<id>`; an empty id
+        means the web `group`, as in recall). The outbound leak checks are skipped there and the note shown with
+        private memories says they may be mentioned. Independent of `private_readable_in`."""
+        raw = str(channel or "").strip()
+        if raw != self._clean_channel(raw):
+            # never clean a malformed id into a listed one ("qq-group:1 23" is not "qq-group:123")
+            return False
+        ch = raw or "group"
+        if ch.lower().startswith("private"):
+            return False
+        return ch in self.leak_free_groups
+
+    @classmethod
+    def _resolve_channel(cls, actor: str, scope: str, channel: str = "") -> str:
+        actor = cls._valid_actor(actor)
+        scope = cls._valid_scope(scope)
+        ch = cls._clean_channel(channel)
+        if scope == "private":
+            if not ch or ch == "private":
+                return f"private:{actor}"
+            if ch == f"private:{actor}":
+                return ch
+            raise ValueError(f"私聊范围 channel 必须对应本人 private:{actor}，收到: {channel!r}")
+        if ch.lower().startswith("private"):
+            raise ValueError(f"{scope} 范围不能使用 private 频道标识: {channel!r}")
+        if scope == "group":
+            return ch or "group"
+        return ch or "world"
+
+    def _init_embedder(self, plugin: Any) -> Optional[VectorEmbedder]:
+        """The vector service: a plugin handed in, else what the settings say (`embed_settings`). The shared code's
+        thresholds are tuned for exactly the bundled service."""
+        if isinstance(plugin, VectorEmbedder):
+            return plugin
+        if callable(plugin):
+
+            class _CallableEmbedder(VectorEmbedder):
+                def embed(self, texts: Sequence[str]) -> Optional[List[array.array]]:
+                    raw = plugin(texts)
+                    if raw is None:
+                        return None
+                    return [_normalize_vec(v) for v in raw]
+
+            return _CallableEmbedder()
+        cfg = embed_settings(self._env)
+        if not cfg["url"]:
+            return None
+        return HttpOpenAIEmbedder(cfg["url"], api_key=cfg["api_key"], model=cfg["model"])
+
+    @property
+    def vector_enabled(self) -> bool:
+        return self._embedder is not None
+
+    def _embed(self, texts: Sequence[str]) -> Optional[List[array.array]]:
+        if self._embedder is None or not texts:
+            return [] if not texts else None
+        try:
+            vecs = self._embedder.embed(texts)
+            if vecs is None or len(vecs) != len(texts):
                 return None
-            bundled = str(self._env.get(EMBED_DEFAULT_ENV) or "").strip()
-            if not named and bundled:
-                return HttpOpenAIEmbedder(bundled)
-        return MemoryStore._init_embedder(self, plugin)
-    _embed = MemoryStore._embed
-    _build_extractor_fn = MemoryStore._build_extractor_fn
-    vector_enabled = MemoryStore.vector_enabled
+            return vecs
+        except Exception as exc:  # noqa: BLE001
+            log.debug("embedder plugin failed (%s)", type(exc).__name__)
+            return None
+
+    def _build_extractor_fn(
+        self,
+        override_fn: Optional[Callable[[str, str], Any]] = None,
+        *,
+        actor: str = "",
+    ) -> Optional[Callable[[str, str], Dict[str, Any]]]:
+        fn = override_fn or self._llm_fn
+        if fn is not None:
+            return lambda sys_p, usr_p: _parse_ops_json(fn(sys_p, usr_p))
+        if self.model_router is not None and self.model_router.has_live_endpoint(purpose="memory_extract", actor=actor):
+            router = self.model_router
+
+            def _routed(sys_p: str, usr_p: str) -> Dict[str, Any]:
+                res = router.complete_messages(
+                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}],
+                    purpose="memory_extract",
+                    actor=actor,
+                )
+                if not res.content.strip() and not res.completion_tokens:
+                    raise MemoryRefusedError("memory extractor model returned empty refusal")
+                return _parse_ops_json(res.content)
+
+            return _routed
+        api_key = (
+            self._env.get("AI_HOUSE_MEMORY_API_KEY")
+            or self._env.get("AI_HOUSE_API_KEY")
+            or ""
+        ).strip()
+        if not api_key:
+            return None
+        base_url = (
+            self._env.get("AI_HOUSE_MEMORY_BASE_URL")
+            or self._env.get("AI_HOUSE_BASE_URL")
+            or "https://api.openai.com"
+        ).strip()
+        model = (
+            self._env.get("AI_HOUSE_MEMORY_MODEL")
+            or self._env.get("AI_HOUSE_MODEL")
+            or "gpt-4o-mini"
+        ).strip()
+        return lambda sys_p, usr_p: _openai_json_extractor(
+            sys_p, usr_p, api_key=api_key, base_url=base_url, model=model
+        )
 
     def __init__(
         self,
@@ -214,6 +354,7 @@ class CommonMemoryStore:
         self._rebuild()
         with self._adapter_conn() as c:
             self._msg_seq = int(c.execute("select coalesce(max(id), 0) from seen").fetchone()[0])
+            self._move_marked_world_rows(c)
 
     # ---- settings ----------------------------------------------------------------------------------------------
 
@@ -310,13 +451,19 @@ class CommonMemoryStore:
         """A recall for the kit's `world` scope (no chat at all: the house's own doings) may see the memories saved
         as `world` and her own diaries, and nothing that belongs to a chat. The shared module has no such place, so
         while such a recall runs (this thread only) its visibility rule is replaced by that narrower one and lines
-        from other chats are left out."""
+        from other chats are left out. The other way round, a recall in a group also sees her `world` memories."""
         visible, recent, note = mod._visible_sql, mod.recent_block, mod._private_note
 
         def _visible_sql(consumer: str, chat: str) -> Tuple[str, List[Any]]:
             if not getattr(self._tl, "world_view", False):
-                return visible(consumer, chat)
-            where = "(id in (select mem_id from kit_origin where scope='world') and (owner=? or scope='public'))"
+                where, params = visible(consumer, chat)
+                if chat.startswith("group:"):
+                    # the house's own doings come to mind in every group, as they always have in the kit (the
+                    # shared module, without unified recall, would only show a group that group's own rows)
+                    world = f"(status='active' and kind!='diary' and chat='{WORLD_CHAT}' and (owner=? or scope='public'))"
+                    return f"(({where}) or {world})", [*params, consumer]
+                return where, params
+            where = f"(chat='{WORLD_CHAT}' and (owner=? or scope='public'))"
             if mod.DIARY_PRIVATE:
                 return f"status='active' and kind!='diary' and {where}", [consumer]
             return f"status='active' and ({where} or (kind='diary' and owner=?))", [consumer, consumer]
@@ -391,8 +538,17 @@ class CommonMemoryStore:
             c.executescript("""
             create table if not exists kit_numbers(key text primary key, num integer not null unique);
             create table if not exists kit_channels(id integer primary key autoincrement, channel text not null unique);
-            create table if not exists kit_origin(mem_id integer primary key, scope text not null);
             """)
+
+    @staticmethod
+    def _move_marked_world_rows(c: sqlite3.Connection) -> None:
+        """A database written while `world` memories still sat among the web group's rows, told apart by a marker
+        table (`kit_origin`): put those rows in their own chat and drop the marker. Done once."""
+        if not c.execute("select 1 from sqlite_master where type='table' and name='kit_origin'").fetchone():
+            return
+        c.execute("update mem set chat=? where chat=? and id in (select mem_id from kit_origin where scope='world')",
+                  (WORLD_CHAT, WEB_GROUP_CHAT))
+        c.execute("drop table kit_origin")
 
     def _numbers(self, keys: Sequence[str]) -> Dict[str, int]:
         """Placeholder number of each housemate, kept in the database so a later housemate never moves an earlier
@@ -483,7 +639,7 @@ class CommonMemoryStore:
             return OWNER_PRIVATE_CHAT
         if scope == "group":
             return self._chat_of_channel(mod, resolved_channel)
-        return WEB_GROUP_CHAT  # world
+        return WORLD_CHAT
 
     # ---- observe -------------------------------------------------------------------------------------------------
 
@@ -664,33 +820,23 @@ class CommonMemoryStore:
                 return int(mod.diary(actor, WEB_GROUP_CHAT, text)), "added"
             chat = self._chat_for(mod, scope, resolved)
             # a `world` memory is hers unless it is saved as shared, as in the old store: another housemate does
-            # not get it (it lives with the web group's rows; `kit_origin` remembers that it is a world one)
+            # not get it
             shared_row = scope in ("group", "world") and bool(shared)
             mid, how = mod.add(actor, chat, text, about=about if about is not None else "", kind=kind,
                                scope="public" if shared_row else "own", source=source, merge=merge,
                                trust=trust, expires_at=expires_at)
-        if scope == "world" and how == "added":
-            with self._adapter_conn() as c:
-                c.execute("insert or replace into kit_origin(mem_id, scope) values (?, 'world')", (int(mid),))
         return int(mid), how
 
-    def _world_ids(self, ids: Sequence[int]) -> set:
-        if not ids:
-            return set()
-        with self._adapter_conn() as c:
-            return {int(r["mem_id"]) for r in c.execute(
-                f"select mem_id from kit_origin where mem_id in ({','.join('?' * len(ids))})", list(ids))}
-
-    def _kit_view(self, row: Mapping[str, Any], world: bool) -> Tuple[str, str]:
+    def _kit_view(self, row: Mapping[str, Any]) -> Tuple[str, str]:
         """(kit scope, kit channel) of a row of the shared module's `mem` table."""
-        if world or row["kind"] == "diary":
+        if row["chat"] == WORLD_CHAT or row["kind"] == "diary":
             return "world", "world"
         if str(row["chat"]).startswith("private:"):
             return "private", f"private:{row['owner']}"
         return "group", self._channel_of_chat(str(row["chat"]), str(row["owner"]))
 
-    def _kit_row(self, row: Mapping[str, Any], world: bool) -> Dict[str, Any]:
-        scope, channel = self._kit_view(row, world)
+    def _kit_row(self, row: Mapping[str, Any]) -> Dict[str, Any]:
+        scope, channel = self._kit_view(row)
         out = {
             "id": int(row["id"]), "owner": "shared" if row["owner"] == "public" else row["owner"], "scope": scope,
             "channel": channel, "about": row["about"], "kind": row["kind"],
@@ -719,7 +865,7 @@ class CommonMemoryStore:
             self._mod._sweep()  # what is past its time is not listed either
         clauses = ["status='active'"]
         params: List[Any] = []
-        origin = "id in (select mem_id from kit_origin where scope='world')"
+        origin = f"chat='{WORLD_CHAT}'"
         if sc == "private":
             act = self._valid_actor(actor or "")
             self._resolve_channel(act, sc, channel)
@@ -749,8 +895,7 @@ class CommonMemoryStore:
         with self._adapter_conn() as c:
             rows = c.execute(f"select * from mem where {' and '.join(clauses)} order by updated desc, id desc limit ?",
                              [*params, cap]).fetchall()
-        world = self._world_ids([int(r["id"]) for r in rows])
-        return [self._kit_row(r, int(r["id"]) in world) for r in rows]
+        return [self._kit_row(r) for r in rows]
 
     def invalidate(
         self,
@@ -782,7 +927,7 @@ class CommonMemoryStore:
             mod.forget(actor, chat, mid)
             with self._adapter_conn() as c:
                 mod._log(c, actor, "invalidate", {"id": mid, "reason": clean_reason})
-        out = self._kit_row(row, kit_scope == "world")
+        out = self._kit_row(row)
         out.update(status="invalidated", invalidated_reason=clean_reason, updated=ts)
         return out
 
@@ -798,7 +943,7 @@ class CommonMemoryStore:
             row = mod._own_row(actor, chat, mid)
         except ValueError:
             raise missing from None
-        kit_scope, _ = self._kit_view(row, bool(self._world_ids([mid])))
+        kit_scope, _ = self._kit_view(row)
         shared_row = row["owner"] == "public"
         if scope == "private" and (shared_row or (rewrite and kit_scope != "private")):
             raise missing
@@ -842,7 +987,7 @@ class CommonMemoryStore:
                     c.execute("update mem set expires_at=? where id=?",
                               (float(expires_at) if expires_at is not None else None, mid))
                 row = c.execute("select * from mem where id=?", (mid,)).fetchone()
-        return self._kit_row(row, kit_scope == "world")
+        return self._kit_row(row)
 
     def sweep_expired(self, now: Optional[float] = None) -> int:
         """Take what is past its time out now (reads do it by themselves). -> how many."""
@@ -887,12 +1032,11 @@ class CommonMemoryStore:
                                   min_score=mod.RECALL_MIN if min_score is None else float(min_score))
         finally:
             self._tl.world_view = False
-        world = self._world_ids([int(r["id"]) for _, r in hits])
         out = []
         for score, r in hits:
             if not include_private and scope != "private" and r["scope"] == "private":
                 continue
-            out.append((float(score), self._kit_row(r, int(r["id"]) in world)))
+            out.append((float(score), self._kit_row(r)))
         return out
 
     forget = invalidate
@@ -934,9 +1078,9 @@ class CommonMemoryStore:
                 return False
             if sc == "private" and not r["private"]:
                 return False
-            if sc == "group" and not r["chat"].startswith("group:"):
+            if sc == "group" and (not r["chat"].startswith("group:") or r["chat"] == WORLD_CHAT):
                 return False
-            if sc == "world" and r["chat"] != WEB_GROUP_CHAT:
+            if sc == "world" and r["chat"] != WORLD_CHAT:
                 return False
             return want_chat is None or r["chat"] == want_chat
 

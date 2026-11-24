@@ -187,8 +187,19 @@ DIARY_SECRETS = re.compile(r"(密码|口令|验证码|token|api[ _-]?key|secret[
 
 # ---- storage --------------------------------------------------------------------
 
+class _Conn(sqlite3.Connection):
+    """`with db() as c:` commits or rolls back as sqlite3 does, and then closes. sqlite3's own `with` leaves the
+    connection open, and one is made per call: they were left for the garbage collector to close."""
+
+    def __exit__(self, *exc):
+        try:
+            return super().__exit__(*exc)
+        finally:
+            self.close()
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=10, factory=_Conn)
     conn.row_factory = sqlite3.Row
     conn.execute("pragma journal_mode=wal")
     conn.execute("pragma busy_timeout=10000")
