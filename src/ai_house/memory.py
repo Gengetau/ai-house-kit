@@ -496,6 +496,12 @@ PRIVATE_IN_GROUP_NOTE_FREE = (
     "不必为了显得记得而硬提，别人问到不该多说的，你自己掂量。）"
 )
 FALLBACK_RECENT_PRIVATE = 3  # 「我之前告诉你的那件事」: no content word to match on, so the latest private notes
+# 「我私下跟你说的那个打算」: the question itself says it was told in private, whatever other words ride along
+_PRIVATE_TALK_REF_RE = re.compile(
+    r"私下|私聊|私信|悄悄|偷偷|单独(?:跟|和|对|同)你|只(?:跟|和|对|同)你(?:一个人)?说"
+    r"|(?:之前|以前|上次|上回|刚才|刚刚|早上|昨天|前几天|那天)[^，。！？?\n]{0,6}(?:跟|和|对|同|给)你(?:说|讲|提)"
+    r"|(?:跟|和|对|同)你(?:说|讲|提)过|告诉过你"
+)
 
 
 def _is_memory_probe(text: str) -> bool:
@@ -1833,8 +1839,9 @@ class MemoryStore:
 
         The private-only helpers in such a group: the pending private lines are matched to the question like
         memories are; the "latest few private notes" fallback for a bare "do you remember what I told you" applies
-        as in a private chat; and "you do not remember" is given only when nothing at all came up, so the prompt
-        never says both.
+        as in a private chat, and also when the question says it was told in private (「我私下跟你说的那个打算」)
+        even though other words in it match nothing; and "you do not remember" is given only when nothing at all
+        came up, so the prompt never says both.
         """
         ts = self._now(now)
         open_here = scope == "group" and self.private_readable_in(channel)
@@ -1843,10 +1850,14 @@ class MemoryStore:
             pending = self._pending_private(actor, text, ts)
             if pending:
                 hits = [*hits, *pending]
-        if not hits and _is_memory_probe(text) and not self._has_content_words(text, actor):
+        if not hits and _is_memory_probe(text):
+            bare = not self._has_content_words(text, actor)
             if scope == "private":
-                hits = self._recent_private(actor, channel, ts)
-            elif open_here:
+                if bare:
+                    hits = self._recent_private(actor, channel, ts)
+            elif open_here and (bare or _PRIVATE_TALK_REF_RE.search(_STRIP_SPEAKER_RE.sub("", str(text or "")))):
+                # "这里都是自己人……在这儿说没关系" carries content words that match nothing; what she asks for is
+                # still "the thing I told you in private", so the newest few are the only honest answer to give
                 hits = [*self._recent_private(actor, "", ts), *self._pending_private(actor, text, ts, latest=True)]
         if not hits:
             # Silence here lets the model fill the gap with a guess ("你对坚果过敏，我记得的"); say it outright.
