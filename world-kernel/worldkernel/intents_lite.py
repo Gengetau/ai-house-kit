@@ -488,6 +488,85 @@ def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[f
     return None, None
 
 
+# --- looking back at a promise that is not a purchase ---------------------------------------------------------
+# What a promise is about is told by the content words that the owner's sentence and the stored promise have in
+# common. The curated words of the plan classifiers above are the vocabulary; words that only say "a plan / together"
+# are left out, because they are in almost every promise and would match any chat.
+_GENERIC_PLAN_WORDS = frozenset({"出门", "陪我去", "陪我出", "陪我逛", "一起", "约好", "约了", "早点睡", "去睡"})
+_PROMISE_TOPIC_WORDS = tuple(sorted(
+    {
+        w
+        for w in (
+            *_OUTING_WORDS, *_TOGETHER_WORDS, *_DISH_WORDS, *_COOK_COMMIT_WORDS, *_CHAT_PLAN_KEYWORDS,
+            *(w for words, _acts in _TOGETHER_ACTIVITY_HINTS for w in words),
+            *(w for words, _places in _OUTING_DEST_MAP for w in words),
+        )
+        if w not in _GENERIC_PLAN_WORDS
+    },
+    key=lambda w: (-len(w), w),
+))
+# Words that carry no topic of their own (who, when, "did it happen", question particles). They are removed before the
+# sentence is cut into two-character pieces, so 「昨天说好的逛街，后来去了吗」 is left with 「逛街」 only.
+_NON_TOPIC_RE = re.compile(
+    r"和房主聊到|房主|聊到|昨天|昨晚|前天|今天|明天|后天|今晚|明早|明晚|早上|上午|中午|下午(?!茶)|晚上|傍晚|周末|"
+    r"周[一二三四五六日天]|星期[一二三四五六日天]|说好的?|约好的?|约定|答应过?|承诺|说过|后来|之后|然后|最后|"
+    r"刚才|刚刚|上次|之前|一起|陪我|陪你|我们|你们|咱们|自己|可以|一下|怎么样|怎么|什么|为什么|没有|有没有|"
+    r"记得|记不记得|还记|事情|的事|这个|那个|这件|那件|这次|那次|去了|去过|去没|没去|了吗|了没|过吗|是不是|"
+    r"还是|好玩|开心|[吗呢啊吧呀哦嘛啦了的去来在是有要想你我他她也都就还和跟把被给让对很太不]"
+)
+_PROMISE_ASK_RE = re.compile(r"说好|约好|答应|约定|约了|承诺|说过")
+_WEEKDAYS = "一二三四五六日"
+_REL_DAY_NAMES = {-2: "前天", -1: "昨天", 0: "今天", 1: "明天", 2: "后天"}
+_RELATIVE_WORD_RE = re.compile(r"今天|明天|后天|今晚|明早|明晚|今早|明晨|等会|待会|一会儿|周末")
+
+
+def _topic_grams(text: str, names: Iterable[str] = ()) -> set:
+    body = str(text or "")
+    for nm in sorted({str(n) for n in names if len(str(n)) >= 2}, key=len, reverse=True):
+        body = body.replace(nm, " ")
+    body = _NON_TOPIC_RE.sub(" ", body)
+    grams: set = set()
+    for run in re.findall(r"[一-鿿A-Za-z0-9]{2,}", body):
+        grams.update(run[i:i + 2] for i in range(len(run) - 1))
+    return grams
+
+
+def _promise_topic_overlap(owner_text: str, summary: str, names: Iterable[str] = ()) -> bool:
+    if any(w in owner_text and w in summary for w in _PROMISE_TOPIC_WORDS):
+        return True
+    return bool(_topic_grams(owner_text, names) & _topic_grams(summary, names))
+
+
+def _part_of_day(start: float, end: float) -> str:
+    """The part of the day (上午/中午/下午/晚上) a due window mostly lies in; "" for a window of most of the day."""
+    s, e = dt.datetime.fromtimestamp(start, JST), dt.datetime.fromtimestamp(end, JST)
+    if e - s > dt.timedelta(hours=8) or s.date() != e.date():
+        return ""
+    best, best_len = "", 0.0
+    for name, (sh, sm), (eh, em) in _DAY_PARTS:
+        a = max(start, dt.datetime.combine(s.date(), dt.time(sh, sm), JST).timestamp())
+        b = min(end, dt.datetime.combine(s.date(), dt.time(eh, em), JST).timestamp())
+        if b - a > best_len:
+            best, best_len = name, b - a
+    return best
+
+
+def _day_label(ts: float) -> str:
+    d = dt.datetime.fromtimestamp(ts, JST)
+    return f"{d.month}月{d.day}日（周{_WEEKDAYS[d.weekday()]}）"
+
+
+def _when_phrase(start: float, end: float, now: float) -> str:
+    """「11月22日（周日）上午，也就是昨天上午」: the absolute day first, the relative word only as a help."""
+    sd, ed = dt.datetime.fromtimestamp(start, JST).date(), dt.datetime.fromtimestamp(end, JST).date()
+    if sd != ed:
+        return f"{_day_label(start)}到{_day_label(end)}"
+    part = _part_of_day(start, end)
+    out = _day_label(start) + part
+    rel = _REL_DAY_NAMES.get((sd - dt.datetime.fromtimestamp(now, JST).date()).days)
+    return f"{out}，也就是{rel}{part}" if rel else out
+
+
 class CommitmentStore:
     """Persistent commitment/memo ledger backed by `world.db` (`house_intents` + `intent_evidence`)."""
 
@@ -925,7 +1004,8 @@ class CommitmentStore:
         ingredients = getattr(self.vocab, "INGREDIENTS", None) or {}
         now_f = float(now)
         seen: set = set()
-        for r in self.list_intents(actor=actor, limit=40):
+        rows = self.list_intents(actor=actor, limit=40)
+        for r in rows:
             if r["kind"] != "errand" or not (r.get("item") or r.get("raw_item")):
                 continue
             state = str(r["state"])
@@ -962,7 +1042,84 @@ class CommitmentStore:
                 )
             else:
                 hints.append(f"你之前答应过帮房主买{label}，还没有买回来，还在办。")
+        hints.extend(self._promise_hints(rows, text, now_f, window_s))
         return hints[:4]
+
+    def _promise_hints(self, rows: Sequence[Mapping[str, Any]], text: str, now: float, window_s: float) -> List[str]:
+        """What she must know about her own recent promises that are not purchases (outings, doing something together,
+        cooking, other chat promises) when the owner asks after them: that she agreed, what for, when, and how it went.
+
+        A promise is brought up when the owner's sentence shares a content word with it (「逛街」「公园」「下午茶」
+        「咖喱」...). A sentence that only asks after "what we agreed" (「昨天说好的事后来怎么样了」: a word of promising and
+        nothing else to go by) brings up the latest two. Anything else brings up nothing.
+        """
+        names = [str(v) for v in (getattr(self.vocab, "NAMES", None) or {}).values()] if self.vocab else []
+        recent: List[Tuple[Mapping[str, Any], str, str]] = []
+        for r in rows:
+            if r["kind"] in ("errand", "memo"):
+                continue
+            state = str(r["state"])
+            if state == "open" and float(r.get("expires_at") or 0) <= now:
+                state = "expired"
+            if state == "expired":
+                ended = float(r.get("expires_at") or 0)
+            elif state == "completed":
+                ended = float(r.get("completed_at") or r.get("updated_at") or 0)
+            elif state == "open":
+                ended = now
+            else:
+                continue
+            if now - ended > window_s:
+                continue
+            summary = re.sub(r"^和房主聊到[：:]\s*", "", str(r.get("summary") or "")).strip()
+            if summary:
+                recent.append((r, state, summary))
+        picked = [x for x in recent if _promise_topic_overlap(text, x[2], names)]
+        if (
+            not picked
+            and _PROMISE_ASK_RE.search(text)
+            and not _topic_grams(text, names)
+            and not any(w in text for w in _PROMISE_TOPIC_WORDS)
+        ):
+            picked = recent
+        out: List[str] = []
+        seen: set = set()
+        for r, state, summary in picked:
+            if summary in seen:
+                continue
+            seen.add(summary)
+            out.append(self._promise_hint(r, state, summary, now))
+            if len(out) >= 2:
+                break
+        return out
+
+    @staticmethod
+    def _promise_hint(r: Mapping[str, Any], state: str, summary: str, now: float) -> str:
+        outing = r["kind"] == "outing"
+        due_from, due_to = r.get("due_from"), r.get("due_to")
+        if due_from and due_to:
+            when = f"约在{_when_phrase(float(due_from), float(due_to), now)}"
+        else:
+            when = f"{_day_label(float(r.get('created_at') or now))}说定的，没写具体时间"
+        short = summary if len(summary) <= 40 else summary[:40] + "…"
+        note = ""
+        if _RELATIVE_WORD_RE.search(summary):
+            note = "（「」里的「明天」「今晚」「周末」之类是约定那天说的，现在已不是那一天，以这里写的日期为准。）"
+        head = f"你答应过房主「{short}」（{when}）"
+        if state == "completed":
+            done = float(r.get("completed_at") or r.get("updated_at") or now)
+            done_s = f"{_day_label(done)} {dt.datetime.fromtimestamp(done, JST).strftime('%H:%M')}"
+            verb = "去过了" if outing else "办成了"
+            return f"{head}，这件事已经{verb}（{done_s}完成）。她问起时照实说已经{verb}。{note}"
+        if state == "expired":
+            return (
+                f"{head}，这个时间已经过了，没有{'成行' if outing else '办成'}的记录。"
+                f"她问起时照实说答应过但{'没去成' if outing else '没办成'}，不要说不记得，"
+                f"也不要编{'去了' if outing else '办成了'}。{note}"
+            )
+        if due_from and float(due_from) > now:
+            return f"{head}，还没到时间，还在等。她问起时照实说还没到时间，不要说已经办了。{note}"
+        return f"{head}，约好的时间已经到了，目前还没有办成的记录。她问起时照实说，不要编已经办了。{note}"
 
     def _detect_errand_item(self, text: str) -> Tuple[Optional[str], int]:
         text = _live_buy_text(text)

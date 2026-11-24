@@ -46,6 +46,19 @@ _SENTENCE_END = "。！？!?…"
 _OPEN_TAIL_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9，,、；;：:]$")  # a reply ending like this stopped mid-sentence
 _PERIODS = ((5, 0, "早上"), (10, 0, "上午"), (11, 30, "中午"), (14, 0, "下午"), (17, 0, "傍晚"), (19, 0, "晚上"))
 _FACT_CLOCK_RE = re.compile(r"^(\d{2}):(\d{2})(?=\s)")
+# A model may head the diary like a document: 「**奈尔的睡前日记** 今天…」, 「# 奈尔的日记」, 「【奈尔的日记】」, a line of
+# 「11月21日 日记」. The text is stored under its own 「YYYY-MM-DD 日记：」 prefix, so the title only gets in the way.
+_TITLE_PUNCT = "。！？!?，,；;、"
+_DIARY_DATE = (
+    r"(?:(?:\d{4}[-年./]\d{1,2}[-月./]\d{1,2}日?|\d{1,2}月\d{1,2}日)[ \t]*(?:[（(](?:周|星期)[一二三四五六日天][）)])?[ \t]*)"
+)
+_BOLD_TITLE_RE = re.compile(r"^\s*(\*\*|__)([^\n*_]{1,30}?)\1")
+_BRACKET_TITLE_RE = re.compile(r"^\s*【[^】\n]{0,30}日记[^】\n]{0,10}】[ \t]*[：:]?\s*")
+_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+([^\n]*)(?:\n|$)")
+_TITLE_LINE_RE = re.compile(
+    rf"^[ \t]*{_DIARY_DATE}?[^\n{_TITLE_PUNCT}]{{0,12}}日记[ \t]*[：:]?[ \t]*(?:\n|$)"
+)
+_BOLD_PAIR_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
 
 DIARY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS house_diaries (
@@ -78,13 +91,40 @@ def label_fact_clock(fact: str) -> str:
     return f"{m.group(1)}:{m.group(2)}（{period_of_day(int(m.group(1)), int(m.group(2)))}）" + fact[m.end():]
 
 
+def _drop_diary_title(text: str) -> str:
+    """The head of the reply without a title line / bold title; the text itself when there is no such head."""
+    for _ in range(3):  # a title, then maybe a date line under it
+        m = _BOLD_TITLE_RE.match(text)
+        after = text[m.end():] if m else ""
+        if m and ("日记" in m.group(2) or not after.split("\n", 1)[0].strip(" \t：:")):
+            rest = after.lstrip(" \t").lstrip("：:")
+        elif (m := _BRACKET_TITLE_RE.match(text)):
+            rest = text[m.end():]
+        elif (m := _HEADING_RE.match(text)):
+            if "\n" in text:
+                rest = text[m.end():]
+            else:  # a one-line reply 「# 奈尔的日记 今天…」: the heading mark and the title word go
+                title = re.match(rf"([^\s{_TITLE_PUNCT}]{{1,20}}日记[^\s{_TITLE_PUNCT}]{{0,4}})\s+", m.group(1))
+                rest = m.group(1)[title.end():] if title else m.group(1)
+        elif (m := _TITLE_LINE_RE.match(text)):
+            rest = text[m.end():]
+        else:
+            break
+        text = rest.lstrip()
+    return text
+
+
 def finish_diary_text(raw: str, limit: int = DIARY_MAX_CHARS) -> str:
     """Control chars removed; over `limit`, or ending mid-sentence, it is cut back to the last finished sentence.
 
+    A title at the head (「**奈尔的睡前日记**」, 「# …」, 「【…日记】」, a line 「11月21日 日记」) and paired `**` bold marks
+    go first, so that neither is counted against the limit nor survives into the stored text.
     A reply with no finished sentence to fall back to (or one that would shrink below `_MIN_KEEP_CHARS`) is kept as it is
     (hard-cut at `limit` only when over it, at the last comma if there is one), rather than emptied.
     """
     text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]+", " ", str(raw or "")).strip()
+    untitled = _BOLD_PAIR_RE.sub(r"\1", _drop_diary_title(text)).strip()
+    text = untitled or _BOLD_PAIR_RE.sub(r"\1", text).strip() or text  # a reply that is only a title stays
     over = len(text) > limit
     if over:
         text = text[:limit]
