@@ -150,6 +150,7 @@ _PREV_CLAUSE_MARKER_RE = re.compile(r"路过|顺路|顺便|顺带|麻烦|拜托|
 _OUTING_DEST_MAP = (
     (("超市", "杂货", "买菜"), ("supermarket", "shop", "grocery", "market", "shotengai", "超市", "商店街")),
     (("商店街",), ("shotengai", "商店街")),
+    (("逛街", "街上", "买衣服", "商场"), ("shotengai", "商店街", "terrace", "yokohama", "mall", "商场", "百货")),
     (("公园", "绿地"), ("park", "公园", "绿地")),
     (("河岸", "星川"), ("riverside", "河岸", "星川")),
     (("图书馆",), ("library", "图书馆")),
@@ -183,6 +184,12 @@ def _is_home_place(place: Any) -> bool:
     return p in _HOME_PLACES or p.startswith("room_")
 
 
+def _routine_grocery_run(ev: Mapping[str, Any]) -> bool:
+    """The household's own food shopping: a `shopping-plan-…` trip, or any stop at the supermarket."""
+    place = str(ev.get("place") or "").strip().lower()
+    return str(ev.get("plan_id") or "").startswith("shopping-plan") or "supermarket" in place or "超市" in place
+
+
 def _plan_place_fits_outing(ev: Mapping[str, Any], summary: str) -> bool:
     """A finished plan can only be the outing when it happened away from home, at the named place if one was named.
 
@@ -197,7 +204,7 @@ def _plan_place_fits_outing(ev: Mapping[str, Any], summary: str) -> bool:
     for sum_toks, ev_toks in _OUTING_DEST_MAP:
         if any(st in summary for st in sum_toks):
             return any(et in place for et in ev_toks)
-    return True
+    return not _routine_grocery_run(ev)  # no place was named: anywhere out counts, the food shopping does not
 
 
 def _plan_activity_fits_together(ev: Mapping[str, Any], summary: str, ev_rows: Sequence[Tuple[str, str]]) -> bool:
@@ -853,6 +860,9 @@ class CommitmentStore:
                     ev_pref = str(ev.get("plan_ref") or "")
                     dest_ok = True
                     if ev_ref != iid and not (plan_ref and ev_pref == plan_ref):
+                        # No place named: anywhere out counts, except the household's own food shopping (a promise
+                        # to go out with the owner was once closed by the resident's grocery run that morning).
+                        dest_ok = not _routine_grocery_run(ev)
                         for sum_toks, ev_toks in _OUTING_DEST_MAP:
                             if any(st in summary for st in sum_toks):
                                 dest_ok = any(et in ev_desc for et in ev_toks)

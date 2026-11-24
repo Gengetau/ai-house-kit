@@ -45,6 +45,69 @@ def _non_errand(hints):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# 0. the rerun with the fixes: the outing promise was closed by her own grocery run that morning
+# ---------------------------------------------------------------------------------------------------------------
+class GroceryRunDoesNotCloseAnOutingPromise(_StoreCase):
+    # the event that closed 「明天上午陪房主去逛街买衣服」 in the field, 09:43 on Sunday
+    ARRIVED = {"kind": "arrived", "actor": "mina", "plan_id": "shopping-plan-ddcda32dc430",
+               "action_id": "act-94fb639165a6", "place": "place:supermarket"}
+
+    def state(self, actor: str = "mina"):
+        return [(r["kind"], r["state"]) for r in self.rows(actor)]
+
+    def test_the_real_case_stays_open_then_expires_and_is_told_as_not_gone(self) -> None:
+        self.say("mina", OUTING_SAID, "好呀，陪你逛街没问题", now=SAT_1730)
+        self.evidence(dict(self.ARRIVED, at=_at(22, 9, 43)))
+        self.evidence({"kind": "plan_finished", "actor": "mina", "plan_id": "shopping-plan-ddcda32dc430",
+                       "place": "place:supermarket", "outcome": "done", "members": ["mina"], "at": _at(22, 10, 8)})
+        self.store.sweep(_at(22, 10, 30))
+        self.assertEqual(self.state(), [("outing", "open")])
+        self.store.sweep(SUN_1300)
+        self.assertEqual(self.state(), [("outing", "expired")])
+        h = self.store.reply_hints("mina", ASK_BACK, SUN_1730)[0]
+        self.assertIn("没去成", h)
+        self.assertNotIn("去过了", h)
+
+    def test_a_shopping_street_closes_it_and_other_places_do_not(self) -> None:
+        for place, closes in (("place:shotengai", True), ("place:park", False), ("place:library", False),
+                              ("place:konbini", False)):
+            with self.subTest(place=place):
+                self.setUp()
+                self.say("mina", OUTING_SAID, "好呀，陪你逛街没问题", now=SAT_1730)
+                self.evidence({"kind": "arrived", "actor": "mina", "plan_id": "outing-1", "place": place,
+                               "at": _at(22, 9, 43)})
+                self.store.sweep(_at(22, 10, 30))
+                self.assertEqual(self.state(), [("outing", "completed" if closes else "open")])
+
+    def test_an_outing_with_no_place_named_still_closes_anywhere_but_the_grocery_run(self) -> None:
+        said, reply = "婉妲，明天上午陪我出去走走好吗？", "好呀，陪你出去走走！"
+        for ev, closes in (
+            ({"kind": "arrived", "actor": "wanda", "plan_id": "outing-2", "place": "place:park"}, True),
+            ({"kind": "arrived", "actor": "wanda", "plan_id": "shopping-plan-9", "place": "place:supermarket"}, False),
+            ({"kind": "arrived", "actor": "wanda", "plan_id": "shopping-plan-9", "place": "place:shotengai"}, False),
+            ({"kind": "plan_finished", "actor": "wanda", "plan_id": "shopping-plan-9", "place": "place:supermarket",
+              "outcome": "done", "members": ["wanda"]}, False),
+            ({"kind": "plan_finished", "actor": "wanda", "plan_id": "outing-2", "place": "place:riverside",
+              "outcome": "done", "members": ["wanda"]}, True),
+        ):
+            with self.subTest(ev=ev):
+                self.setUp()
+                self.say("wanda", said, reply, now=SAT_1730)
+                self.assertEqual(self.state("wanda"), [("outing", "open")])
+                self.evidence(dict(ev, at=_at(22, 9, 43)))
+                self.store.sweep(_at(22, 10, 30))
+                self.assertEqual(self.state("wanda"), [("outing", "completed" if closes else "open")])
+
+    def test_a_promise_to_go_to_the_supermarket_is_still_closed_by_going_there(self) -> None:
+        self.say("wanda", "婉妲，明天上午陪我去超市逛逛好吗？", "好呀，一起去超市！", now=SAT_1730)
+        self.assertEqual(self.state("wanda"), [("outing", "open")])
+        self.evidence({"kind": "arrived", "actor": "wanda", "plan_id": "shopping-plan-9", "place": "place:supermarket",
+                       "at": _at(22, 9, 43)})
+        self.store.sweep(_at(22, 10, 30))
+        self.assertEqual(self.state("wanda"), [("outing", "completed")])
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # 1. she can answer about her own non-purchase promises
 # ---------------------------------------------------------------------------------------------------------------
 class PromiseHintsForOutingsAndTogether(_StoreCase):
