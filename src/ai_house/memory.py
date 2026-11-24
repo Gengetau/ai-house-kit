@@ -1127,7 +1127,11 @@ class MemoryStore:
         group channel id listed there, spelled exactly as the house spells it (`group`, `qq-group:<id>`; an empty id
         means the web `group`, as in recall). The outbound leak checks are skipped there and the note shown with
         private memories says they may be mentioned. Independent of `private_readable_in`."""
-        ch = self._clean_channel(channel) or "group"
+        raw = str(channel or "").strip()
+        if raw != self._clean_channel(raw):
+            # never clean a malformed id into a listed one ("qq-group:1 23" is not "qq-group:123")
+            return False
+        ch = raw or "group"
         if ch.lower().startswith("private"):
             return False
         return ch in self.leak_free_groups
@@ -1734,7 +1738,10 @@ class MemoryStore:
             day = dt.datetime.fromtimestamp(float(row["updated"] or 0), JST).strftime("%m-%d")
             return f"[私密·刚说的] {row['text']}（记于 {day}）"
         line = self._format_row_core(row)
-        return f"[私密·{line[1:]}" if from_private_chat else line
+        if not from_private_chat:
+            return line
+        head, sep, rest = line[1:].partition("]")
+        return f"[私密·{head.replace('·私密', '', 1)}{sep}{rest}"
 
     def _format_row_core(self, row: Mapping[str, Any]) -> str:
         kind = str(row["kind"])

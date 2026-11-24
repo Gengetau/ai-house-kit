@@ -151,6 +151,42 @@ class ConfigParsing(_Base):
         self.assertFalse(st.leak_free_in(group_channel_of("some_other_channel", "50001", is_webchat=False)))
 
 
+class MalformedChannelIsNeverCleanedIntoAListedOne(_Base):
+    def test_an_id_with_junk_inside_is_not_the_listed_group(self) -> None:
+        st = self.make("group,qq-group:123")
+        for ch in ("qq-group:1 23", "qq-group:12\t3", "qq-group:123\x00", "gro up", "qq-group:123;", "QQ-GROUP:123",
+                   "qq-group:0123", "qq-group:", "x" * 80):
+            with self.subTest(channel=ch):
+                self.assertFalse(st.leak_free_in(ch))
+        # surrounding blanks are only padding; the empty id is the web group, as in recall
+        for ch in ("group", " group ", "group\n", "", "qq-group:123", " qq-group:123 "):
+            with self.subTest(channel=ch):
+                self.assertTrue(st.leak_free_in(ch))
+
+    def test_the_outbound_check_still_runs_for_such_an_id(self) -> None:
+        st = self.make("group,qq-group:123")
+        self.seed(st)
+        said = "房主打算下个月辞职去开一家咖啡店"
+        self.assertEqual(st.check_outbound_leak("nell", "group", said, channel="qq-group:123", now=DAY2), [])
+        for ch in ("qq-group:1 23", "QQ-GROUP:123"):
+            with self.subTest(channel=ch):
+                try:
+                    hit = st.check_outbound_leak("nell", "group", said, channel=ch, now=DAY2)
+                except ValueError:
+                    continue  # refused outright is as good as caught
+                self.assertTrue(hit)
+
+
+class PrivateRowsCarryOneMarkNotTwo(_Base):
+    def test_the_label_is_not_doubled(self) -> None:
+        st = self.make("group")
+        self.seed(st)
+        got = st.recall("nell", "group", ASK_PLAN, channel="group", now=DAY2)
+        self.assertIn("[私密·", got)
+        line = next(x for x in got.splitlines() if "咖啡店" in x)
+        self.assertEqual(line.count("私密"), 1, line)
+
+
 class CliValidationAndTemplate(unittest.TestCase):
     def _up(self, value: str) -> tuple:
         tmp = tempfile.TemporaryDirectory()
@@ -179,6 +215,23 @@ class CliValidationAndTemplate(unittest.TestCase):
                 rc, err, daemon_cls = self._up(good)
                 daemon_cls.assert_called_once()  # got past the check and tried to build the daemon
                 self.assertNotIn(ENV, err)
+
+    def test_up_refuses_a_switch_one_value_that_would_silently_mean_off(self) -> None:
+        # only "1" turns it on: "true" would be read as off and the maintainer would believe it is on
+        for bad in ("true", "on", "yes", "2"):
+            with self.subTest(value=bad):
+                rc, err, daemon_cls = self._up(f"\n{READ}={bad}")
+                self.assertEqual(rc, 2)
+                self.assertIn(READ, err)
+                daemon_cls.assert_not_called()
+        for good in ("1", "0", ""):
+            with self.subTest(value=good):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(READ, None)
+                    rc, err, daemon_cls = self._up(f"\n{READ}={good}")
+                    os.environ.pop(READ, None)
+                daemon_cls.assert_called_once()
+                self.assertNotIn(READ, err)
 
     def test_doctor_reports_the_same_problem(self) -> None:
         tmp = tempfile.TemporaryDirectory()

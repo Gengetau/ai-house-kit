@@ -24,7 +24,7 @@ from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import openai_compatible_chat
 from .daemon import JST, DaemonLockError, HouseDaemon, make_http_server
 from .llm import explain_llm_error
-from .memory import LEAK_FREE_GROUPS_ENV, parse_leak_free_groups
+from .memory import LEAK_FREE_GROUPS_ENV, PRIVATE_IN_GROUPS_ENV, parse_leak_free_groups
 from .plugin_api import PluginRegistry
 
 
@@ -81,10 +81,21 @@ def _leak_free_groups_problem(raw: str) -> str:
     )
 
 
+def _private_in_groups_problem(raw: str) -> str:
+    """Why `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS` cannot be used, or `''`. Only `1` turns it on; `true`/`on` would be read
+    as off without a word, and the maintainer would believe it is on."""
+    val = str(raw or "").strip()
+    if val in ("", "0", "1"):
+        return ""
+    return f"{PRIVATE_IN_GROUPS_ENV} 只能写 1（开）或 0（关），现在写的是 {val[:20]!r}"
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     _load_dotenv(args.env_file)
     # a half-open privacy setting is worse than none: refuse to start rather than guess which entries were meant
-    problem = _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, ""))
+    problem = _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, "")) or _private_in_groups_problem(
+        os.environ.get(PRIVATE_IN_GROUPS_ENV, "")
+    )
     if problem:
         print(f"[ai-house] 配置有问题，没有启动：{problem}", file=sys.stderr, flush=True)
         return 2
@@ -382,6 +393,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "name": "leak_free_groups",
             "ok": not pm_problem,
             "detail": pm_problem or f"这些群发送前不查私聊内容：{'、'.join(pm_ok)}",
+        })
+
+    pig_raw = eff_env.get(PRIVATE_IN_GROUPS_ENV, "").strip()
+    if pig_raw:
+        pig_problem = _private_in_groups_problem(pig_raw)
+        checks.append({
+            "name": "private_in_groups",
+            "ok": not pig_problem,
+            "detail": pig_problem or ("住客在群里想得起房主私聊里说的事" if pig_raw == "1" else "私聊记忆不进群"),
         })
 
     try:
