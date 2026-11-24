@@ -240,6 +240,37 @@ class SurfaceTests(Base):
             self.assertIn(n, live["detail"])
         self.assertNotIn(FAKE_KEY, live["detail"])
 
+    def test_error_body_wrapped_in_a_list_is_explained(self) -> None:
+        # Gemini's OpenAI-compatible endpoint answers a bad model name with HTTP 400 and a JSON *list* body.
+        body = [{"error": {"code": 400, "message": "* GenerateContentRequest.model: unexpected model name format\n", "status": "INVALID_ARGUMENT"}}]
+        d = self.daemon(virtual_clock=True)
+        stub = self.stub(400, body)  # type: ignore[arg-type]
+        res = d.test_llm_settings({"base_url": stub.base_url, "model": "Bad-Name", "api_key": FAKE_KEY})
+        self.assertFalse(res["ok"])
+        for n in ("模型名不存在", "AI_HOUSE_MODEL", "HTTP 400", "unexpected model name format", "status=INVALID_ARGUMENT"):
+            self.assertIn(n, res["error"])
+        self.assertNotIn("AttributeError", res["error"])
+
+        env = {"AI_HOUSE_WORLD_PACK": "life1", "AI_HOUSE_BASE_URL": stub.base_url, "AI_HOUSE_API_KEY": FAKE_KEY, "AI_HOUSE_MODEL": "Bad-Name"}
+        buf = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=False), contextlib.redirect_stdout(buf):
+            rc = cli.main(["doctor", "--data-dir", self.tmpdir(), "--live-ping", "--json"])
+        self.assertEqual(rc, 1)
+        live = next(c for c in json.loads(buf.getvalue())["checks"] if c["name"] == "llm_live_ping")
+        self.assertIn("模型名不存在", live["detail"])
+        self.assertNotIn("AttributeError", live["detail"])
+
+    def test_odd_error_bodies_never_raise(self) -> None:
+        d = self.daemon(virtual_clock=True)
+        for body in ([], [1, 2], "plain string", 7, None, [{"message": "nope"}], {"error": ["x"]}):
+            with self.subTest(body=body):
+                stub = self.stub(400, body)  # type: ignore[arg-type]
+                res = d.test_llm_settings({"base_url": stub.base_url, "model": "m", "api_key": FAKE_KEY})
+                self.assertFalse(res["ok"])
+                self.assertIn("HTTP 400", res["error"])
+                for bad in ("AttributeError", "TypeError", "Traceback"):
+                    self.assertNotIn(bad, res["error"])
+
     def test_chat_fallback_note_is_short_chinese_only(self) -> None:
         stub = self.stub(401, _err_doc(f"Incorrect API key provided: {FAKE_KEY}", "invalid_api_key"))
         d = self.daemon(

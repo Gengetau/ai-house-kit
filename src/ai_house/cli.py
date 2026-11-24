@@ -24,6 +24,7 @@ from .builtin_plugins.onebot_ws import ChannelConfigError
 from .chat_agent import openai_compatible_chat
 from .daemon import JST, DaemonLockError, HouseDaemon, make_http_server
 from .llm import explain_llm_error
+from .memory import LEAK_FREE_GROUPS_ENV, PRIVATE_IN_GROUPS_ENV, parse_leak_free_groups
 from .plugin_api import PluginRegistry
 
 
@@ -68,8 +69,36 @@ def _load_dotenv(path: str = ".env") -> None:
             os.environ[k] = v
 
 
+def _leak_free_groups_problem(raw: str) -> str:
+    """Why `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` cannot be used, or `''` when it is empty or well formed."""
+    _ok, bad = parse_leak_free_groups(raw)
+    if not bad:
+        return ""
+    shown = "、".join(repr(x) for x in bad[:5])
+    return (
+        f"{LEAK_FREE_GROUPS_ENV} 里有写法不对的项：{shown}。"
+        "只能写 group（小屋网页里的群）或 qq-group:<纯数字群号>，多个用逗号分隔；私聊（private…）不能放进来"
+    )
+
+
+def _private_in_groups_problem(raw: str) -> str:
+    """Why `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS` cannot be used, or `''`. Only `1` turns it on; `true`/`on` would be read
+    as off without a word, and the maintainer would believe it is on."""
+    val = str(raw or "").strip()
+    if val in ("", "0", "1"):
+        return ""
+    return f"{PRIVATE_IN_GROUPS_ENV} 只能写 1（开）或 0（关），现在写的是 {val[:20]!r}"
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     _load_dotenv(args.env_file)
+    # a half-open privacy setting is worse than none: refuse to start rather than guess which entries were meant
+    problem = _leak_free_groups_problem(os.environ.get(LEAK_FREE_GROUPS_ENV, "")) or _private_in_groups_problem(
+        os.environ.get(PRIVATE_IN_GROUPS_ENV, "")
+    )
+    if problem:
+        print(f"[ai-house] 配置有问题，没有启动：{problem}", file=sys.stderr, flush=True)
+        return 2
     host = args.host or os.environ.get("AI_HOUSE_HOST") or "127.0.0.1"
     port = args.port if args.port is not None else int(os.environ.get("AI_HOUSE_PORT") or "8780")
     data_dir = args.data_dir or os.environ.get("AI_HOUSE_DATA_DIR") or "./runtime"
@@ -114,7 +143,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     listen_note = f"（监听 {host}:{port}，若在容器内请访问宿主机映射端口）" if display_host != host else ""
     mode_label = (
-        f"真实大模型 ({daemon.chat_agent.model})"
+        f"真实大模型 ({daemon.chat_agent.display_model()})"
         if daemon.chat_agent.live_llm_enabled
         else "零配置内置演示模式（可在网页向导或 .env 填入 AI_HOUSE_API_KEY 切换）"
     )
@@ -201,6 +230,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         "ONEBOT_OWNER_QQ=",
         "ONEBOT_ACTOR=",
         "ONEBOT_GROUPS=",
+        "# 私聊记忆进群：AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=1 才让住客在群里想得起房主的私聊（默认关）；下面列出的群（group、qq-group:<群号>，逗号分隔）发送前不再拦私聊内容，留空 = 都照拦",
+        "AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS=0",
+        f"{LEAK_FREE_GROUPS_ENV}=",
         "",
     ]
     env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,6 +385,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     elif onebot_ping:
         checks.append({"name": "onebot_live_ping", "ok": False, "detail": "指定了 --onebot-ping 但未配置 ONEBOT_WS_URL"})
 
+    pm_raw = eff_env.get(LEAK_FREE_GROUPS_ENV, "").strip()
+    if pm_raw:
+        pm_problem = _leak_free_groups_problem(pm_raw)
+        pm_ok, _bad = parse_leak_free_groups(pm_raw)
+        checks.append({
+            "name": "leak_free_groups",
+            "ok": not pm_problem,
+            "detail": pm_problem or f"这些群发送前不查私聊内容：{'、'.join(pm_ok)}",
+        })
+
+    pig_raw = eff_env.get(PRIVATE_IN_GROUPS_ENV, "").strip()
+    if pig_raw:
+        pig_problem = _private_in_groups_problem(pig_raw)
+        checks.append({
+            "name": "private_in_groups",
+            "ok": not pig_problem,
+            "detail": pig_problem or ("住客在群里想得起房主私聊里说的事" if pig_raw == "1" else "私聊记忆不进群"),
+        })
+
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         probe = data_dir / ".doctor_probe.sqlite"
@@ -374,6 +425,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         })
     except Exception as exc:  # noqa: BLE001
         checks.append({"name": "worldpack", "ok": False, "detail": str(exc)})
+
+    from .agent import DIRECT, brain_for, build_engines
+
+    wanted = {brain_for(eff_env)}
+    wanted.update(
+        brain_for(eff_env, k[len("AI_HOUSE_ACTOR_BRAIN_"):].lower())
+        for k in eff_env
+        if k.startswith("AI_HOUSE_ACTOR_BRAIN_")
+    )
+    wanted.discard(DIRECT)
+    if wanted:
+        engines = build_engines(eff_env, data_dir / "agent")
+        for name in sorted(wanted):
+            eng = engines.get(name)
+            why = eng.unavailable_reason() if eng is not None else f"没有名为 {name} 的住客大脑引擎"
+            checks.append({
+                "name": f"agent_brain_{name}",
+                "ok": not why,
+                "detail": why or f"住客聊天由 {eng.default_model_label()} 来跑（只检查了安装与密钥是否就位，没有发起调用）",
+            })
 
     api_key = eff_env.get("AI_HOUSE_API_KEY", "").strip()
     if args.live_ping:

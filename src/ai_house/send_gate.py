@@ -56,6 +56,18 @@ def in_quiet_hours(now: float, window_spec: str) -> bool:
     return cur_m >= start_m or cur_m < end_m
 
 
+def group_channel_of(channel_id: str, eff_target: str, *, is_webchat: bool) -> str:
+    """The group channel id a gated group message is going to, spelled the way chat and memory spell it
+    (`group`, `qq-group:<id>`), so the outbound checks ask the same question recall answered.
+
+    Another channel plugin has no such id: it keeps its plugin id, which no `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` entry matches."""
+    if is_webchat:
+        return eff_target or "group"
+    if channel_id in ("onebot_v11", "onebot"):
+        return f"qq-group:{eff_target}"
+    return channel_id
+
+
 def _safe_int(raw: Any, default: int) -> int:
     try:
         return max(1, int(raw))
@@ -442,14 +454,15 @@ class SendGate:
                 if created_ts > 0 and (now - created_ts) > 1800.0:
                     self._stats["blocked"] += 1
                     raise BlockedDelivery("expired_ttl")
-            check_ch = f"private:{actor}" if eff_scope == "private" else channel_id
+            out_ch = group_channel_of(channel_id, eff_target, is_webchat=is_webchat)
+            check_ch = f"private:{actor}" if eff_scope == "private" else out_ch
             if getattr(d, "guard", None) is not None:
-                why = d.guard.check(check_ch, text)
+                why = d.guard.check(check_ch, text, actor=actor)
                 if why:
                     self._stats["blocked"] += 1
                     raise BlockedDelivery(f"guard:{why}")
             if eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
-                if d.memory.check_outbound_leak(actor, "group", text, now=now):
+                if d.memory.check_outbound_leak(actor, "group", text, channel=out_ch, now=now):
                     self._stats["blocked"] += 1
                     raise BlockedDelivery("memory_leak:private_to_public")
 
@@ -550,14 +563,15 @@ class SendGate:
                 raise
 
             now = float(d.clock.now())
-            check_ch = f"private:{actor}" if eff_scope == "private" else f"qq-group:{eff_target}" if channel_id == "onebot_v11" and eff_scope == "group" else channel_id
+            out_ch = group_channel_of(channel_id, eff_target, is_webchat=False)
+            check_ch = f"private:{actor}" if eff_scope == "private" else out_ch
             if body and getattr(d, "guard", None) is not None:
-                why = d.guard.check(check_ch, body)
+                why = d.guard.check(check_ch, body, actor=actor)
                 if why:
                     self._stats["blocked"] += 1
                     raise BlockedDelivery(f"guard:{why}")
             if body and eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
-                if d.memory.check_outbound_leak(actor, "group", body, now=now):
+                if d.memory.check_outbound_leak(actor, "group", body, channel=out_ch, now=now):
                     self._stats["blocked"] += 1
                     raise BlockedDelivery("memory_leak:private_to_public")
 

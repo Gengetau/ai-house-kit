@@ -78,7 +78,7 @@ _QUESTION_CLAUSE_RE = re.compile(
     r"[？?]\s*$|吗|呢|(?:什么|啥)(?!都|也|的)|谁知道|是不是|是否|有没有|记不记得|哪(?:些|个|种)|怎么|多少|为什么|为啥"
 )
 _COOK_COMMIT_WORDS = ("做饭", "下厨", "我来做", "我煮", "给你做", "帮做", "做顿", "做一顿", "做晚饭", "煮晚饭", "做早饭", "做午饭")
-_OUTING_WORDS = ("出门", "晴空都", "逛", "图书馆", "咖啡店", "喫茶", "超市", "车站", "公园", "书店", "便利店")
+_OUTING_WORDS = ("出门", "晴空都", "逛", "陪我去", "陪我出", "图书馆", "咖啡店", "喫茶", "超市", "车站", "公园", "书店", "便利店")
 _TOGETHER_WORDS = ("一起", "约好", "约了", "大扫除", "桌游", "看电影", "开黑", "联机")
 _DISH_WORDS = ("咖喱", "火锅", "寿喜锅", "乌冬", "拉面", "意面", "炒面", "蛋包饭", "味噌汤", "炒饭", "松饼", "司康")
 _VALID_KINDS = frozenset({"errand", "cook", "memo", "outing", "together", "chat_promise"})
@@ -95,6 +95,7 @@ _BUY_VERB = (
 _QTY = (
     r"\s*(?:[一二两俩三四五六七八九十\d]+\s*[" + _MEASURE_CHARS + r"]?|点(?!心)|些|[个把包瓶盒袋份条杯根只斤罐箱支颗串])?\s*"
 )
+_BOUGHT_VERBISH = r"(?:买|带|捎|采购|补货|补|缺)(?:一下|下)?"
 _NOUN = r"([\u4e00-\u9fffA-Za-z0-9]{1,12})"
 _LENIENT_BUY_RE = re.compile(_BUY_VERB + _QTY + _NOUN)
 _REQUEST_MARKERS = (
@@ -149,6 +150,7 @@ _PREV_CLAUSE_MARKER_RE = re.compile(r"路过|顺路|顺便|顺带|麻烦|拜托|
 _OUTING_DEST_MAP = (
     (("超市", "杂货", "买菜"), ("supermarket", "shop", "grocery", "market", "shotengai", "超市", "商店街")),
     (("商店街",), ("shotengai", "商店街")),
+    (("逛街", "街上", "买衣服", "商场"), ("shotengai", "商店街", "terrace", "yokohama", "mall", "商场", "百货")),
     (("公园", "绿地"), ("park", "公园", "绿地")),
     (("河岸", "星川"), ("riverside", "河岸", "星川")),
     (("图书馆",), ("library", "图书馆")),
@@ -174,6 +176,57 @@ _TOGETHER_ACTIVITY_HINTS = (
     (("一起",), ("being_together",)),
 )
 _PLAN_SUCCESS_OUTCOMES = frozenset({"done", "early_home"})
+_HOME_PLACES = frozenset({"kitchen", "living", "study", "yard", "bath", "home"})
+
+
+def _is_home_place(place: Any) -> bool:
+    p = str(place or "").strip().lower()
+    return p in _HOME_PLACES or p.startswith("room_")
+
+
+def _routine_grocery_run(ev: Mapping[str, Any]) -> bool:
+    """The household's own food shopping: a `shopping-plan-…` trip, or any stop at the supermarket."""
+    place = str(ev.get("place") or "").strip().lower()
+    return str(ev.get("plan_id") or "").startswith("shopping-plan") or "supermarket" in place or "超市" in place
+
+
+def _plan_place_fits_outing(ev: Mapping[str, Any], summary: str) -> bool:
+    """A finished plan can only be the outing when it happened away from home, at the named place if one was named.
+
+    `plan_finished` carries no plan kind, so a tea plan in the living room used to close every open "去…" promise.
+    A plan without a place stays acceptable (older exporters did not write one).
+    """
+    place = str(ev.get("place") or "").strip().lower()
+    if not place:
+        return True
+    if _is_home_place(place):
+        return False
+    for sum_toks, ev_toks in _OUTING_DEST_MAP:
+        if any(st in summary for st in sum_toks):
+            return any(et in place for et in ev_toks)
+    return not _routine_grocery_run(ev)  # no place was named: anywhere out counts, the food shopping does not
+
+
+def _plan_activity_fits_together(ev: Mapping[str, Any], summary: str, ev_rows: Sequence[Tuple[str, str]]) -> bool:
+    """A finished shared plan closes a "一起<活动>" promise only when its activity is not known to be a different one."""
+    specific = [acts for words, acts in _TOGETHER_ACTIVITY_HINTS if words != ("一起",) and any(w in summary for w in words)]
+    if not specific:
+        return True
+    acts = {str(ev.get("activity") or "").lower()} - {""}
+    pid = str(ev.get("plan_id") or "")
+    if not acts and pid:
+        for _key, body_raw in ev_rows:
+            if pid not in body_raw:
+                continue
+            try:
+                other = json.loads(body_raw)
+            except ValueError:
+                continue
+            if str(other.get("plan_id") or "") == pid and other.get("activity"):
+                acts.add(str(other["activity"]).lower())
+    if not acts:
+        return True
+    return any(a in group for a in acts for group in specific)
 
 
 def _clauses(text: str) -> List[str]:
@@ -190,14 +243,84 @@ def diet_memo_blocked(text: str) -> bool:
     diet = [c for c in _clauses(text) if any(w in c for w in _ALLERGY_MEMO_WORDS)]
     return bool(diet) and all(_QUESTION_CLAUSE_RE.search(c) for c in diet)
 
+# Words that make a plain chat line look like a plan. Only the owner's own words count: the resident's reply is
+# full of "一起/咖喱" while answering small talk, and the owner's question about a past event is not a plan either.
+_CHAT_PLAN_KEYWORDS = (
+    "早点睡", "去睡", "做饭", "火锅", "咖喱", "喝茶", "下午茶", "打游戏", "出门", "看书", "散步", "一起", "晴空都",
+    "逛街", "逛逛", "陪我去", "陪我出", "陪我逛",
+)
+# A question that is really an invitation or a request ("要不要一起…", "能做咖喱饭吗", "…好不好", "…怎么样").
+_INVITE_MARKER_RE = re.compile(
+    r"要不要|想不想|能不能|能否|可不可以|行不行|好不好|好吗|可以吗|怎么样|如何|不如|能[^，,。.！!？?；;\n]{0,8}吗"
+)
+# Looking back ("昨天说好的逛街，后来去了吗") is a question about the past, not a new plan.
+_RETROSPECT_RE = re.compile(r"了吗|了没|过吗|有没有|后来|昨天|昨晚|前天|刚才|刚刚|上次|之前|是不是")
+
+
+def owner_proposes_plan(owner_text: str) -> bool:
+    """True when some clause of what the owner said is a plan/invitation (not a question about habits or the past)."""
+    for clause in _clauses(owner_text):
+        if not any(k in clause for k in _CHAT_PLAN_KEYWORDS) or _RETROSPECT_RE.search(clause):
+            continue
+        if _QUESTION_CLAUSE_RE.search(clause) and not _INVITE_MARKER_RE.search(clause):
+            continue
+        return True
+    return False
+
+
+_DECLINE_RE = re.compile(
+    r"没法|没办法|无法|不能|不可以|不行|做不到|办不到|去不了|买不了|来不了|做不了|不方便|没空|没时间|"
+    r"改天|改成|改到|换成|拒绝|不想|不去|不买|不做|不会(?=去|买|做|帮|带)|"
+    # "买不到/带不了/帮不上/去不成": the item or the errand is out of reach
+    r"买不到|带不了|带不到|帮不上|去不成|买不成|来不成|做不成|"
+    # "今天不出门 / 暂时没打算出门 / 不打算去": she is staying in, so she is not going to fetch anything
+    r"不出门|[不没]打算(?:出门|出去|去|买|带)|"
+    # "大概率不出门 / 应该不会去 / 估计不买": a hedge is still a no
+    r"(?:大概率|大概|多半|八成|应该|估计|恐怕)(?:会)?不(?:会)?(?:出门|出去|去|买|带)"
+)
+_ACCEPT_RE = re.compile(
+    r"好的|好呀|好啊|好哒|好嘞|好哦|好吧|行啊|没问题|可以|当然|我会|我去|我来|交给我|包在我|答应|马上|这就|一定|收到|乐意|愿意|嗯嗯"
+)
+
+
+def reply_declines(reply_text: str) -> bool:
+    """True when the resident's reply turns the request down ("没法出门买鸡蛋", "能不能改成下午？", "今天大概率不出门",
+    "榴莲我买不到").
+
+    The first clause that either declines or accepts decides, so "好的，我会买，不过现在没法出门" is still an
+    agreement while "我现在在家发呆，没法出门买鸡蛋" is not. A reply that does neither is not read as a refusal.
+    """
+    for clause in _clauses(reply_text):
+        if _DECLINE_RE.search(clause):
+            return True
+        if _ACCEPT_RE.search(clause):
+            return False
+    return False
+
+
+# 「陪我去商店街买衣服」: the owner shops herself and asks for company, she does not ask the resident to buy anything.
+_COMPANION_BUY_RE = re.compile(r"(?:陪我|陪着我|陪我一起|跟我|和我|与我)[^，,。.！!？?；;\n]{0,12}?" + _BUY_VERB)
+
+
 def _clause_blocked(clause: str) -> bool:
-    """Past tense, questions and negations never form a purchase errand."""
+    """Past tense, questions, negations and 「陪我去…买」 never form a purchase errand."""
     c = _FORGET_RE.sub("记得", clause)
-    if _PAST_BUY_RE.search(c) or _NEG_BUY_RE.search(c) or _QUESTION_RE.search(c):
+    if _PAST_BUY_RE.search(c) or _NEG_BUY_RE.search(c) or _QUESTION_RE.search(c) or _COMPANION_BUY_RE.search(c):
         return True
     if "吗" in c and not _POLITE_RE.search(c):
         return True
     return False
+
+
+def _single_char_is_bought(text: str, label: str) -> bool:
+    """A one-character item word ("米", "鱼") counts only as the direct object of a buy verb and as a whole word.
+
+    Anywhere else it is part of a longer word or a name ("米娜", "鱼缸"): the old "label in text" test turned
+    「米娜，明天陪我去逛街买衣服」 into a rice errand.
+    """
+    return bool(re.search(
+        _BOUGHT_VERBISH + _QTY + re.escape(label) + r"(?:(?![\u4e00-\u9fff])|(?=[回来去吧啊呀哦嘛吗啦了的]))", text
+    ))
 
 
 def _live_buy_text(text: str) -> str:
@@ -305,8 +428,25 @@ def _loads_list(raw: Any, fallback: Sequence[str] = ()) -> List[str]:
     return _clean_actors(fallback)
 
 
+# A part of the day named in the sentence: (start, end) as (hour, minute). Ends run a little past the hour a person
+# would say (tea that began at 17:00 ends after 18:00), so an activity that is just finishing still counts.
+_DAY_PARTS = (
+    ("上午", (7, 0), (12, 30)),
+    ("中午", (11, 0), (14, 0)),
+    ("下午", (12, 0), (18, 30)),
+    ("晚上", (18, 0), (23, 59)),
+)
+# 「下午茶」 is something to drink, not a time.
+_DAY_PART_RE = re.compile(r"(今天|明天|后天)?(?:的)?(上午|中午|下午(?!茶)|晚上)")
+_DAY_OFFSET = {"今天": 0, "明天": 1, "后天": 2}
+
+
 def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[float]]:
-    """Parse relative JST due phrases (`今晚`, `明天`, `明早`, `明晚`, `周末`, `等会儿`)."""
+    """Parse relative JST due phrases (`今晚`, `明天`, `明早`, `明晚`, `周末`, `等会儿`, and a part of the day:
+    `下午`, `今天上午`, `明天下午`, `晚上`).
+
+    A part of the day without a day word means the next one that is not over yet; said after it ended, it is
+    tomorrow's. 「今天」 alone is the rest of today. No time word: no window (the caller's default time-to-live)."""
     body = str(text or "")
     cur = dt.datetime.fromtimestamp(float(now), JST)
     d0 = cur.date()
@@ -326,6 +466,17 @@ def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[f
     if any(w in body for w in ("明晚", "明天晚上")):
         d1 = d0 + dt.timedelta(days=1)
         return _ts(d1, 18, 0), _ts(d1, 23, 59)
+    m = _DAY_PART_RE.search(body)
+    if m:
+        _, (sh, sm), (eh, em) = next(p for p in _DAY_PARTS if p[0] == m.group(2))
+        day = d0 + dt.timedelta(days=_DAY_OFFSET.get(m.group(1) or "今天", 0))
+        start, end = _ts(day, sh, sm), _ts(day, eh, em)
+        if day == d0:
+            if not m.group(1) and float(now) >= end:  # 「下午一起喝茶」 at 20:00 means tomorrow afternoon
+                day += dt.timedelta(days=1)
+                return _ts(day, sh, sm), _ts(day, eh, em)
+            return max(float(now), start), max(float(now) + 3600.0, end)
+        return start, end
     if "明天" in body:
         d1 = d0 + dt.timedelta(days=1)
         return _ts(d1, 8, 0), _ts(d1, 23, 59)
@@ -339,7 +490,88 @@ def parse_due_window(text: str, now: float) -> Tuple[Optional[float], Optional[f
         sat = d0 + dt.timedelta(days=days_ahead)
         sun = sat + dt.timedelta(days=1)
         return _ts(sat, 9, 0), _ts(sun, 22, 0)
+    if "今天" in body:
+        return float(now), max(float(now) + 3600.0, _ts(d0, 23, 59))
     return None, None
+
+
+# --- looking back at a promise that is not a purchase ---------------------------------------------------------
+# What a promise is about is told by the content words that the owner's sentence and the stored promise have in
+# common. The curated words of the plan classifiers above are the vocabulary; words that only say "a plan / together"
+# are left out, because they are in almost every promise and would match any chat.
+_GENERIC_PLAN_WORDS = frozenset({"出门", "陪我去", "陪我出", "陪我逛", "一起", "约好", "约了", "早点睡", "去睡"})
+_PROMISE_TOPIC_WORDS = tuple(sorted(
+    {
+        w
+        for w in (
+            *_OUTING_WORDS, *_TOGETHER_WORDS, *_DISH_WORDS, *_COOK_COMMIT_WORDS, *_CHAT_PLAN_KEYWORDS,
+            *(w for words, _acts in _TOGETHER_ACTIVITY_HINTS for w in words),
+            *(w for words, _places in _OUTING_DEST_MAP for w in words),
+        )
+        if w not in _GENERIC_PLAN_WORDS
+    },
+    key=lambda w: (-len(w), w),
+))
+# Words that carry no topic of their own (who, when, "did it happen", question particles). They are removed before the
+# sentence is cut into two-character pieces, so 「昨天说好的逛街，后来去了吗」 is left with 「逛街」 only.
+_NON_TOPIC_RE = re.compile(
+    r"和房主聊到|房主|聊到|昨天|昨晚|前天|今天|明天|后天|今晚|明早|明晚|早上|上午|中午|下午(?!茶)|晚上|傍晚|周末|"
+    r"周[一二三四五六日天]|星期[一二三四五六日天]|说好的?|约好的?|约定|答应过?|承诺|说过|后来|之后|然后|最后|"
+    r"刚才|刚刚|上次|之前|一起|陪我|陪你|我们|你们|咱们|自己|可以|一下|怎么样|怎么|什么|为什么|没有|有没有|"
+    r"记得|记不记得|还记|事情|的事|这个|那个|这件|那件|这次|那次|去了|去过|去没|没去|了吗|了没|过吗|是不是|"
+    r"还是|好玩|开心|[吗呢啊吧呀哦嘛啦了的去来在是有要想你我他她也都就还和跟把被给让对很太不]"
+)
+_PROMISE_ASK_RE = re.compile(r"说好|约好|答应|约定|约了|承诺|说过")
+_WEEKDAYS = "一二三四五六日"
+_REL_DAY_NAMES = {-2: "前天", -1: "昨天", 0: "今天", 1: "明天", 2: "后天"}
+_RELATIVE_WORD_RE = re.compile(r"今天|明天|后天|今晚|明早|明晚|今早|明晨|等会|待会|一会儿|周末")
+
+
+def _topic_grams(text: str, names: Iterable[str] = ()) -> set:
+    body = str(text or "")
+    for nm in sorted({str(n) for n in names if len(str(n)) >= 2}, key=len, reverse=True):
+        body = body.replace(nm, " ")
+    body = _NON_TOPIC_RE.sub(" ", body)
+    grams: set = set()
+    for run in re.findall(r"[一-鿿A-Za-z0-9]{2,}", body):
+        grams.update(run[i:i + 2] for i in range(len(run) - 1))
+    return grams
+
+
+def _promise_topic_overlap(owner_text: str, summary: str, names: Iterable[str] = ()) -> bool:
+    if any(w in owner_text and w in summary for w in _PROMISE_TOPIC_WORDS):
+        return True
+    return bool(_topic_grams(owner_text, names) & _topic_grams(summary, names))
+
+
+def _part_of_day(start: float, end: float) -> str:
+    """The part of the day (上午/中午/下午/晚上) a due window mostly lies in; "" for a window of most of the day."""
+    s, e = dt.datetime.fromtimestamp(start, JST), dt.datetime.fromtimestamp(end, JST)
+    if e - s > dt.timedelta(hours=8) or s.date() != e.date():
+        return ""
+    best, best_len = "", 0.0
+    for name, (sh, sm), (eh, em) in _DAY_PARTS:
+        a = max(start, dt.datetime.combine(s.date(), dt.time(sh, sm), JST).timestamp())
+        b = min(end, dt.datetime.combine(s.date(), dt.time(eh, em), JST).timestamp())
+        if b - a > best_len:
+            best, best_len = name, b - a
+    return best
+
+
+def _day_label(ts: float) -> str:
+    d = dt.datetime.fromtimestamp(ts, JST)
+    return f"{d.month}月{d.day}日（周{_WEEKDAYS[d.weekday()]}）"
+
+
+def _when_phrase(start: float, end: float, now: float) -> str:
+    """「11月22日（周日）上午，也就是昨天上午」: the absolute day first, the relative word only as a help."""
+    sd, ed = dt.datetime.fromtimestamp(start, JST).date(), dt.datetime.fromtimestamp(end, JST).date()
+    if sd != ed:
+        return f"{_day_label(start)}到{_day_label(end)}"
+    part = _part_of_day(start, end)
+    out = _day_label(start) + part
+    rel = _REL_DAY_NAMES.get((sd - dt.datetime.fromtimestamp(now, JST).date()).days)
+    return f"{out}，也就是{rel}{part}" if rel else out
 
 
 class CommitmentStore:
@@ -522,9 +754,12 @@ class CommitmentStore:
         req_qty = max(1, int(row["qty"] or 1))
         summary = str(row["summary"] or "")
 
-        is_errand = intent_kind == "errand" or bool(item) or bool(raw_item) or any(v in summary for v in _BUY_VERBS)
+        # An outing/together whose words mention buying ("陪我去逛街买衣服") is still an outing: it closes on arriving,
+        # never on a purchase event (a summary-only "买" is an errand only for a kind that has no better home).
+        buy_in_summary = intent_kind not in ("outing", "together") and any(v in summary for v in _BUY_VERBS)
+        is_errand = intent_kind == "errand" or bool(item) or bool(raw_item) or buy_in_summary
         if is_errand:
-            if not item and not raw_item and not any(v in summary for v in _BUY_VERBS):
+            if not item and not raw_item and not buy_in_summary:
                 return None
             accum_qty = 0
             last_hit: Optional[Tuple[float, str]] = None
@@ -594,6 +829,11 @@ class CommitmentStore:
                     members = ev.get("members")
                     if intent_kind == "together" and isinstance(members, list) and len(set(map(str, members))) < 2:
                         continue
+                    ev_ref = str(ev.get("intent_ref") or ev.get("intent_id") or "")
+                    if intent_kind == "outing" and ev_ref != iid and not _plan_place_fits_outing(ev, summary):
+                        continue
+                    if intent_kind == "together" and not _plan_activity_fits_together(ev, summary, ev_rows):
+                        continue
                     return ev_at or created, key
                 if intent_kind == "together" and ev_kind == "activity":
                     shared_plan = str(ev.get("plan_id") or "")
@@ -620,6 +860,9 @@ class CommitmentStore:
                     ev_pref = str(ev.get("plan_ref") or "")
                     dest_ok = True
                     if ev_ref != iid and not (plan_ref and ev_pref == plan_ref):
+                        # No place named: anywhere out counts, except the household's own food shopping (a promise
+                        # to go out with the owner was once closed by the resident's grocery run that morning).
+                        dest_ok = not _routine_grocery_run(ev)
                         for sum_toks, ev_toks in _OUTING_DEST_MAP:
                             if any(st in summary for st in sum_toks):
                                 dest_ok = any(et in ev_desc for et in ev_toks)
@@ -643,7 +886,10 @@ class CommitmentStore:
                         )
                     ):
                         return ev_at or created, key
-                elif ev_actor == actor and (ev_kind == "arrived" or (ev_kind == "plan_finished" and ev_ok)):
+                elif ev_actor == actor and (
+                    ev_kind == "arrived"
+                    or (ev_kind == "plan_finished" and ev_ok and not _is_home_place(ev.get("place")))
+                ):
                     if any(w in summary for w in ("出门", "去", "晴空都", "逛")):
                         return ev_at or created, key
 
@@ -731,8 +977,167 @@ class CommitmentStore:
             return raw.lower()
         return _DEFAULT_ITEM_ALIASES.get(raw)
 
+    def unbuyable_noun(self, owner_text: str) -> str:
+        """The out-of-catalog thing the owner explicitly asks the resident to buy, or "" (nothing / buyable)."""
+        text = str(owner_text or "")
+        if not text or self._detect_errand_item(text)[0]:
+            return ""
+        noun = extract_buy_request_noun(text)
+        return "" if not noun or self._resolve_item_id(noun) else noun
+
+    def _item_words(self, item: str) -> List[str]:
+        words = [w for w, i in _DEFAULT_ITEM_ALIASES.items() if i == item and len(w) >= 2]
+        spec = (getattr(self.vocab, "INGREDIENTS", None) or {}).get(item) if self.vocab else None
+        label = str((spec or {}).get("label") or "").strip()
+        for w in (label, label.split("（", 1)[0].strip()):
+            if len(w) >= 2 and w not in words:
+                words.append(w)
+        return words
+
+    def reply_hints(self, actor: str, owner_text: str, now: float, *, window_s: float = 3 * 86400.0) -> List[str]:
+        """Facts about her own promises that she must know *before* she answers the owner.
+
+        - the owner asks for something she cannot buy: say so now, instead of a note glued to the reply afterwards;
+        - the owner asks after a recent errand of hers that expired or is only a reminder: she must not say
+          "我会尽快去买的" about something that is over or was never buyable.
+        """
+        if not self.world_db or not str(owner_text or "").strip():
+            return []
+        text = str(owner_text)
+        hints: List[str] = []
+        noun = self.unbuyable_noun(text)
+        if noun:
+            hints.append(
+                f"房主这句话想让你买「{noun}」，但这个你买不了（你只能去超市采购常见的食材、零食和饮品，「{noun}」不在其中）。"
+                "请如实告诉她你买不了，不要答应去买；最多说可以先记个提醒。"
+            )
+        ingredients = getattr(self.vocab, "INGREDIENTS", None) or {}
+        now_f = float(now)
+        seen: set = set()
+        rows = self.list_intents(actor=actor, limit=40)
+        for r in rows:
+            if r["kind"] != "errand" or not (r.get("item") or r.get("raw_item")):
+                continue
+            state = str(r["state"])
+            if state == "open" and float(r.get("expires_at") or 0) <= now_f:
+                state = "expired"
+            if state not in ("open", "expired"):
+                continue
+            if state == "expired" and now_f - float(r.get("expires_at") or 0) > window_s:
+                continue
+            if r.get("item"):
+                words = self._item_words(str(r["item"]))
+                label = str((ingredients.get(r["item"]) or {}).get("label") or r["item"]).split("（", 1)[0]
+                unbuyable = False
+            else:
+                label = str(r["raw_item"])
+                words = [label]
+                unbuyable = True
+            if label in seen or not any(w and w in text for w in words):
+                continue
+            seen.add(label)
+            if unbuyable and state == "expired":
+                hints.append(
+                    f"你之前只是给房主记了个「{label}」的提醒，但这个你买不了，提醒已经过期，没有办成。"
+                    "她问起时请如实说你买不了、已经过期，不要说会去买。"
+                )
+            elif unbuyable:
+                hints.append(
+                    f"你给房主记了个「{label}」的提醒，但这个你买不了，也不会自动去买。她问起时请如实说。"
+                )
+            elif state == "expired":
+                hints.append(
+                    f"你之前答应过帮房主买{label}，但一直没买成，约定已经过期了。"
+                    "她问起时请如实说没买成、已经过期，不要当成还在办；她还要的话请她再说一声。"
+                )
+            else:
+                hints.append(f"你之前答应过帮房主买{label}，还没有买回来，还在办。")
+        hints.extend(self._promise_hints(rows, text, now_f, window_s))
+        return hints[:4]
+
+    def _promise_hints(self, rows: Sequence[Mapping[str, Any]], text: str, now: float, window_s: float) -> List[str]:
+        """What she must know about her own recent promises that are not purchases (outings, doing something together,
+        cooking, other chat promises) when the owner asks after them: that she agreed, what for, when, and how it went.
+
+        A promise is brought up when the owner's sentence shares a content word with it (「逛街」「公园」「下午茶」
+        「咖喱」...). A sentence that only asks after "what we agreed" (「昨天说好的事后来怎么样了」: a word of promising and
+        nothing else to go by) brings up the latest two. Anything else brings up nothing.
+        """
+        names = [str(v) for v in (getattr(self.vocab, "NAMES", None) or {}).values()] if self.vocab else []
+        recent: List[Tuple[Mapping[str, Any], str, str]] = []
+        for r in rows:
+            if r["kind"] in ("errand", "memo"):
+                continue
+            state = str(r["state"])
+            if state == "open" and float(r.get("expires_at") or 0) <= now:
+                state = "expired"
+            if state == "expired":
+                ended = float(r.get("expires_at") or 0)
+            elif state == "completed":
+                ended = float(r.get("completed_at") or r.get("updated_at") or 0)
+            elif state == "open":
+                ended = now
+            else:
+                continue
+            if now - ended > window_s:
+                continue
+            summary = re.sub(r"^和房主聊到[：:]\s*", "", str(r.get("summary") or "")).strip()
+            if summary:
+                recent.append((r, state, summary))
+        picked = [x for x in recent if _promise_topic_overlap(text, x[2], names)]
+        if (
+            not picked
+            and _PROMISE_ASK_RE.search(text)
+            and not _topic_grams(text, names)
+            and not any(w in text for w in _PROMISE_TOPIC_WORDS)
+        ):
+            picked = recent
+        out: List[str] = []
+        seen: set = set()
+        for r, state, summary in picked:
+            if summary in seen:
+                continue
+            seen.add(summary)
+            out.append(self._promise_hint(r, state, summary, now))
+            if len(out) >= 2:
+                break
+        return out
+
+    @staticmethod
+    def _promise_hint(r: Mapping[str, Any], state: str, summary: str, now: float) -> str:
+        outing = r["kind"] == "outing"
+        due_from, due_to = r.get("due_from"), r.get("due_to")
+        if due_from and due_to:
+            when = f"约在{_when_phrase(float(due_from), float(due_to), now)}"
+        else:
+            when = f"{_day_label(float(r.get('created_at') or now))}说定的，没写具体时间"
+        short = summary if len(summary) <= 40 else summary[:40] + "…"
+        note = ""
+        if _RELATIVE_WORD_RE.search(summary):
+            note = "（「」里的「明天」「今晚」「周末」之类是约定那天说的，现在已不是那一天，以这里写的日期为准。）"
+        head = f"你答应过房主「{short}」（{when}）"
+        if state == "completed":
+            done = float(r.get("completed_at") or r.get("updated_at") or now)
+            done_s = f"{_day_label(done)} {dt.datetime.fromtimestamp(done, JST).strftime('%H:%M')}"
+            verb = "去过了" if outing else "办成了"
+            return f"{head}，这件事已经{verb}（{done_s}完成）。她问起时照实说已经{verb}。{note}"
+        if state == "expired":
+            return (
+                f"{head}，这个时间已经过了，没有{'成行' if outing else '办成'}的记录。"
+                f"她问起时照实说答应过但{'没去成' if outing else '没办成'}，不要说不记得，"
+                f"也不要编{'去了' if outing else '办成了'}。{note}"
+            )
+        if due_from and float(due_from) > now:
+            return f"{head}，还没到时间，还在等。她问起时照实说还没到时间，不要说已经办了。{note}"
+        return f"{head}，约好的时间已经到了，目前还没有办成的记录。她问起时照实说，不要编已经办了。{note}"
+
     def _detect_errand_item(self, text: str) -> Tuple[Optional[str], int]:
         text = _live_buy_text(text)
+        names = getattr(self.vocab, "NAMES", None) if self.vocab else None
+        if isinstance(names, Mapping):
+            # "米娜" is a person, not rice: names never take part in item matching.
+            for nm in sorted({str(v) for v in names.values() if len(str(v)) >= 2}, key=len, reverse=True):
+                text = text.replace(nm, " ")
         if not any(v in text for v in _BUY_VERBS):
             return None, 1
         ingredients = getattr(self.vocab, "INGREDIENTS", None) if self.vocab else None
@@ -750,6 +1155,8 @@ class CommitmentStore:
                         candidates.setdefault(short, item_id)
         for label, item_id in sorted(candidates.items(), key=lambda kv: -len(kv[0])):
             if label in text:
+                if len(label) == 1 and not _single_char_is_bought(text, label):
+                    continue
                 m = re.search(
                     rf"([1-9]|[一二两俩三])\s*(?:个|盒|瓶|袋|份|斤|根|条|颗|包|块|束|片|杯|罐|听)?\s*{re.escape(label)}",
                     text,
@@ -866,7 +1273,6 @@ class CommitmentStore:
                         "答应了的": list(base_agreed),
                     })
         elif clean_owner:
-            combined = f"{clean_owner}\n{clean_reply}"
             raw_buy = ""
             buy_item, buy_qty = self._detect_errand_item(clean_owner)
             if buy_item:
@@ -897,19 +1303,15 @@ class CommitmentStore:
                     "答应了的": list(base_agreed),
                 })
             else:
-                keywords = (
-                    "早点睡", "去睡", "做饭", "火锅", "咖喱", "喝茶", "下午茶", "打游戏",
-                    "出门", "买", "看书", "散步", "一起", "晴空都",
-                )
-                cook_or_life = tuple(k for k in keywords if k != "买")
                 has_buy_phrase = bool(raw_buy) or any(v in live_owner for v in _BUY_VERBS)
-                if (not buy_item and not has_buy_phrase) and any(k in combined for k in cook_or_life):
+                if (not buy_item and not has_buy_phrase) and owner_proposes_plan(clean_owner):
                     extracted.append({
                         "text": f"和房主聊到：{clean_owner[:80]}",
                         "kind": "chat_promise",
                         "答应了的": list(base_agreed),
                     })
 
+        declined = reply_declines(clean_reply)
         enriched_intents: List[Dict[str, Any]] = []
         for it in extracted:
             item_party = _clean_actors(it.get("party") or base_party, fallback=actor)
@@ -923,6 +1325,10 @@ class CommitmentStore:
                 has_raw=bool(str(it.get("raw_item") or "").strip()),
                 party_len=len(item_party),
             )
+            if declined and eff_kind != "memo" and not (str(it.get("raw_item") or "").strip() and not it.get("item")):
+                # She said no (or asked to move it): that is not a promise. Memos are facts about the owner and stay,
+                # and an out-of-catalog errand is only a reminder to the owner, never a promise to buy.
+                continue
             i_from = it.get("due_from") if it.get("due_from") is not None else (None if eff_kind == "memo" else due_from)
             i_to = it.get("due_to") if it.get("due_to") is not None else (None if eff_kind == "memo" else due_to)
             eff_ref = str(it.get("plan_ref") or plan_ref)
@@ -1029,5 +1435,7 @@ __all__ = [
     "CommitmentStore",
     "IntentsLite",
     "SCHEMA",
+    "owner_proposes_plan",
     "parse_due_window",
+    "reply_declines",
 ]

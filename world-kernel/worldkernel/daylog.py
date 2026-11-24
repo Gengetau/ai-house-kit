@@ -29,15 +29,17 @@ OCCASION = {"home": "居家", "out": "出门", "formal": "正式场合", "sport"
 SAY = {"tea_time": "喝茶", "working": "做自己的事", "kitchen_help": "打下手"}
 
 
-def place(loc, actor):
+def place(loc, actor, names=None):
+    """`names`: the current world's {actor_id: name} (a custom resident's room too); default the built-in six."""
+    nm = NAMES if names is None else names
     if not loc:
         return ""
     if loc.startswith("room_"):
         who = loc[5:]
         if who == actor:
             return "自己房间"
-        if who in NAMES:
-            return NAMES[who] + "的房间"
+        if who in nm:
+            return nm[who] + "的房间"
     return V.label(loc)
 
 
@@ -53,10 +55,12 @@ def _outside(loc):
     return bool(loc) and (loc == "away" or loc.startswith(V.PLACE))
 
 
-def entries(db, start, end, now):
+def entries(db, start, end, now, names=None):
     """Lines for everything that started in [start, end), oldest first. `db` is a sqlite3 connection to life1.db
-    (row_factory=sqlite3.Row), opened read-only by the caller."""
-    people = sorted(NAMES)
+    (row_factory=sqlite3.Row), opened read-only by the caller. `names` is the current world's roster
+    ({actor_id: name}, e.g. vocab.NAMES: a resident who moved in later is in it); without it, the built-in six."""
+    names = dict(NAMES if names is None else names)
+    people = sorted(names)
     marks = ",".join("?" * len(people))
     when = "COALESCE(a.started_at, a.finished_at)"
     acts = db.execute(
@@ -91,7 +95,7 @@ def entries(db, start, end, now):
         s, f = (x["arrived"], x["arrived"]) if x["kind"] == "move" else (x["began"], x["end"] or now)
         x["with"] = _with(stay, x["actor"], x["loc"], s, f)
         x["people"] = [x["actor"]]  # the line names only her; 同在 is shown beside it, the filter is by who it is about
-        x["text"] = _say(x, now)
+        x["text"] = _say(x, now, names)
         # an outside place she reached: world.db's 「X到了超市」 says the same, the caller drops that one
         w = x if x["kind"] == "move" else x["walk"]
         x["reached"] = w["arrived"] if w and str(w["to"] or "").startswith(V.PLACE) else None
@@ -191,8 +195,16 @@ def _item(a, evs, garments):
 
 
 def _round(w):
-    """A walk that ends where it began without going out (to the kitchen to check, and back): not a walk to tell."""
-    return w["frm"] == w["to"] and not any(v and _outside(v) for v in w["via"])
+    """A walk that ends where it began without going out (to the kitchen to check, and back): not a walk to tell.
+    The same holds outside: 「从超市去超市」 says nothing (the shop's own 「到了超市」 line is the arrival)."""
+    return w["frm"] == w["to"] and (_outside(w["frm"]) or not any(v and _outside(v) for v in w["via"]))
+
+
+def _out_again(w, it):
+    """The walk has been outside and is now home (or in some room), and the next move goes out again: a second trip.
+    Folding it in made one walk 「从超市去超市」 out of leaving the shop, a minute at home and going back."""
+    was_out = _outside(w["frm"]) or any(v and _outside(v) for v in w["via"])
+    return was_out and bool(w["to"]) and not _outside(w["to"]) and _outside(it["to"])
 
 
 def _fold(actor, acts, evs, garments, now):
@@ -210,7 +222,7 @@ def _fold(actor, acts, evs, garments, now):
             continue
         near = walk is not None and it["s"] - walk["f"] <= FOLD_S
         if it["kind"] == "move":
-            if near:
+            if near and not _out_again(walk, it):
                 walk.update(to=it["to"], loc=it["to"], f=it["f"], arrived=it["arrived"],
                             events=walk["events"] + it["events"], via=walk["via"] + [walk["to"]])
             else:
@@ -260,31 +272,31 @@ def _merge(prev, x):
     return True
 
 
-def _going(w, actor, merged):
+def _going(w, actor, merged, names=None):
     """「去浴室」「出门去超市」「从超市回到家，」 for the walk part of a line."""
     frm, to = w["from"], w["to"]
     if to and to.startswith(V.PLACE):
         if frm and frm.startswith(V.PLACE):
-            return f"从{place(frm, actor)}去{place(to, actor)}" + ("，" if merged else "")
-        return f"出门去{place(to, actor)}" + ("，" if merged else "")
+            return f"从{place(frm, actor, names)}去{place(to, actor, names)}" + ("，" if merged else "")
+        return f"出门去{place(to, actor, names)}" + ("，" if merged else "")
     if to == "away":
-        return f"离开{place(frm, actor)}" if frm and frm.startswith(V.PLACE) else "出门"
+        return f"离开{place(frm, actor, names)}" if frm and frm.startswith(V.PLACE) else "出门"
     # coming home: from the last outside place on the way (kitchen -> away -> supermarket -> away -> living)
     outside = [v for v in [frm, *(w.get("via") or [])] if v and v.startswith(V.PLACE)]
     back = outside[-1] if outside else None
     if back or frm == "away":
-        return (f"从{place(back, actor)}回到家，" if back else "回到家，") + (f"在{place(to, actor)}" if merged else
-                                                                         f"到了{place(to, actor)}")
-    return f"去{place(to, actor)}" if merged else f"从{place(frm, actor)}去了{place(to, actor)}"
+        return (f"从{place(back, actor, names)}回到家，" if back else "回到家，") + (f"在{place(to, actor, names)}" if merged else
+                                                                         f"到了{place(to, actor, names)}")
+    return f"去{place(to, actor, names)}" if merged else f"从{place(frm, actor, names)}去了{place(to, actor, names)}"
 
 
-def _say(x, now):
+def _say(x, now, names=None):
     actor, kind = x["actor"], x["kind"]
-    name = NAMES.get(actor, actor)
+    name = (NAMES if names is None else names).get(actor, actor)
     if kind == "move":
-        return name + _going({"from": x.get("frm"), "to": x["to"], "via": x.get("via")}, actor, False)
+        return name + _going({"from": x.get("frm"), "to": x["to"], "via": x.get("via")}, actor, False, names)
     w = x["walk"]
-    lead = _going(w, actor, True) if w else f"在{place(x['loc'], actor)}"
+    lead = _going(w, actor, True, names) if w else f"在{place(x['loc'], actor, names)}"
     long = (span(now - x["began"]) + "，还在继续") if x["running"] else span((x["end"] or now) - x["began"])
     if kind == "activity":
         act = x.get("act")
@@ -304,7 +316,7 @@ def _say(x, now):
         got = "、".join(f"{_label(b['item'], b.get('name'))} ×{b['qty']}" for b in x["bought"])
         yen = sum(b["yen"] or 0 for b in x["bought"])
         whose = {b["account"] for b in x["bought"]}
-        acct = "公账" if whose == {"house"} else "自己的钱" if whose <= set(NAMES) else "公账和自己的钱"
+        acct = "公账" if whose == {"house"} else "自己的钱" if whose <= set(NAMES if names is None else names) else "公账和自己的钱"
         return f"{name}{lead}买了{got}，共 ¥{yen:,}（{acct}）"
     return name
 

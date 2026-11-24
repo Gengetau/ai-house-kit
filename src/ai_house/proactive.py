@@ -469,17 +469,15 @@ class ProactiveEngine:
         if not text:
             return {"ok": True, "triggered": False, "reason": gen_mode}
 
-        check_ch = (
-            f"private:{chosen.actor}"
-            if target_scope == "private"
-            else (eff_group_channel if target_channel in ("onebot_v11", "onebot") else target_channel)
-        )
+        # the real group channel the message goes to (web `group`, or `qq-group:<id>`), the same id recall uses
+        out_ch = eff_group_channel if target_channel in ("webchat", "onebot_v11", "onebot") else target_channel
+        check_ch = f"private:{chosen.actor}" if target_scope == "private" else out_ch
         if getattr(daemon, "guard", None) is not None:
-            why = daemon.guard.check(check_ch, text)
+            why = daemon.guard.check(check_ch, text, actor=chosen.actor)
             if why:
                 return {"ok": True, "triggered": False, "reason": f"blocked:{why}"}
         if target_scope != "private" and getattr(daemon, "memory", None) is not None:
-            if daemon.memory.check_outbound_leak(chosen.actor, "group", text, now=ts):
+            if daemon.memory.check_outbound_leak(chosen.actor, "group", text, channel=out_ch, now=ts):
                 return {"ok": True, "triggered": False, "reason": "blocked:memory_leak"}
 
         with self._lock:

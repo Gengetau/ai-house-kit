@@ -71,13 +71,13 @@ def hm(ts):
     return datetime.datetime.fromtimestamp(ts, JST).strftime("%H:%M")
 
 
-def facts(db, world_db, day, now):
+def facts(db, world_db, day, now, names=None):
     """That day's timeline lines up to now, oldest first: {ts, text, with, events}. `db` is a read connection to
     life1.db (sqlite3.Row rows). The same lines the week page shows; a script 「X到了超市」 that a detail line already
     tells (same person, within 2 minutes) is left out, as the page does with the details on."""
     start = t0(day)
     end = min(start + 86400, now)
-    detail = [x for x in daylog.entries(db, start, start + 86400, now) if x["ts"] < end]
+    detail = [x for x in daylog.entries(db, start, start + 86400, now, names=names) if x["ts"] < end]
     w = sqlite3.connect(Path(world_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     w.row_factory = sqlite3.Row
     try:
@@ -90,7 +90,7 @@ def facts(db, world_db, day, now):
         if x["reached"]:
             hit = next((r for r in script if r["id"] not in told and abs(r["ts"] - x["reached"]) <= 120
                         and x["actor"] in json.loads(r["actors"] or "[]")
-                        and any(str(r["text"]).startswith(n + "到了") for n in NAMES.values())), None)
+                        and any(str(r["text"]).startswith(n + "到了") for n in (NAMES if names is None else names).values())), None)
             if hit:
                 told.add(hit["id"])
     lines = [{"ts": r["ts"], "end": None, "text": str(r["text"] or ""), "with": [], "events": [], "kind": "script"}
@@ -230,7 +230,7 @@ class DayNote:
             with self.s.read() as db:
                 if not force and db.execute("SELECT 1 FROM summaries WHERE summary_id=?", (sid,)).fetchone():
                     return "exists"
-                lines = facts(db, self.world_db, day, self.s.clock.now())
+                lines = facts(db, self.world_db, day, self.s.clock.now(), names=self.names)
                 span = db.execute("SELECT MIN(event_id), MAX(event_id) FROM events WHERE occurred_at>=? AND"
                                   " occurred_at<?", (t0(day), t0(day) + 86400)).fetchone()
         except Exception as e:  # world.db locked, a row daylog cannot read: said in the result, not retried

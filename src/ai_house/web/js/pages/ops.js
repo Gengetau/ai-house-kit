@@ -333,7 +333,7 @@ export async function render(view, route, ctx){
               el('span', {class: 'chip ' + (state.llm_mode === 'live_api' ? 'ok' : '')}, state.model_name || state.llm_mode))),
           el('div', {class: 'stack', style: 'gap:10px'},
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '当前世界包 (WorldPack)'), el('b', {}, state.pack_profile || 'life1')),
-            el('div', {class: 'row between'}, el('span', {class: 'muted'}, '对话驱动'), el('b', {}, state.llm_mode === 'live_api' ? '真实 OpenAI 兼容模型' : '零密钥离线演示引擎')),
+            el('div', {class: 'row between'}, el('span', {class: 'muted'}, '对话驱动'), el('b', {}, state.brain && state.brain !== 'direct' ? `agent 外壳（${state.brain}）` : (state.llm_mode === 'live_api' ? '真实 OpenAI 兼容模型' : '零密钥离线演示引擎'))),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '发现的世界包'), el('span', {class: 'small'}, (plugs.packs || []).join('、') || 'default')),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '消息通道 (Channels)'), el('span', {class: 'small'}, (plugs.channels || []).join('、') || 'webchat')),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '扩展 (Extensions)'), el('span', {class: 'small'}, (plugs.extensions || []).join('、') || '无')),
