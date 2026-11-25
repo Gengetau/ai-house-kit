@@ -33,6 +33,8 @@ earlier endpoint showed (it showed the owner's private-chat summaries), not wide
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
+import json
 import logging
 import re
 import sqlite3
@@ -51,6 +53,9 @@ WEB_GROUP_CHAT = "group:1"  # the kit's web group (as `memory_common.WEB_GROUP_C
 _STATE = {"proposed": "open", "accepted": "open", "completed": "completed", "expired": "expired",
           "missed": "expired", "declined": "cancelled", "cancelled": "cancelled"}
 
+_JST = _dt.timezone(_dt.timedelta(hours=9))
+# the owner asks for something anew in the batch (so a repeated item is a real second errand, never a restatement)
+_NEW_REQUEST = re.compile(r"再|又|另外|还要|还想|还得|多买|多带|第二|两次|重新")
 _OWNER_NAME_BAD = re.compile(r"\(你\)|（你）|·头衔.*$")
 
 
@@ -163,7 +168,15 @@ class CommonIntents:
         def apply_chat(consumer, chat, private, ops, lines, *a, **k):
             tl.owner_cards = owner_cards(lines)
             try:
-                return orig_apply(consumer, chat, private, ops, lines, *a, **k)
+                now = k.get("now", a[0] if a else None)
+                try:
+                    kept, dropped = self._without_restated(i, consumer, chat, private, ops, lines, now)
+                except Exception:  # noqa: BLE001  # this guard never holds the memories back: on doubt nothing is dropped
+                    kept, dropped = ops, 0
+                done = orig_apply(consumer, chat, private, kept, lines, *a, **k)
+                if dropped and isinstance(done, dict):
+                    done["merged"] = done.get("merged", 0) + dropped  # counted the way a merge into an old row is
+                return done
             finally:
                 tl.owner_cards = frozenset()
 
@@ -176,6 +189,91 @@ class CommonIntents:
             return key
 
         i.apply_chat, i._party_key = apply_chat, party_key
+
+    def _day_start(self, now: Optional[float]) -> tuple:
+        from .diary import DIARY_DAY_STARTS_H
+        t = float(now) if now is not None else float(self._ambient_now())
+        local = _dt.datetime.fromtimestamp(t - DIARY_DAY_STARTS_H * 3600, _JST)
+        return t, _dt.datetime.combine(local.date(), _dt.time(hour=DIARY_DAY_STARTS_H), _JST).timestamp()
+
+    def _without_restated(self, i: Any, consumer: str, chat: Any, private: bool, ops: Any, lines: Any,
+                          now: Optional[float]) -> tuple:
+        """Drop the intent ops that only restate a promise of hers that was completed today. -> (ops kept, n dropped).
+
+        The shared `_new` merges into open rows only, so once the kernel closed "buy a box of tea" a later chat in which
+        she repeats the old errand ("the tea isn't bought yet") registered it a second time. An op is dropped only when
+        ALL of these hold; on any doubt it is kept (a second real errand is worse to lose than a duplicate to see):
+          1. its terms compile to something the kernel understands (not `unsupported`);
+          2. the op's quote is a line of HERS (a restatement), not a line of the owner or anybody else;
+          3. no line of the owner in this batch asks for something anew (再 / 又 / 另外 / 还要 / 多买 ...);
+          4. a promise of the same actor, party, beneficiary and audience was completed today (house day, 05:00 JST)
+             and its terms are equal to the op's.
+        A clearly new request ("再买一盒") fails 2 or 3 and registers as before."""
+        if not (i.ON and ops):
+            return ops, 0
+        actor = i.W.actor_of(consumer)
+        spoken = i._speakers(lines)
+        if any(who == "owner" and _NEW_REQUEST.search(words or "") for who, words in spoken):
+            return ops, 0
+        _, start = self._day_start(now)
+        with self._conn() as c:
+            done = [r for r in c.execute("select * from intents where status='completed' and actor=? and updated>=?",
+                                         (actor, start)) if i._same_audience(r, actor, chat, private)]
+        if not done:
+            return ops, 0
+        kept, dropped = [], 0
+        for op in ops:
+            if self._restates(i, actor, op, spoken, done):
+                dropped += 1
+            else:
+                kept.append(op)
+        return kept, dropped
+
+    def _restates(self, i: Any, actor: str, op: Any, spoken: Any, done: Any) -> bool:
+        if not isinstance(op, dict) or op.get("op") != "intent" or op.get("with"):
+            return False
+        if i._quoted(op.get("quote"), spoken) != actor:
+            return False
+        names = op.get("for") or []
+        keys = [i._party_key(n) for n in ([names] if isinstance(names, str) else names)]
+        if any(k is None for k in keys):
+            return False
+        bene = sorted(set(keys) - {actor})
+        terms = self._rules.compile_terms(str(op.get("text") or ""), self.vocab, [actor], bene)
+        if not terms or terms == [{"kind": "unsupported"}]:
+            return False
+        for r in done:
+            if json.loads(r["party"]) != [actor] or json.loads(r["beneficiary"] or "[]") != bene:
+                continue
+            if self._rules.compile_terms(r["text"], self.vocab, [actor], bene) == terms:
+                return True
+        return False
+
+    def done_today_lines(self, actor: str, now: Optional[float] = None, private: bool = False, n: int = 3) -> List[str]:
+        """Finished facts for a chat turn: promises of hers that the kernel (or the chat) closed today, newest `n`, as
+        "答应房主的「…」已经办完了（HH:MM）". A private promise's text is only given to her own private chat with the
+        owner, never to a group turn. Off with INTENTS=0; independent of INTENTS_SHOW (it nags about nothing open)."""
+        if not self._i.ON:
+            return []
+        t, start = self._day_start(now)
+        try:
+            with self._conn() as c:
+                found = c.execute("select * from intents where status='completed' and updated>=? and updated<=? "
+                                  "order by updated desc, id desc", (start, t)).fetchall()
+        except sqlite3.Error:
+            return []
+        out: List[tuple] = []
+        for r in found:
+            if actor not in json.loads(r["party"]):
+                continue
+            if r["visibility"] == "private" and not (private and r["actor"] == actor):
+                continue
+            who = "答应房主的" if "owner" in json.loads(r["beneficiary"] or "[]") else "约好的"
+            hm = _dt.datetime.fromtimestamp(float(r["updated"]), _JST).strftime("%H:%M")
+            out.append((float(r["updated"]), f"{who}「{r['text']}」已经办完了（{hm}）"))
+            if len(out) >= n:
+                break
+        return [text for _, text in sorted(out)]
 
     @property
     def intents_module(self) -> Any:

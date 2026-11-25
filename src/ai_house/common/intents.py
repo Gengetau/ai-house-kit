@@ -892,7 +892,7 @@ def _structured(r, now):
     times = [f.get("said_at", f.get("at", d["created"])) for f in d["refs"] if "chat" in f]
     d["said_at"] = min(times) if times else d["created"]
     d["deadline"] = _deadline(d, os.environ.get("INTENTS_EXPIRY_V2") == "1")
-    d["terms"] = rules.compile_terms(d["text"], vocab, d["party"])
+    d["terms"] = rules.compile_terms(d["text"], vocab, d["party"], d["beneficiary"])
     return d
 
 

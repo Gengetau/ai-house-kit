@@ -45,7 +45,8 @@
 | `qq_identity.py` | 房主的别名不再写在这个文件里，改为读花名册 `OWNER["aliases"]`（没有就只认「房主」「owner」） | 别名是数据，不是逻辑 |
 | `intents.py` | 开头两行 `import world as W` / `import qq_identity as ID` 改成：在包里 `from . import world_shim as W, qq_identity as ID`，否则照旧 | 同一个文件两边都能用；私有端的 `world` 是它自己那个大模块，kit 里同名的那几样在 `world_shim.py` |
 | `intents.py` | **行为**：新增开关 `INTENTS_PRESENCE`（模块导入时读，和 `INTENTS_SHOW` 一样，默认 `1`；模块里的变量叫 `PRESENCE_ON`，因为 `PRESENCE` 这个名字原文件已经用作建表语句）。关着时 `queue_world` 不再调用 `presence_from_chat`，`presence_from_chat` 自己也直接返回 `None`：不从聊天里推房主在哪个房间，也不往房主化身的队列里写东西；`owner_chat_queue` 照常写 | 维护者 2026-11-24 定（「从聊天里判断房主在哪」做成开关）。**默认开，私有端换用后行为不变**；kit 的守护进程以后自己决定开不开 |
-| `intents.py` | 除上面两条外逐行相同。注意 `_rules()`（找 `promise_rules` 和词表）按私有部署的目录去找旁边的 `world-kernel`，在 kit 的包里找不到这个目录：用的时候要么 `worldkernel` 已在 `sys.path` 上，要么适配层把 `_rules` 换成自己的（带上按包绑定的 `promise_rules.bound(vocab)`）。这里没改 | 不改共享文件；换法留给适配层 |
+| `intents.py` | **行为**：`_structured` 里把约定编成内核条件的那一行多传一个参数：`rules.compile_terms(d["text"], vocab, d["party"], d["beneficiary"])`（原来没有最后一个）。`promise_rules.compile_terms` 同时加了可选参数 `beneficiary`，只在受益人是房主时，才把「替／帮／给＋某个短名字＋买／带」里的名字当成房主的昵称剥掉 | 2026-11-25 真机实测：QQ 私聊里模型写的约定摘要用的是房主的 QQ 昵称（「替某某买一盒红茶带回来」），原来的语法不认识这个名字，约定登记了却不会被执行。**两边要一起换**：只换 `intents.py`、内核的 `promise_rules.py` 还是旧的，这一行会报参数个数不对 |
+| `intents.py` | 除上面三条外逐行相同。注意 `_rules()`（找 `promise_rules` 和词表）按私有部署的目录去找旁边的 `world-kernel`，在 kit 的包里找不到这个目录：用的时候要么 `worldkernel` 已在 `sys.path` 上，要么适配层把 `_rules` 换成自己的（带上按包绑定的 `promise_rules.bound(vocab)`）。这里没改 | 不改共享文件；换法留给适配层 |
 
 ## `world_shim.py`：私有部署的 `world` 里，约定用到的那几样
 

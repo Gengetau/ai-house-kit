@@ -443,6 +443,30 @@ class HouseDaemon:
                 return False
             pending[0].join(timeout=min(left, 0.2))
 
+    def _today_lines(self, aid: str, now: float, is_private: bool) -> List[str]:
+        """What she already did today (the house's own record of her, newest 8) plus the promises already finished today.
+        Her own world history, so it goes to group turns as well; a private promise's text only to her private chat.
+        Never raises: a fresh house with nothing recorded yet, or a read that fails, simply gives no block."""
+        lines: List[str] = []
+        try:
+            from .diary import collect_actor_facts, diary_day
+            facts = collect_actor_facts(self.life_db, self.world_db, aid, diary_day(now), now, self.vocab.NAMES)
+            # the newest 8, but what she bought stays (up to the last 3 purchases) even when later chores crowd it out
+            picked = set(sorted(k for k, f in enumerate(facts) if "买了" in f)[-3:])
+            for k in range(len(facts) - 1, -1, -1):
+                if len(picked) >= 8:
+                    break
+                picked.add(k)
+            lines.extend(facts[k] for k in sorted(picked))
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"today facts error: {type(exc).__name__}")
+        if self.intents is not None:
+            try:
+                lines.extend(self.intents.done_today_lines(aid, now, is_private))
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"done promises error: {type(exc).__name__}")
+        return lines
+
     def _turn_world_ok(self, turn_epoch: int, *, need_intents: bool = False) -> bool:
         """False once `reset_house` ran since the turn began. Takes the lock so a concurrent remount is waited out."""
         with self._lock:
@@ -1601,6 +1625,9 @@ class HouseDaemon:
                     self.log(f"promise card lines error: {type(exc).__name__}")
                 if promise_lines:
                     mem_ctx = "\n".join(filter(None, [mem_ctx, "你和别人约好、快到时间的事：", *promise_lines]))
+            today = self._today_lines(aid, now, is_private)
+            if today:
+                mem_ctx = "\n".join(filter(None, [mem_ctx, "你今天已经做过的事（屋里的记录，按时间）：", *today]))
             turn_media: List[Dict[str, Any]] = []
 
             def _run_tool(
