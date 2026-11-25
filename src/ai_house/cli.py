@@ -420,10 +420,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "OneBot v11 WebSocket 配置与依赖就绪" + ("" if onebot_ping else "（加 --onebot-ping 可实际连一次协议端）")
             ),
         })
-        from .builtin_plugins.onebot_ws import parse_listen_only
+        from .builtin_plugins.onebot_ws import parse_listen_only, parse_listen_only_observe
 
         try:
             listen_on = parse_listen_only(eff_env.get("ONEBOT_LISTEN_ONLY"))
+            parse_listen_only_observe(eff_env.get("ONEBOT_LISTEN_ONLY_OBSERVE"), listen_on)
             checks.append({
                 "name": "onebot_listen_only",
                 "ok": True,

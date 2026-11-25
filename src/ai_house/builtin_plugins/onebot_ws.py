@@ -21,7 +21,8 @@ Rules enforced here:
   * the socket reconnects with exponential backoff; the access token is only sent as a header and never logged;
   * one "may this be written?" decision sits at the single place that writes to the socket (`_call_detailed`): a muted
     group, a destination that is not whitelisted and segment types outside a small allow-list are refused there,
-    whoever asks; with `ONEBOT_LISTEN_ONLY=1` it refuses everything (the channel only listens, see docs/CHAT-AND-QQ.md).
+    whoever asks; with `ONEBOT_LISTEN_ONLY=1` it refuses everything (the channel only listens, see docs/CHAT-AND-QQ.md), except the two
+    history reads in `LISTEN_ONLY_READ_ACTIONS` when `ONEBOT_LISTEN_ONLY_OBSERVE=1`.
 
 Threads: one reader (only receives, resolves echo futures, queues events), one worker (talks to the model and
 sends). `start()` returns immediately.
@@ -101,6 +102,11 @@ class OneBotConfig:
     send_retries: int = 2
     retry_backoff_s: float = 0.15
     listen_only: bool = False  # ONEBOT_LISTEN_ONLY=1: read everything, write nothing (env only, never from stored config)
+    listen_only_observe: bool = False  # ONEBOT_LISTEN_ONLY_OBSERVE=1: read the account's own sent replies back (env only)
+    observe_window_s: float = 120.0  # how long after the incoming message to look for the real reply
+    observe_poll_s: float = 10.0
+    observe_max_msgs: int = 5  # bubbles collected for one reply
+    observe_history_count: int = 20  # `count` asked of the history action
 
     @property
     def where(self) -> str:
@@ -120,16 +126,34 @@ def parse_listen_only(raw: Any) -> bool:
     raise ChannelConfigError("ONEBOT_LISTEN_ONLY 只能写 1（只听不发）、0 或留空")
 
 
+def parse_listen_only_observe(raw: Any, listen_only: bool) -> bool:
+    """`ONEBOT_LISTEN_ONLY_OBSERVE`: exactly `1`, `0` or empty/unset. It reads the account's own sent replies back, which
+    only makes sense (and is only allowed) while `ONEBOT_LISTEN_ONLY=1`."""
+    v = str(raw if raw is not None else "").strip()
+    if v in ("", "0"):
+        return False
+    if v != "1":
+        raise ChannelConfigError("ONEBOT_LISTEN_ONLY_OBSERVE 只能写 1（读回账号真正发出的回复）、0 或留空")
+    if not listen_only:
+        raise ChannelConfigError("ONEBOT_LISTEN_ONLY_OBSERVE=1 必须和 ONEBOT_LISTEN_ONLY=1 一起用（只在只听不发时才去读回别的程序发出的回复）")
+    return True
+
+
 # What may be written to the socket: two actions, four segment types. Everything else is refused at the writer.
 SEND_ACTIONS = frozenset({"send_group_msg", "send_private_msg"})
+# The only actions a listen-only channel may put on the socket, and only with ONEBOT_LISTEN_ONLY_OBSERVE=1: both read
+# the chat history. Anything not listed here (every send_*, delete_msg, set_*, get_login_info, ...) stays refused.
+LISTEN_ONLY_READ_ACTIONS = frozenset({"get_friend_msg_history", "get_group_msg_history"})
 ALLOWED_SEGMENTS = frozenset({"text", "at", "image", "record"})
 
 
 class _ReceiveOnlySocket:
-    """The socket as `OneBotChannel._ws` holds it in listen-only mode: it can be read and closed, never written to."""
+    """The socket as `OneBotChannel._ws` holds it in listen-only mode: it can be read and closed, never written to,
+    except for a frame whose action is in `allow` (the read-only history actions, only with observe on)."""
 
-    def __init__(self, ws: Any) -> None:
+    def __init__(self, ws: Any, allow: frozenset = frozenset()) -> None:
         self._ws = ws
+        self._allow = allow
 
     def __iter__(self) -> Any:
         return iter(self._ws)
@@ -140,7 +164,14 @@ class _ReceiveOnlySocket:
     def close(self, *a: Any, **kw: Any) -> Any:
         return self._ws.close(*a, **kw)
 
-    def send(self, *_a: Any, **_kw: Any) -> None:
+    def send(self, data: Any = None, *_a: Any, **_kw: Any) -> Any:
+        if self._allow and isinstance(data, str):
+            try:
+                frame = json.loads(data)
+            except ValueError:
+                frame = None
+            if isinstance(frame, dict) and frame.get("action") in self._allow:
+                return self._ws.send(data)
         raise PermissionError("listen_only: this channel does not write")
 
 
@@ -236,8 +267,20 @@ class OneBotChannel(ChannelPlugin):
             "send_failed": 0, "blocked": 0, "dropped": 0, "demo_skipped": 0, "duplicates": 0,
             "gate_limited": 0, "listen_only": 0,
         }
+        if self.observing:  # counters of the observe path appear only when it is on
+            self.stats.update({"observed": 0, "observe_miss": 0, "observe_failed": 0})
+        self._observe_slots = threading.BoundedSemaphore(8)  # replies being waited for at once
+        self._observed_ids: Deque[str] = deque(maxlen=200)  # history messages already used as someone's reply
         self.last_limit: Optional[Dict[str, Any]] = None
         self._shadow_mem: Deque[Dict[str, Any]] = deque(maxlen=500)  # the listen-only record when there is no runtime dir
+
+    @property
+    def observing(self) -> bool:
+        """True when a listen-only channel also reads back what the account really sent (`ONEBOT_LISTEN_ONLY_OBSERVE=1`)."""
+        return self.listen_only and self.cfg.listen_only_observe is True
+
+    def _read_actions(self) -> frozenset:
+        return LISTEN_ONLY_READ_ACTIONS if self.observing else frozenset()
 
     @property
     def listen_only(self) -> bool:
@@ -267,6 +310,7 @@ class OneBotChannel(ChannelPlugin):
             import websockets.sync.client  # noqa: F401
         except ImportError:
             raise ChannelConfigError('接 QQ 需要 websockets：pip install "ai-house-kit[onebot]"') from None
+        listen_on = parse_listen_only(eff.get("ONEBOT_LISTEN_ONLY"))
         cfg = OneBotConfig(
             url=url,
             owners=owners,
@@ -285,7 +329,8 @@ class OneBotChannel(ChannelPlugin):
             debounce_ms=int(_num(eff, "ONEBOT_DEBOUNCE_MS", 0, 0, 5000)),
             send_retries=int(_num(eff, "ONEBOT_SEND_RETRIES", 2, 0, 5)),
             retry_backoff_s=_num(eff, "ONEBOT_RETRY_BACKOFF_S", 0.15, 0.01, 10.0),
-            listen_only=parse_listen_only(eff.get("ONEBOT_LISTEN_ONLY")),
+            listen_only=listen_on,
+            listen_only_observe=parse_listen_only_observe(eff.get("ONEBOT_LISTEN_ONLY_OBSERVE"), listen_on),
         )
         return cls(cfg)
 
@@ -491,7 +536,7 @@ class OneBotChannel(ChannelPlugin):
                     self.cfg.url, additional_headers=headers, open_timeout=10, max_size=4 * 1024 * 1024
                 ) as ws:
                     with self._ws_lock:
-                        self._ws = _ReceiveOnlySocket(ws) if self.listen_only else ws
+                        self._ws = _ReceiveOnlySocket(ws, self._read_actions()) if self.listen_only else ws
                     started = time.monotonic()
                     self._bump("connects")
                     self._log("connected")
@@ -880,6 +925,12 @@ class OneBotChannel(ChannelPlugin):
             mids = [str(x) for x in (ev.get("_message_ids") or ()) if str(x).strip()] or (
                 [str(ev.get("message_id"))] if str(ev.get("message_id") or "").strip() else []
             )
+            if self.observing:  # off the event path: a thread waits for what the account really sent
+                self._start_observe(
+                    kind, str(target), channel, speaker, roommate, mids,
+                    t0=stamp if isinstance(stamp, (int, float)) else time.time(),
+                    self_id=_id(ev.get("self_id")) or self.self_id,
+                )
             send_groups: List[Tuple[List[str], List[Dict[str, Any]]]] = []
             for rep in res.get("replies") or ():
                 if rep.get("mode") == "blocked":
@@ -915,6 +966,136 @@ class OneBotChannel(ChannelPlugin):
                 with self._dedup_lock:
                     for sp_id in spool_ids:
                         self._inflight_spool_ids.discard(sp_id)
+
+    # ---- observing what the account really sent (ONEBOT_LISTEN_ONLY_OBSERVE=1) -------------------------------------
+    def _start_observe(
+        self, kind: str, target: str, channel: str, speaker: Speaker, roommate: str, inbound_ids: Sequence[str],
+        *, t0: float, self_id: str,
+    ) -> None:
+        if not hasattr(self._host, "record_observed_reply"):
+            self._log("observe: the host cannot take an observed reply; skipped")
+            return
+        if not self._observe_slots.acquire(blocking=False):
+            self._log("observe: too many replies being waited for; skipped")
+            return
+
+        def run() -> None:
+            try:
+                self._observe_turn(kind, target, channel, speaker, roommate, inbound_ids, t0, self_id)
+            except Exception as exc:  # noqa: BLE001 - never log message text
+                self._bump("observe_failed")
+                self._log(f"observe failed: {type(exc).__name__}")
+            finally:
+                self._observe_slots.release()
+
+        th = threading.Thread(target=run, name="onebot-observe", daemon=True)
+        th.start()
+        self._threads.append(th)
+        self._threads = [t for t in self._threads if t.is_alive() or t is th]
+
+    def _observe_turn(
+        self, kind: str, target: str, channel: str, speaker: Speaker, roommate: str, inbound_ids: Sequence[str],
+        t0: float, self_id: str,
+    ) -> None:
+        """Wait for the reply the other program sends from this account, then hand it to the host as her reply."""
+        did = f"observe-{inbound_ids[-1] if inbound_ids else uuid.uuid4().hex[:12]}"
+
+        def note(verdict: str, length: int = 0) -> None:
+            self.record_listen_only(
+                path="observe", verdict=verdict, kind=kind, target=target, actor=roommate, text_len=length,
+                inbound_ids=inbound_ids, delivery_id=did,
+            )
+
+        if not self_id:
+            self._log("observe: the account's own id is not known yet; skipped")
+            note("observe_error:no_self_id")
+            return
+        found, err = self._wait_for_own_reply(kind, target, t0, self_id)
+        if err:
+            self._bump("observe_failed")
+            self._log(f"observe: history read failed ({err}); no reply recorded")
+            note(f"observe_error:{err}")
+            return
+        if not found:
+            self._bump("observe_miss")
+            note("observe_none")
+            return
+        text = "\n".join(found)[:2000]
+        if self._host.record_observed_reply(channel, text, speaker, actor=roommate):
+            self._bump("observed")
+            note(f"observed:{len(found)}", len(text))
+        else:
+            self._bump("observe_failed")
+            note("observe_error:host_refused")
+
+    def _wait_for_own_reply(self, kind: str, target: str, t0: float, self_id: str) -> Tuple[List[str], str]:
+        """(bubbles, "") when found, ([], "") when nothing came in the window, ([], error code) when a read failed.
+        Polls the history; the first poll that finds a reply is followed by one more poll for the next bubbles."""
+        action = "get_group_msg_history" if kind == "group" else "get_friend_msg_history"
+        key = "group_id" if kind == "group" else "user_id"
+        deadline = time.monotonic() + self.cfg.observe_window_s
+        best: List[Tuple[str, str]] = []
+        found_once = False
+        while not self._stop.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0 and not found_once:
+                break
+            if self._stop.wait(self.cfg.observe_poll_s if found_once else min(self.cfg.observe_poll_s, left)):
+                break
+            ok, code, resp, _ = self._call_full(action, {key: int(target), "count": self.cfg.observe_history_count})
+            if not ok:
+                return [], code
+            msgs = self._history_list(resp.get("data"))
+            if msgs is None:
+                return [], "bad_shape"
+            picked, closed = self._pick_own_replies(msgs, t0, self_id)
+            if picked:
+                best = picked
+            if found_once or closed or len(best) >= self.cfg.observe_max_msgs:
+                break
+            found_once = bool(picked)
+        if best:
+            self._observed_ids.extend(mid for mid, _ in best if mid)
+        return [t for _, t in best], ""
+
+    @staticmethod
+    def _history_list(data: Any) -> Optional[List[Mapping[str, Any]]]:
+        """The message list out of a history response: `{"messages": [...]}` or a bare list."""
+        if isinstance(data, dict):
+            data = data.get("messages")
+        if not isinstance(data, list):
+            return None
+        return [m for m in data if isinstance(m, Mapping)]
+
+    def _pick_own_replies(
+        self, msgs: Sequence[Mapping[str, Any]], t0: float, self_id: str
+    ) -> Tuple[List[Tuple[str, str]], bool]:
+        """([(message_id, text)] this account sent at or after `t0` within the window, whether someone else spoke after
+        them). Messages already used for an earlier turn are skipped; a window's worth of bubbles at most."""
+        picked: List[Tuple[str, str]] = []
+        closed = False
+        t_end = t0 + self.cfg.observe_window_s
+        timed = [m for m in msgs if isinstance(m.get("time"), (int, float))]
+        for m in sorted(timed, key=lambda x: x["time"]):
+            if m["time"] < t0 or m["time"] > t_end:
+                continue
+            sender = m.get("sender") if isinstance(m.get("sender"), Mapping) else {}
+            uid = _id(m.get("user_id")) or _id(sender.get("user_id"))
+            if uid != self_id:
+                if picked:
+                    closed = True
+                    break
+                continue
+            mid = str(m.get("message_id") or "")
+            if mid and mid in self._observed_ids:
+                continue
+            text, _ = parse_message(m.get("message", m.get("raw_message", "")), self_id)
+            if not text:
+                continue
+            picked.append((mid, text))
+            if len(picked) >= self.cfg.observe_max_msgs:
+                break
+        return picked, closed
 
     # ---- sending -------------------------------------------------------------------------------------------------
     def _split(self, text: str) -> List[str]:
@@ -1120,10 +1301,12 @@ class OneBotChannel(ChannelPlugin):
     def _may_write(self, action: str, params: Mapping[str, Any]) -> str:
         """The single "may this be written?" decision, asked right before the socket write. "" = yes, else the reason.
 
-        Listen-only refuses everything. Otherwise: only the two send actions, only whitelisted groups, no group that is
+        Listen-only refuses everything except the history reads in `LISTEN_ONLY_READ_ACTIONS` (observe on). Otherwise: only the two send actions, only whitelisted groups, no group that is
         muted right now, and only segment types in `ALLOWED_SEGMENTS` (a raw CQ string or an unknown segment is not
         treated as harmless text). Whoever calls the writer, the reply path, the outbox or a test, passes through here."""
         if self.listen_only:
+            if action in self._read_actions():  # a read-only history action, only with observe on
+                return ""
             return "refused_listen_only"
         if action not in SEND_ACTIONS:
             return "refused_action"
@@ -1147,13 +1330,22 @@ class OneBotChannel(ChannelPlugin):
         return ""
 
     def _call_detailed(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, str, bool]:
+        ok, code, resp, left_wire = self._call_full(action, params)
+        if not ok:
+            return False, code, "", left_wire
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        msg_id = str(data.get("message_id") or "")
+        return True, "ok", (msg_id or f"ob-{resp.get('echo')}"), True
+
+    def _call_full(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any], bool]:
+        """One OneBot call: (ok, code, the whole response, left_wire). The response is {} unless ok."""
         refusal = self._may_write(action, params)
         if refusal:
-            return False, refusal, "", False
+            return False, refusal, {}, False
         with self._ws_lock:
             ws = self._ws
         if ws is None:
-            return False, "not_connected", "", False
+            return False, "not_connected", {}, False
         with self._pending_lock:
             self._echo += 1
             echo = f"ah{self._echo}"
@@ -1165,29 +1357,27 @@ class OneBotChannel(ChannelPlugin):
             left_wire = True
             resp = fut.result(timeout=self.cfg.send_timeout_s)
         except PermissionError:  # the stored socket itself refused (listen-only wrapper); keep the connection
-            return False, "refused_listen_only", "", False
+            return False, "refused_listen_only", {}, False
         except concurrent.futures.TimeoutError:
-            return False, "timeout", "", True
+            return False, "timeout", {}, True
         except ConnectionError:
             if not left_wire:
                 with self._ws_lock:
                     if self._ws is ws:
                         self._ws = None
-            return False, "disconnected", "", left_wire
+            return False, "disconnected", {}, left_wire
         except Exception:
             if not left_wire:
                 with self._ws_lock:
                     if self._ws is ws:
                         self._ws = None
-            return False, "send_error", "", left_wire
+            return False, "send_error", {}, left_wire
         finally:
             with self._pending_lock:
                 self._pending.pop(echo, None)
         if resp.get("status") == "ok" or resp.get("retcode") == 0:
-            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
-            msg_id = str(data.get("message_id") or "")
-            return True, "ok", (msg_id or f"ob-{echo}"), True
-        return False, f"retcode_{resp.get('retcode')}", "", False
+            return True, "ok", {**resp, "echo": echo}, True
+        return False, f"retcode_{resp.get('retcode')}", {}, False
 
     def _call(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str]:
         ok, code, _, _ = self._call_detailed(action, params)

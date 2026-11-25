@@ -77,6 +77,7 @@ from .settings_store import SettingsStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
 SHADOW_CHAT_MODE = "shadow"  # a chat row holding a draft that a listen-only channel did not send
+OBSERVED_CHAT_MODE = "observed"  # a chat row holding a reply that another program really sent from the QQ account
 
 
 def _house_time_line(now: float) -> str:
@@ -1484,6 +1485,52 @@ class HouseDaemon:
         ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
             return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only)
+
+    def record_observed_reply(
+        self,
+        channel: str,
+        text: str,
+        speaker: Speaker,
+        *,
+        actor: Optional[str] = None,
+    ) -> bool:
+        """A listen-only channel with observe on read back what the account really sent for a turn it only drafted.
+        That is what she said: it is stored as her chat row (mode `observed`, shown to her like any reply) and memory
+        gets it as her line (the owner's line was observed with the turn), so extraction and the promise chain see an
+        answer. False when nothing was stored (empty text, no such room or roommate, world gone)."""
+        text = str(text or "").strip()[:2000]
+        if not text:
+            return False
+        is_private = str(channel or "").startswith("private:")
+        aid = channel.split(":", 1)[1] if is_private else str(actor or "")
+        with self._lock:
+            if self.needs_onboarding or self.authority is None or self.memory is None:
+                return False
+            if aid not in self.vocab.ROSTER:
+                return False
+            now = self.clock.now()
+            with contextlib.closing(sqlite3.connect(self.world_db)) as c:
+                with c:
+                    c.execute(
+                        "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, media_json, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, '', ?, '[]', ?)",
+                        (channel, aid, self.vocab.NAMES.get(aid, aid), "owner" if speaker.is_owner else speaker.name,
+                         text, OBSERVED_CHAT_MODE, now),
+                    )
+            # an empty inbound text: the owner's line is already in memory, only her line is added
+            self.memory.observe(
+                aid,
+                "private" if is_private else "group",
+                "",
+                channel="" if is_private else channel,
+                speaker=speaker.name,
+                speaker_role="owner" if speaker.is_owner else "member",
+                speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
+                reply=text,
+                now=now,
+            )
+        self._broadcast("chat", {"channel": "group" if channel == "group" else "private", "replies": 1})
+        return True
 
     def _converse(
         self,
