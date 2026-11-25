@@ -10,15 +10,26 @@ NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 UNITS = r"[份包袋瓶个块杯盒]"
 NUMBER = r"(?:[1-6一两二三四五六])"
 TOGETHER_S = 600
+# When a promise is made for the owner, the model's summary may call the owner by the chat nickname instead of
+# 房主. Only the shape (替|帮|给)<short name>(买|带) is read that way, and only when the caller says the beneficiary
+# is the owner. These are not names.
+_NOT_A_NAME = re.compile(r"自己|忙|大家|别人|我们|你们|她们|他们|一起|顺便|顺路")
+_ALIAS = re.compile(r"(?P<verb>替|帮|给)(?P<name>[^\s，。！？,.!?：:（）()买带]{1,4}?)(?=买|带)")
+# Time words that may stand alone inside a note in brackets, such as （11月21日）or (周六 下午3点).
+_DATE = r"(?:\d{4}年)?\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d|今天|明天|后天|今晚|明晚|当天|下午|上午|晚上|早上|周末|" \
+        r"(?:周|星期)[一二三四五六日天]|[一二三四五六七八九十\d]+点半?|\d{1,2}[:：]\d\d"
+_DATE_NOTE = re.compile(r"[（(]\s*(?:" + _DATE + r")(?:[\s,，、]*(?:" + _DATE + r"))*\s*[）)]")
 
 
-def compile_terms(text, vocab, party=None):
+def compile_terms(text, vocab, party=None, beneficiary=None):
     """Closed grammar: unrecognised residue blocks automatic completion, never drops a clause. The names and
-    the housemates it knows are those of the default pack; `bound(vocab)` gives the same for another pack."""
-    return _compile_terms(text, vocab, party, DEFAULT_NAMES)
+    the housemates it knows are those of the default pack; `bound(vocab)` gives the same for another pack.
+    `beneficiary` (optional, e.g. ["owner"]) is who the promise is for; only then may the owner's chat nickname
+    in `替<nickname>买…` count as the owner."""
+    return _compile_terms(text, vocab, party, DEFAULT_NAMES, beneficiary)
 
 
-def _compile_terms(text, vocab, party, names):
+def _compile_terms(text, vocab, party, names, beneficiary=None):
     from .inventory import RULES
     t = str(text)
     people = len(party) if party is not None else sum(name in t for name in names)
@@ -27,9 +38,16 @@ def _compile_terms(text, vocab, party, names):
     # Canonical names in person files need not be called 'name'.
     for name in names:
         t = t.replace(name, "")
-    t = re.sub(r"\d{4}-\d\d-\d\d(?: \d\d:\d\d)?|今天|明天|后天|今晚|明晚|下午|上午|晚上|早上|周末|"
-               r"周[一二三四五六日天]|[一二三四五六七八九十\d]+点(?:半)?|下次|改天|有空时", "", t)
-    t = re.sub(r"我们|我|她|打算|准备|答应|约好|说好|帮|替|给|要|会|再|顺便|去一趟|一下|吧|呢", "", t)
+    t = _DATE_NOTE.sub("", t)
+    t = re.sub(r"(?:\d{4}年)?\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d(?: \d\d:\d\d)?|今天|明天|后天|今晚|明晚|当天|下午|上午|"
+               r"晚上|早上|周末|(?:周|星期)[一二三四五六日天]|[一二三四五六七八九十\d]+点(?:半)?|下次|改天|有空时", "", t)
+    if beneficiary is not None and list(beneficiary) == ["owner"]:
+        alias = _ALIAS.search(t)
+        if alias and not _NOT_A_NAME.search(alias.group("name")):
+            t = t[:alias.start("name")] + t[alias.end("name"):]
+    # A pronoun right after 帮/替/给/答应 is the person it is done for; anywhere else it stays residue.
+    t = re.sub(r"(帮|替|给|答应)[他你]", r"\1", t)
+    t = re.sub(r"我们|我|她|打算|准备|答应|约好|说好|帮|替|给|要|会|再|顺便|顺路|去一趟|一下|吧|呢", "", t)
     terms = []
     handoff = bool(re.search(r"交给|送给|一起吃|拿给", str(text)))
     # Remove delivery clause only after recording the unsupported condition.
@@ -38,6 +56,12 @@ def _compile_terms(text, vocab, party, names):
         t = re.sub(r"(?:交|送|拿)(?:到)?(?:手里|给)?|吃", "", t)
     brought = bool(re.search(r"带回(?:来|家)?|拿回(?:来|家)?", t))
     t = re.sub(r"带回(?:来|家)?|拿回(?:来|家)?", "", t)
+    # `带<item>回来` without 买: bringing a shop item home means buying it (the judge still needs both events).
+    # The words in between stay in the text, so anything that is not an ingredient is residue.
+    bring = None if brought or re.search(r"买到?|采购|补买", t) else re.search(r"带(?P<what>[^带]+?)回(?:来|家)", t)
+    if bring:
+        brought = True
+        t = t[:bring.start()] + bring.group("what") + t[bring.end():]
     aliases = {"park": "公园", "bookshop": "书店", "cafe": "咖啡店", "shrine": "神社",
                "library": "图书馆", "supermarket": "超市"}
     locations = []
@@ -56,8 +80,9 @@ def _compile_terms(text, vocab, party, names):
             locations.append(room)
             t = t[:token.start()] + t[token.end():]
     buy = re.search(r"买到?|采购|补买", t)
-    if buy:
-        t = t[:buy.start()] + t[buy.end():]
+    if buy or bring:
+        if buy:
+            t = t[:buy.start()] + t[buy.end():]
         aliases = {}
         for item, words in RULES:
             if item in vocab.INGREDIENTS and item != "other_snack":
@@ -73,6 +98,8 @@ def _compile_terms(text, vocab, party, names):
             m = re.search(pat, t)
             if not m:
                 continue
+            if m.start() and t[m.start() - 1] in "做煮烧炒烤炖熬":
+                return [{"kind": "unsupported"}]  # `做咖喱` is cooking (another action), not buying curry roux
             number = m.group("n") or "1"
             n = int(number) if number.isdigit() else NUM[number]
             item = aliases[word]
@@ -245,15 +272,15 @@ class _Bound:
         self.bots = frozenset(vocab.ROSTER)
         self.names = tuple(str(n) for n in vocab.NAMES.values()) + ("房主",)
 
-    def compile_terms(self, text, vocab=None, party=None):
-        return _compile_terms(text, self.vocab if vocab is None else vocab, party, self.names)
+    def compile_terms(self, text, vocab=None, party=None, beneficiary=None):
+        return _compile_terms(text, self.vocab if vocab is None else vocab, party, self.names, beneficiary)
 
     def judge(self, intent, evidence, now):
         return _judge_all(intent, evidence, now, self.bots)
 
 
 def bound(vocab):
-    """-> an object with `compile_terms(text, vocab=None, party=None)` and `judge(intent, evidence, now)` for the
+    """-> an object with `compile_terms(text, vocab=None, party=None, beneficiary=None)` and `judge(intent, evidence, now)` for the
     pack `vocab` (a vocabulary namespace: ROSTER, NAMES, PLACES, ...). The module-level functions stay the default
     pack's."""
     return _Bound(vocab)
