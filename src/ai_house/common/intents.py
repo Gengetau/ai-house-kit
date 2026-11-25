@@ -146,6 +146,10 @@ NO_EVIDENCE = re.compile(r"不参加|不同意|不答应|不愿意|不能|不会
 YES_START = re.compile(r"^(?:好[呀啊的吧哒嘞耶滴]?|行[啊呀吧]?|可以|没问题|当然|嗯嗯|[oO][kK]|"
                        r"算我一个|我也去|我参加|答应|说定|定了|就这么|约好|安排上|一起|走[吧起])"
                        r"(?=$|[\s，。！、,.!～~]|我|明|后|周|下|三|四|五|六|七|八|九|十)")
+# A greeting before the yes is not part of the answer; a later question that doubts the deal still is.
+GREETING = re.compile(r"(?:(?:早上好|早安|上午好|中午好|下午好|晚上好|晚安|你好)|早(?=[\s，。！、,.!～~呀啊哦]|$))[\s，。！、,.!～~呀啊哦]*")
+DOUBT = re.compile(r"确定|真的|当真|非要|一定要|还是算了|要不算了")
+SENTENCE = re.compile(r"[^。！!？?\n]*(?:[。！!？?\n]|$)")
 
 
 def _unreal(text):
@@ -189,8 +193,33 @@ def _bound_yes(who, quote_at, spoken):
     proposer, proposal = spoken[quote_at]
     if who == proposer:
         return True
+
+    def greet_off(t):
+        t = t.strip()
+        m = GREETING.match(t)
+        while m and m.end():
+            t = t[m.end():]
+            m = GREETING.match(t)
+        return t
+
+    def side_questions_off(text):
+        """After a plain first-sentence yes, drop later questions that are about something else."""
+        rest = greet_off(text)
+        sents = [x for x in SENTENCE.findall(rest) if x.strip()]
+        if len(sents) < 2 or re.search(r'[「“"]', text) or re.search(r'[?？]', sents[0]) \
+                or not YES_START.match(sents[0].strip()):
+            return text
+        # "要不要" is an offer, not a refusal; any other 不 in a question keeps it.
+        keep = [x for x in sents[1:] if not re.search(r'[?？]', x) or _same_topic(proposal, x) or DOUBT.search(x)
+                or '不' in x.replace('要不要', '') or NO.search(x.replace('要不要', ''))
+                or NO_EVIDENCE.search(x) or _unreal(x)]
+        return text[:len(text) - len(rest)] + sents[0] + ''.join(keep)
+
     for i, (speaker, text) in enumerate(spoken):
-        if speaker != who or i <= quote_at or _unreal(text) or NO.search(text) or NO_EVIDENCE.search(text):
+        if speaker != who or i <= quote_at:
+            continue
+        text = side_questions_off(text)
+        if _unreal(text) or NO.search(text) or NO_EVIDENCE.search(text):
             continue
         # A later, explicit quote of this particular proposal can identify the reply without time metadata.
         cited = re.findall(r'[「“\"]([^」”\"]+)[」”\"]', text)
@@ -204,19 +233,22 @@ def _bound_yes(who, quote_at, spoken):
             continue
         if re.search(r'[?？]', reply):
             continue
-        yes = YES_START.match(reply.strip())
+        reply = greet_off(reply)
+        yes = YES_START.match(reply)
         if not yes:
             continue
-        tail = reply.strip()[yes.end():].strip(' ，。！、,.!～~')
-        if not tail or _same_topic(proposal, tail):
-            return True
-        # Object-free scheduling / participation continuation, not an unrelated affirmative sentence.
-        tail = re.sub(r'^(?:我们|我|那|就)', '', tail)
-        if re.fullmatch(r'(?:明天|后天|今天|周[一二三四五六日天])?[一二三四五六七八九十0-9]+点', tail):
-            return True
-        if re.fullmatch(r'(?:(?:明天|后天|今天|周[一二三四五六日天])?[一二三四五六七八九十0-9]*点?)?'
-                        r'(?:出门|出发|见|见面|集合|去|参加|一起去)', tail):
-            return True
+        first = SENTENCE.match(reply).group()
+        for tail in (first[yes.end():], reply[yes.end():]):
+            tail = tail.strip(' ，。！、,.!～~')
+            if not tail or _same_topic(proposal, tail):
+                return True
+            # Object-free scheduling / participation continuation, not an unrelated affirmative sentence.
+            tail = re.sub(r'^(?:我们|我|那|就)', '', tail)
+            if re.fullmatch(r'(?:明天|后天|今天|周[一二三四五六日天])?[一二三四五六七八九十0-9]+点', tail):
+                return True
+            if re.fullmatch(r'(?:(?:明天|后天|今天|周[一二三四五六日天])?[一二三四五六七八九十0-9]*点?)?'
+                            r'(?:出门|出发|见|见面|集合|去|参加|一起去)', tail):
+                return True
     return False
 
 
@@ -716,7 +748,9 @@ def _end(c, actor, chat, private, op, spoken, talked, now):
     quote = W._clean(op.get("quote"), 200)
     quote_at = _bound_quote(quote, spoken) if EVIDENCE_GATE else None
     said_by = spoken[quote_at][0] if EVIDENCE_GATE else _quoted(quote, spoken)
-    if not said_by or said_by not in json.loads(r["party"]):
+    # Only a drop may also come from who the promise is for (the owner cancelling it); "done" stays with the party.
+    allowed = json.loads(r["party"]) + (json.loads(r["beneficiary"] or "[]") if kind == "intent_drop" else [])
+    if not said_by or said_by not in allowed:
         raise ValueError("no evidence from anyone in it")
     line = spoken[quote_at][1] if EVIDENCE_GATE else _quote_line(quote, spoken)
     if EVIDENCE_GATE and (_unreal(line) or re.search(r'[?？]', line)):

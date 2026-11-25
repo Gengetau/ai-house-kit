@@ -1672,6 +1672,16 @@ class HouseDaemon:
             today = self._today_lines(aid, now, is_private)
             if today:
                 mem_ctx = "\n".join(filter(None, [mem_ctx, "你今天已经做过的事（屋里的记录，按时间）：", *today]))
+            if self.intents is not None and (is_private or self.intents.show):
+                # her agreed, unfinished promises with the day already worked out (she must not do date arithmetic);
+                # a group turn gets them only with INTENTS_SHOW=1, like the card lines above
+                try:
+                    open_promises = self.intents.open_lines(aid, now, is_private)
+                except Exception as exc:  # noqa: BLE001  # a promise read never stops her reply
+                    open_promises = []
+                    self.log(f"open promises error: {type(exc).__name__}")
+                if open_promises:
+                    mem_ctx = "\n".join(filter(None, [mem_ctx, "你答应了、还没办的事（屋里的记录）：", *open_promises]))
             if speaker.is_owner:
                 # told before she replies; the "买不了" tail after her reply stays as the fallback
                 try:

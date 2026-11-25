@@ -78,8 +78,24 @@ def strip_stale_day_notes(text: Any) -> Any:
     return rest if rest != text and _ABS_DATE.search(rest) else text
 
 
+# "the next time I go out" wording: that time is the next shopping trip, not a condition to wait for
+_OUTING_WORDS = re.compile(r"下次出门|下回出门|出门时|出门的时候|出去时|出去的时候|下次去超市|下次路过超市|下次")
+# a real condition in the text: with any of these an "after" promise stays as the model wrote it
+_REAL_CONDITION = re.compile(r"等|之后|以后|如果|要是|假如|只要|一旦|再说|有空|发工资|回来后|之前|才")
+
+
+def _outing_after_to_vague(op: dict) -> dict:
+    """An undated "after" intent whose only condition is an outing phrase becomes "vague", so the next trip runs it."""
+    text = op.get("text")
+    if (op.get("when") == "after" and not op.get("due") and isinstance(text, str)
+            and _OUTING_WORDS.search(text) and not _REAL_CONDITION.search(text)):
+        return dict(op, when="vague")
+    return op
+
+
 def _clean_ops(ops: Any) -> Any:
-    """Copy of `ops` where each intent op's text has no stale day note; other ops and the caller's dicts stay as they are."""
+    """Copy of `ops` where each intent op's text has no stale day note and an outing-only "after" is "vague"; other ops
+    and the caller's dicts stay as they are."""
     if not isinstance(ops, (list, tuple)):
         return ops
     out = []
@@ -88,6 +104,7 @@ def _clean_ops(ops: Any) -> Any:
             text = strip_stale_day_notes(op["text"])
             if text != op["text"]:
                 op = dict(op, text=text)
+            op = _outing_after_to_vague(op)
         out.append(op)
     return out
 
@@ -311,6 +328,44 @@ class CommonIntents:
             if len(out) >= n:
                 break
         return [text for _, text in sorted(out)]
+
+    def open_lines(self, actor: str, now: Optional[float] = None, private: bool = False, n: int = 5) -> List[str]:
+        """Promises of hers that are agreed and not done, with the day already worked out by the house (JST), so she
+        never does the date arithmetic herself. Dated ones by start, then undated. Same visibility rule as
+        `done_today_lines`; off with INTENTS=0; never raises on a read error."""
+        if not self._i.ON:
+            return []
+        t = float(now) if now is not None else float(self._ambient_now())
+        try:
+            with self._conn() as c:
+                found = c.execute("select * from intents where status='accepted' order by id").fetchall()
+        except sqlite3.Error:
+            return []
+        today = _dt.datetime.fromtimestamp(t, _JST).replace(hour=0, minute=0, second=0, microsecond=0)
+        dated: List[tuple] = []
+        undated: List[str] = []
+        for r in found:
+            if actor not in json.loads(r["party"]):
+                continue
+            if r["visibility"] == "private" and not (private and r["actor"] == actor):
+                continue
+            who = "答应房主的" if "owner" in json.loads(r["beneficiary"] or "[]") else "约好的"
+            head = f"{who}「{r['text']}」还没办，"
+            if r["due_from"] is None:
+                undated.append(head + "没有约具体哪天")
+                continue
+            if r["due_to"] is not None and float(r["due_to"]) < t - 86400:
+                continue
+            lo = _dt.datetime.fromtimestamp(float(r["due_from"]), _JST)
+            days = (lo.date() - today.date()).days
+            rel = ("昨天，已经过了" if days == -1 else "今天" if days == 0 else "明天" if days == 1 else "后天" if days == 2
+                   else "大后天" if days == 3 else f"{days}天后" if days > 3 else f"{-days}天前，已经过了")
+            at = ""
+            if r["due_to"] is not None and float(r["due_to"]) - float(r["due_from"]) < 86400:  # an exact time: `_when`
+                at = " " + _dt.datetime.fromtimestamp(float(r["due_from"]) + 3600, _JST).strftime("%H:%M")
+            dated.append((float(r["due_from"]), head + f"约在{lo.month}月{lo.day}日{at}（{rel}）"))
+        dated.sort(key=lambda x: x[0])
+        return ([text for _, text in dated] + undated)[:max(0, n)]
 
     @property
     def intents_module(self) -> Any:

@@ -43,6 +43,13 @@ REMINDER_RULE = (
 )
 
 
+# About asked-for dates of her open promises, in every system prompt that has her rules (as REMINDER_RULE).
+OPEN_PROMISES_RULE = (
+    "被问到答应过的事约在哪天、还有什么没办，照“你答应了、还没办的事”里写的答，日期照那里写的说，不要自己换算；"
+    "那里没有的，就说没有记着这件事。"
+)
+
+
 def sends_rule(max_sends: int) -> str:
     """The rules-text sentence about how many messages one turn may send (the same number the turn enforces)."""
     return f"一轮最多发 {int(max_sends)} 条。" if int(max_sends) > 0 else "一轮发几条不限，但别刷屏。"
@@ -65,6 +72,7 @@ def system_prompt(persona: str, *, where: str, allow_quiet: bool, max_sends: int
         "- 其他工具（看屋里情况、翻自己的记忆）需要时再用，用完仍要用 send_message 回话。",
         "- 被问到今天有没有做过某件事，只看“你今天已经做过的事”：列在里面就是做了；里面没有、"
         "此刻状态里也看不出来，就说还没做，不要猜。",
+        "- " + OPEN_PROMISES_RULE,
         "- " + REMINDER_RULE,
         "- 问到你的心情、喜好、打算，凭你的性格和此刻的状态直接回答，不必去翻记忆。"
         "想不起来、不知道的事，用你自己的口吻说不记得就好，不要说“翻不到记录”“记忆里没有”“我不乱编”这类话。",
