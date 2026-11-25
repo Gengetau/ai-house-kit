@@ -18,7 +18,10 @@ Rules enforced here:
     only a failure before anything touched the wire is kept (with its pictures/voice) and resumed on reconnect;
   * a reply that the send gate's quota holds back is not sent and not announced on QQ: the reason is stored on the
     spool row and shown by `status_view()`;
-  * the socket reconnects with exponential backoff; the access token is only sent as a header and never logged.
+  * the socket reconnects with exponential backoff; the access token is only sent as a header and never logged;
+  * one "may this be written?" decision sits at the single place that writes to the socket (`_call_detailed`): a muted
+    group, a destination that is not whitelisted and segment types outside a small allow-list are refused there,
+    whoever asks; with `ONEBOT_LISTEN_ONLY=1` it refuses everything (the channel only listens, see docs/CHAT-AND-QQ.md).
 
 Threads: one reader (only receives, resolves echo futures, queues events), one worker (talks to the model and
 sends). `start()` returns immediately.
@@ -40,6 +43,7 @@ from urllib.parse import urlparse
 
 from ..channel_spool import ChannelSpool, split_bubbles
 from ..chat_identity import Speaker, member_speaker, owner_speaker
+from ..media_provenance import describe as describe_media
 from worldkernel.outbox import BlockedDelivery, NotSent
 from ..plugin_api import ChannelPlugin, ConfigField, PluginDefinition, PluginManifest
 
@@ -96,12 +100,48 @@ class OneBotConfig:
     debounce_ms: int = 0
     send_retries: int = 2
     retry_backoff_s: float = 0.15
+    listen_only: bool = False  # ONEBOT_LISTEN_ONLY=1: read everything, write nothing (env only, never from stored config)
 
     @property
     def where(self) -> str:
         """host:port only; the URL itself may carry credentials and is never logged."""
         p = urlparse(self.url)
         return f"{p.hostname}:{p.port}" if p.port else str(p.hostname)
+
+
+def parse_listen_only(raw: Any) -> bool:
+    """`ONEBOT_LISTEN_ONLY`: exactly `1` (on), `0` or empty/unset (off). Anything else is an error: a typo such as `true`
+    must not quietly leave a channel that was meant to stay silent sending."""
+    v = str(raw if raw is not None else "").strip()
+    if v in ("", "0"):
+        return False
+    if v == "1":
+        return True
+    raise ChannelConfigError("ONEBOT_LISTEN_ONLY 只能写 1（只听不发）、0 或留空")
+
+
+# What may be written to the socket: two actions, four segment types. Everything else is refused at the writer.
+SEND_ACTIONS = frozenset({"send_group_msg", "send_private_msg"})
+ALLOWED_SEGMENTS = frozenset({"text", "at", "image", "record"})
+
+
+class _ReceiveOnlySocket:
+    """The socket as `OneBotChannel._ws` holds it in listen-only mode: it can be read and closed, never written to."""
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+
+    def __iter__(self) -> Any:
+        return iter(self._ws)
+
+    def recv(self, *a: Any, **kw: Any) -> Any:
+        return self._ws.recv(*a, **kw)
+
+    def close(self, *a: Any, **kw: Any) -> Any:
+        return self._ws.close(*a, **kw)
+
+    def send(self, *_a: Any, **_kw: Any) -> None:
+        raise PermissionError("listen_only: this channel does not write")
 
 
 def parse_message(message: Any, self_id: str) -> Tuple[str, bool]:
@@ -194,9 +234,15 @@ class OneBotChannel(ChannelPlugin):
         self.stats: Dict[str, int] = {
             "connects": 0, "received": 0, "replied": 0, "ignored": 0, "rate_limited": 0,
             "send_failed": 0, "blocked": 0, "dropped": 0, "demo_skipped": 0, "duplicates": 0,
-            "gate_limited": 0,
+            "gate_limited": 0, "listen_only": 0,
         }
         self.last_limit: Optional[Dict[str, Any]] = None
+        self._shadow_mem: Deque[Dict[str, Any]] = deque(maxlen=500)  # the listen-only record when there is no runtime dir
+
+    @property
+    def listen_only(self) -> bool:
+        """True when this channel only listens (`ONEBOT_LISTEN_ONLY=1`). Fixed at start; a restart changes it."""
+        return self.cfg.listen_only is True
 
     # ---- configuration -------------------------------------------------------------------------------------------
     @classmethod
@@ -239,6 +285,7 @@ class OneBotChannel(ChannelPlugin):
             debounce_ms=int(_num(eff, "ONEBOT_DEBOUNCE_MS", 0, 0, 5000)),
             send_retries=int(_num(eff, "ONEBOT_SEND_RETRIES", 2, 0, 5)),
             retry_backoff_s=_num(eff, "ONEBOT_RETRY_BACKOFF_S", 0.15, 0.01, 10.0),
+            listen_only=parse_listen_only(eff.get("ONEBOT_LISTEN_ONLY")),
         )
         return cls(cfg)
 
@@ -257,6 +304,11 @@ class OneBotChannel(ChannelPlugin):
         rt_dir = getattr(host, "runtime_dir", None)
         if rt_dir is not None:
             self._spool = ChannelSpool(rt_dir)
+            if self.listen_only:
+                # replies saved before this switch was on must never go out, now or on the day it is turned off
+                closed = self._spool.close_ready_rows("listen_only")
+                if closed:
+                    self._log(f"listen-only: closed {closed} saved reply(ies) that had not gone out")
             self._enqueue_recovered(only_ready=False)
         roster = self._live_roster()
         if self.cfg.actor and roster and self.cfg.actor not in roster:
@@ -265,7 +317,13 @@ class OneBotChannel(ChannelPlugin):
         mate = actor or (f"{self.cfg.actor}（待住客创建）" if self.cfg.actor else "（尚无住客）")
         self._log(
             f"enabled: {self.cfg.where}, roommate={mate}, owners={len(self.cfg.owners)}, groups={len(self.cfg.groups)}"
+            + (", listen_only=ON" if self.listen_only else "")
         )
+        if self.listen_only:
+            self._log(
+                "LISTEN-ONLY (ONEBOT_LISTEN_ONLY=1): reading and answering in the web studio as usual, but nothing is "
+                "written to QQ; what would have been sent is kept in the listen-only record (GET /api/listen-only)"
+            )
         self._note_actor_state(state)
         for name, fn in (("reader", self._run), ("worker", self._work)):
             t = threading.Thread(target=fn, name=f"onebot-{name}", daemon=True)
@@ -363,6 +421,7 @@ class OneBotChannel(ChannelPlugin):
         return {
             "channel_id": self.channel_id,
             "connected": connected,
+            "listen_only": self.listen_only,
             "stats": stats,
             "limited": stats.get("gate_limited", 0),
             "last_limit": last,
@@ -432,7 +491,7 @@ class OneBotChannel(ChannelPlugin):
                     self.cfg.url, additional_headers=headers, open_timeout=10, max_size=4 * 1024 * 1024
                 ) as ws:
                     with self._ws_lock:
-                        self._ws = ws
+                        self._ws = _ReceiveOnlySocket(ws) if self.listen_only else ws
                     started = time.monotonic()
                     self._bump("connects")
                     self._log("connected")
@@ -560,6 +619,10 @@ class OneBotChannel(ChannelPlugin):
         target = str(plan.get("target") or ev.get("user_id") or "")
         at_uid = str(plan.get("at") or "") or None
         try:
+            if self.listen_only:  # nothing saved by a live run may leave while only listening
+                if self._spool is not None and spool_ids:
+                    self._spool.ack(spool_ids, state="skipped", reason="listen_only")
+                return
             if (not bubbles and not media) or start_idx >= len(bubbles) + len(media) or not target:
                 if self._spool is not None and spool_ids:
                     self._spool.ack(spool_ids, state="done")
@@ -631,6 +694,7 @@ class OneBotChannel(ChannelPlugin):
             merged_records.extend(x for x in media["records"] if x not in merged_records)
         merged = dict(last_ev)
         merged["_spool_ids"] = spool_ids
+        merged["_message_ids"] = [str(i.get("message_id")) for i in batch if str(i.get("message_id") or "").strip()]
         if merged_images or merged_records:
             merged["_merged_attachments"] = {"images": merged_images[:4], "records": merged_records[:2]}
         if texts:
@@ -706,6 +770,13 @@ class OneBotChannel(ChannelPlugin):
         sender = ev.get("sender") if isinstance(ev.get("sender"), dict) else {}
         nick = sender.get("card") or sender.get("nickname") or ""
         return None, {"uid": uid, "kind": kind, "gid": gid, "text": text, "nick": nick}
+
+    def _host_accepts(self, name: str) -> bool:
+        try:
+            sig = inspect.signature(self._host.converse)
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return name in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
     def handle_event(self, ev: Mapping[str, Any]) -> str:
         """Decide what to do with one message event; returns a short outcome label (used by tests and stats)."""
@@ -794,8 +865,21 @@ class OneBotChannel(ChannelPlugin):
                         converse_kw["attachments"] = attachments
                 except (TypeError, ValueError):
                     pass
+            if self.listen_only:
+                # the host is told this channel does not send: the draft is then kept as a "not sent" row and is not
+                # remembered as something she said. A host that cannot take that argument is not used at all.
+                if not self._host_accepts("listen_only"):
+                    self._log("listen-only: the host cannot converse in listen-only mode; event not handled")
+                    if self._spool is not None and spool_ids:
+                        self._spool.ack(spool_ids, state="skipped", reason="listen_only_unsupported_host")
+                    return self._ignore("listen_only_unsupported_host")
+                converse_kw["listen_only"] = True
             res = self._host.converse(channel, text, speaker, **converse_kw)
             sent = 0
+            drafted_before = self.stats["listen_only"]
+            mids = [str(x) for x in (ev.get("_message_ids") or ()) if str(x).strip()] or (
+                [str(ev.get("message_id"))] if str(ev.get("message_id") or "").strip() else []
+            )
             send_groups: List[Tuple[List[str], List[Dict[str, Any]]]] = []
             for rep in res.get("replies") or ():
                 if rep.get("mode") == "blocked":
@@ -817,10 +901,14 @@ class OneBotChannel(ChannelPlugin):
             at_uid = uid if kind == "group" else None
             for idx, (parts, media_list) in enumerate(send_groups):
                 attach_ids = spool_ids if idx == len(send_groups) - 1 else ()
-                if self._send_bubbles(kind, target, parts, at=at_uid, spool_ids=attach_ids, media=media_list):
+                if self._send_bubbles(
+                    kind, target, parts, at=at_uid, spool_ids=attach_ids, media=media_list, inbound_ids=mids
+                ):
                     sent += 1
             if sent:
                 self._bump("replied")
+            if not sent and self.stats["listen_only"] > drafted_before:
+                return "listen_only"  # a draft was made and kept in the record; nothing was written to QQ
             return "replied" if sent else "no_reply"
         finally:
             if spool_ids:
@@ -860,11 +948,18 @@ class OneBotChannel(ChannelPlugin):
             ok, code, _, left_wire = self._call_detailed(action, params)
             if ok:
                 break
-            # Retry ONLY when nothing touched the wire yet and not a server retcode rejection.
-            if left_wire or code.startswith("retcode_") or attempt + 1 >= max_attempts or self._stop.is_set():
+            # Retry ONLY when nothing touched the wire yet and not a server retcode rejection. A refusal by the writer
+            # itself (`refused_*`) is a decision, not a failure: asking again changes nothing.
+            if left_wire or code.startswith(("retcode_", "refused_")) or attempt + 1 >= max_attempts or self._stop.is_set():
                 break
             self._stop.wait(self.cfg.retry_backoff_s * (attempt + 1))
         return ok, code, left_wire
+
+    def _end_blocked(self, spool_ids: Sequence[int], reason: str) -> None:
+        self._bump("blocked")
+        self._log(f"send refused ({reason})")
+        if self._spool is not None and spool_ids:
+            self._spool.ack(spool_ids, state="blocked", reason=reason)
 
     def _send_bubbles(
         self,
@@ -877,12 +972,19 @@ class OneBotChannel(ChannelPlugin):
         spool_ids: Sequence[int] = (),
         save_plan: bool = True,
         media: Sequence[Mapping[str, Any]] = (),
+        inbound_ids: Sequence[str] = (),
     ) -> bool:
         """Deliver a reply (text bubbles, then pictures/voice) through `SendGate`.
 
         `start_idx` counts delivered units: bubbles first, then media items. A failure before anything touched the
         wire keeps the saved reply (media included) as `reply_ready` for the reconnect resume; any other failure is
-        logged and recorded on the spool row. The reply is charged to the quota once, after its first unit is out."""
+        logged and recorded on the spool row. The reply is charged to the quota once, after its first unit is out.
+        A host without a send gate sends nothing (the channel fails closed). On a resume the checks that cost nothing
+        (destination, mute, the pictures' provenance) are asked again before the remaining units go out.
+
+        In listen-only mode the gate still gives its verdict, but nothing is written: the draft goes into the
+        listen-only record, the quota is charged in the shadow ledger, the spool row is closed (`skipped`,
+        `listen_only`) and no reply is saved for a later resume."""
         parts = [str(p).strip() for p in bubbles if str(p).strip()]
         media_items = self._sendable_media(media)
         units = len(parts) + len(media_items)
@@ -899,9 +1001,13 @@ class OneBotChannel(ChannelPlugin):
             return False
         send_actor = send_actor or self.actor
         gate = getattr(self._host, "send_gate", None) if self._host is not None else None
+        if gate is None:
+            self._end_blocked(spool_ids, "send_gate:unavailable")
+            return False
         did = f"ob-spool-{spool_ids[-1]}" if spool_ids else f"ob-direct-{uuid.uuid4().hex[:16]}"
+        listen = self.listen_only
         charge_key: Optional[str] = None
-        if start_idx == 0 and gate is not None:
+        if start_idx == 0:
             try:
                 charge_key = gate.authorize_direct_send(
                     "onebot_v11",
@@ -911,11 +1017,17 @@ class OneBotChannel(ChannelPlugin):
                     actor=send_actor,
                     text="\n".join(parts),
                     delivery_id=did,
-                    media_count=len(media_items),
+                    media=media_items,
+                    dry_run=listen,
                 )
             except BlockedDelivery as exc:
                 self._bump("blocked")
                 self._log(f"send blocked by SendGate ({exc.reason})")
+                if listen:
+                    self.record_listen_only(
+                        path="direct", verdict=f"blocked:{exc.reason}", kind=kind, target=str(target), actor=send_actor,
+                        text_len=len("\n".join(parts)), media=media_items, inbound_ids=inbound_ids, delivery_id=did,
+                    )
                 if self._spool is not None and spool_ids:
                     self._spool.ack(spool_ids, state="blocked", reason=f"send_gate:{exc.reason}")
                 return False
@@ -923,9 +1035,36 @@ class OneBotChannel(ChannelPlugin):
                 self._bump("rate_limited")
                 self._note_limit(exc.reason, kind, str(target))
                 self._log(f"send limited by SendGate ({exc.reason}); reply not sent")
+                if listen:
+                    self.record_listen_only(
+                        path="direct", verdict=f"limited:{exc.reason}", kind=kind, target=str(target), actor=send_actor,
+                        text_len=len("\n".join(parts)), media=media_items, inbound_ids=inbound_ids, delivery_id=did,
+                    )
                 if self._spool is not None and spool_ids:
                     self._spool.ack(spool_ids, state="skipped", reason=f"send_gate:{exc.reason}")
                 return False
+        else:
+            try:
+                gate.recheck_direct_send(
+                    "onebot_v11", self, kind=kind, target=str(target), actor=send_actor,
+                    media=media_items[max(0, start_idx - len(parts)):],
+                )
+            except (BlockedDelivery, NotSent) as exc:
+                self._end_blocked(spool_ids, f"send_gate:{exc.reason}")
+                return False
+
+        if listen:
+            # the verdict was "allowed"; keep what would have gone out and pretend it did, for the limits only
+            self.record_listen_only(
+                path="direct", verdict="allowed", kind=kind, target=str(target), actor=send_actor, bubbles=parts,
+                media=media_items, inbound_ids=inbound_ids, delivery_id=did,
+            )
+            if charge_key is not None:
+                gate.record_direct_sent(did, charge_key)
+            self._bump("listen_only")
+            if self._spool is not None and spool_ids:
+                self._spool.ack(spool_ids, state="skipped", reason="listen_only")
+            return False
 
         if save_plan and self._spool is not None and spool_ids:
             self._spool.save_reply_plan(spool_ids, parts, target=target, kind=kind, at=at or "", media=media_items)
@@ -950,6 +1089,9 @@ class OneBotChannel(ChannelPlugin):
             ok, code, left_wire = self._call_with_retry(action, {param_key: int(target), "message": segs})
 
             if not ok:
+                if code.startswith("refused_"):  # the writer said no (mute, destination, segment type): final
+                    self._end_blocked(spool_ids, f"transport:{code}")
+                    return sent_any
                 # PR-C4: Preserve `reply_ready` for reconnect resume whenever the frame never left the wire!
                 if (not left_wire) and (not code.startswith("retcode_")) and self._spool is not None and spool_ids:
                     return sent_any
@@ -960,7 +1102,7 @@ class OneBotChannel(ChannelPlugin):
                 return sent_any
 
             sent_any = True
-            if not charged and gate is not None and charge_key is not None:
+            if not charged and charge_key is not None:
                 gate.record_direct_sent(did, charge_key)
                 charged = True
             if self._spool is not None and spool_ids:
@@ -974,7 +1116,40 @@ class OneBotChannel(ChannelPlugin):
         """True if at least one part went out (a later part failing still leaves the first one delivered)."""
         return self._send_bubbles(kind, target, self._split(text), at=at)
 
+    # ---- the one place that writes to the socket -----------------------------------------------------------------
+    def _may_write(self, action: str, params: Mapping[str, Any]) -> str:
+        """The single "may this be written?" decision, asked right before the socket write. "" = yes, else the reason.
+
+        Listen-only refuses everything. Otherwise: only the two send actions, only whitelisted groups, no group that is
+        muted right now, and only segment types in `ALLOWED_SEGMENTS` (a raw CQ string or an unknown segment is not
+        treated as harmless text). Whoever calls the writer, the reply path, the outbox or a test, passes through here."""
+        if self.listen_only:
+            return "refused_listen_only"
+        if action not in SEND_ACTIONS:
+            return "refused_action"
+        msg = params.get("message") if isinstance(params, Mapping) else None
+        if not isinstance(msg, list):
+            return "refused_segment"
+        for seg in msg:
+            if not isinstance(seg, Mapping) or str(seg.get("type") or "") not in ALLOWED_SEGMENTS:
+                return "refused_segment"
+        if action == "send_group_msg":
+            gid = str(params.get("group_id") or "").strip()
+            if not gid.isdigit() or gid not in self.cfg.groups:
+                return "refused_destination"
+            gb = getattr(self._host, "group_behavior", None)
+            if gb is not None:
+                try:
+                    if gb.is_muted(f"qq-group:{gid}"):
+                        return "refused_muted"
+                except Exception:  # noqa: BLE001 - a mute lookup that fails is read as "muted"
+                    return "refused_muted"
+        return ""
+
     def _call_detailed(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, str, bool]:
+        refusal = self._may_write(action, params)
+        if refusal:
+            return False, refusal, "", False
         with self._ws_lock:
             ws = self._ws
         if ws is None:
@@ -989,6 +1164,8 @@ class OneBotChannel(ChannelPlugin):
             ws.send(json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False))
             left_wire = True
             resp = fut.result(timeout=self.cfg.send_timeout_s)
+        except PermissionError:  # the stored socket itself refused (listen-only wrapper); keep the connection
+            return False, "refused_listen_only", "", False
         except concurrent.futures.TimeoutError:
             return False, "timeout", "", True
         except ConnectionError:
@@ -1015,6 +1192,54 @@ class OneBotChannel(ChannelPlugin):
     def _call(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str]:
         ok, code, _, _ = self._call_detailed(action, params)
         return ok, code
+
+    # ---- the listen-only record ----------------------------------------------------------------------------------
+    def record_listen_only(
+        self,
+        *,
+        path: str,
+        verdict: str,
+        source: str = "",
+        kind: str = "",
+        target: str = "",
+        actor: str = "",
+        text: str = "",
+        text_len: int = 0,
+        bubbles: Sequence[str] = (),
+        media: Sequence[Mapping[str, Any]] = (),
+        inbound_ids: Sequence[str] = (),
+        delivery_id: str = "",
+    ) -> None:
+        """Keep what this channel would have sent (and what the gate said about it). Only an `allowed` draft keeps its
+        text; a blocked or limited one keeps its reason and length. Media: kind, sha256 and size, never the bytes."""
+        allowed = str(verdict) == "allowed"
+        shown: List[str] = [str(b) for b in bubbles] if allowed else []
+        if allowed and not shown and str(text or "").strip():
+            shown = [str(text).strip()]
+        length = int(text_len or 0) or len("\n".join(shown) if shown else str(text or ""))
+        row = dict(
+            path=path, verdict=str(verdict), source=source, kind=kind, target=str(target), actor=actor,
+            inbound_ids=[str(i) for i in inbound_ids], delivery_id=delivery_id, text_len=length, bubbles=shown,
+            media=describe_media(media),
+        )
+        if self._spool is not None:
+            try:
+                self._spool.record_listen_only(**row)
+                return
+            except Exception as exc:  # noqa: BLE001 - fall back to memory; the record never decides a send
+                self._log(f"listen-only record could not be written ({type(exc).__name__})")
+        self._shadow_mem.appendleft({**row, "id": 0, "ts": time.time()})
+
+    def listen_only_rows(self, limit: int = 100) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if self._spool is not None:
+            try:
+                rows = self._spool.list_listen_only(limit=limit)
+            except Exception:  # noqa: BLE001
+                rows = []
+        if not rows:
+            rows = list(self._shadow_mem)[: max(1, int(limit))]
+        return rows
 
     def lookup_delivery(self, delivery_id: str) -> Optional[str]:
         with self._ref_lock:
@@ -1048,6 +1273,8 @@ class OneBotChannel(ChannelPlugin):
             action = "send_group_msg" if kind == "group" else "send_private_msg"
             param_key = "group_id" if kind == "group" else "user_id"
             ok, code, ext_ref, left_wire = self._call_detailed(action, {param_key: int(target), "message": segs})
+            if not ok and code.startswith("refused_"):
+                raise BlockedDelivery(code)
             if not ok:
                 self._bump("send_failed")
                 if not sent_any and not left_wire:
@@ -1063,6 +1290,8 @@ class OneBotChannel(ChannelPlugin):
                 action,
                 {param_key: int(target), "message": [{"type": "record", "data": {"file": f"base64://{audio_b64}"}}]},
             )
+            if not ok_a and code_a.startswith("refused_"):
+                raise BlockedDelivery(code_a)
             if ok_a:
                 sent_any = True
                 last_ref = ext_a
@@ -1078,6 +1307,8 @@ class OneBotChannel(ChannelPlugin):
                 action,
                 {param_key: int(target), "message": [{"type": "image", "data": {"file": f"base64://{image_b64}"}}]},
             )
+            if not ok_i and code_i.startswith("refused_"):
+                raise BlockedDelivery(code_i)
             if ok_i:
                 sent_any = True
                 last_ref = ext_i

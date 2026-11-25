@@ -8,6 +8,7 @@ import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from ..media_provenance import register_for_tool
 from ..media_safety import mime_for_path, to_data_uri
 from ..plugin_api import (
     ConfigField,
@@ -266,6 +267,9 @@ def _tool_send_meme(
             wire_png_b64 = base64.b64encode(_render_sticker_png(str(item.get("mood") or ""))).decode("ascii")
         else:
             wire_png_b64 = str(item.get("image_base64") or "")
+        # bind the wire bytes to this chat and to the sticker's label and caption (a group only gets media with this)
+        register_for_tool(daemon, ctx, wire_png_b64, kind="sticker",
+                          source_texts=[str(item.get("title") or ""), clean_cap])
         ctx.pending_media.append({
             "kind": "sticker",
             "meme_id": item["id"],

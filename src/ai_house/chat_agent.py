@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .agent import DIRECT, AgentRuntime, EngineUnavailable, TurnRequest, brain_for
+from .agent.engine import max_sends_per_turn
 from .agent import prompts as agent_prompts
 from .chat_identity import Speaker, one_line, owner_speaker, quote_untrusted
 from .llm import (
@@ -183,12 +184,13 @@ class RoommateChatAgent:
         """One chat turn run by an agent shell. Returns {"text", "quiet", "engine", "model"}."""
         assert self.agent_runtime is not None
         allow_quiet = where == "group"
+        max_sends = max_sends_per_turn(self._env, where)  # per chat kind; the same number is the turn's limit and her rules text
         req = TurnRequest(
             engine=engine,
             actor=actor_id,
             channel=channel or f"{where}:{actor_id}",
             where=where,
-            system=agent_prompts.system_prompt(persona, where=where, allow_quiet=allow_quiet),
+            system=agent_prompts.system_prompt(persona, where=where, allow_quiet=allow_quiet, max_sends=max_sends),
             state_lines=[
                 f"- 所在位置：{ctx['place_label']}",
                 f"- 正在做的事：{ctx['doing']}（同屋在场：{'、'.join(ctx['roommates_here']) or '只有自己'}）",
@@ -203,6 +205,7 @@ class RoommateChatAgent:
             tool_specs=tool_specs if self.tools_enabled else (),
             tool_runner=tool_runner,
             allow_quiet=allow_quiet,
+            max_sends=max_sends,
         )
         ok = False
         t0 = time.monotonic()
@@ -383,8 +386,9 @@ class RoommateChatAgent:
                 return f"群友「{m.get('sender_name')}」"
             return str(m.get("sender_name") or m.get("sender"))
 
-        # one line per message (a body cannot fake the next line's speaker); held-back replies are not "things she said"
-        shown = [m for m in recent_history if m.get("mode") != "blocked"]
+        # one line per message (a body cannot fake the next line's speaker); held-back replies are not "things she said",
+        # and neither is a draft that a listen-only channel kept instead of sending (mode `shadow`)
+        shown = [m for m in recent_history if m.get("mode") not in ("blocked", "shadow")]
         def _said(m: Dict[str, Any]) -> str:
             if m.get("sender") == "member":
                 return f"「{quote_untrusted(m.get('text'))}」"

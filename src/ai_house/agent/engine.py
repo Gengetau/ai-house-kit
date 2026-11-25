@@ -18,7 +18,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 SPEAK_TOOL = "send_message"
 QUIET_TOOL = "stay_quiet"
-MAX_SENDS_PER_TURN = 3
+MAX_SENDS_PER_TURN = 3  # the default for both chat kinds (the private deployment's default too)
+SENDS_GROUP_ENV = "AI_HOUSE_MAX_SENDS_PER_TURN_GROUP"
+SENDS_PRIVATE_ENV = "AI_HOUSE_MAX_SENDS_PER_TURN_PRIVATE"
 MAX_TOOL_CALLS_PER_TURN = 8
 MAX_MESSAGE_CHARS = 400
 
@@ -46,6 +48,21 @@ QUIET_TOOL_SPEC: Dict[str, Any] = {
         "properties": {"reason": {"type": "string", "description": "一句话说明为什么不接话（不会发出去）"}},
     },
 }
+
+
+def max_sends_per_turn(env: Any, where: str) -> int:
+    """How many `send_message` calls one turn may make in this kind of chat: `AI_HOUSE_MAX_SENDS_PER_TURN_GROUP` for a
+    group, `AI_HOUSE_MAX_SENDS_PER_TURN_PRIVATE` for a private chat. 0 = no per-turn limit. Unset, empty or not a
+    non-negative whole number = the default (3), so an old configuration behaves as before."""
+    key = SENDS_GROUP_ENV if where == "group" else SENDS_PRIVATE_ENV
+    raw = str((env or {}).get(key) or "").strip()
+    if not raw:
+        return MAX_SENDS_PER_TURN
+    try:
+        val = int(raw)
+    except ValueError:
+        return MAX_SENDS_PER_TURN
+    return val if 0 <= val <= 1000 else MAX_SENDS_PER_TURN
 
 
 class EngineError(RuntimeError):
@@ -94,8 +111,9 @@ class EngineResult:
 class Turn:
     """State of one turn. Created on the caller's thread; the engine's loop thread fills it in."""
 
-    def __init__(self, *, allow_quiet: bool, tool_names: Sequence[str]) -> None:
+    def __init__(self, *, allow_quiet: bool, tool_names: Sequence[str], max_sends: int = MAX_SENDS_PER_TURN) -> None:
         self.allow_quiet = bool(allow_quiet)
+        self.max_sends = max(0, int(max_sends))  # 0 = no per-turn limit (the hourly budget still applies elsewhere)
         self.tool_names = set(tool_names)
         self.sent: List[str] = []
         self.quiet = False
@@ -117,7 +135,7 @@ class Turn:
             return {"ok": False, "error": "empty_text", "note": "内容是空的，没有发出"}
         if self.quiet:
             return {"ok": False, "error": "already_quiet", "note": "本轮已经选择不接话"}
-        if len(self.sent) >= MAX_SENDS_PER_TURN:
+        if self.max_sends and len(self.sent) >= self.max_sends:
             self.end_requested = True
             return {"ok": False, "error": "too_many_messages", "note": "这一轮已经发得够多了，到此为止"}
         self.sent.append(text[:MAX_MESSAGE_CHARS])

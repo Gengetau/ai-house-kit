@@ -43,6 +43,7 @@ from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
 from .intents_common import CommonIntents
 from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
+from .media_provenance import MediaProvenance
 from .media_safety import mime_for_path, resolve_scoped_media_path
 from . import memory_migrate
 from .memory_common import CommonMemoryStore
@@ -75,6 +76,7 @@ from .plugin_api import (
 from .settings_store import SettingsStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
+SHADOW_CHAT_MODE = "shadow"  # a chat row holding a draft that a listen-only channel did not send
 
 HOST_EXTRA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -289,6 +291,7 @@ class HouseDaemon:
         self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
         self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
         self.send_gate = SendGate(self)
+        self.media_provenance = MediaProvenance()  # where group media came from; in memory, a restart empties it
         self.group_behavior = GroupBehaviorController(self.runtime_dir, clock=self.clock)
         self.proactive = ProactiveEngine(self.runtime_dir, clock=self.clock)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
@@ -976,6 +979,8 @@ class HouseDaemon:
         return {
             "packs": sorted(self.registry.packs.keys()),
             "channels": ["webchat"] + [c.channel_id for c in self.channels],
+            # channels that read but do not send (`ONEBOT_LISTEN_ONLY=1`); the ops page marks them
+            "listen_only_channels": [c.channel_id for c in self.channels if getattr(c, "listen_only", False) is True],
             "extensions": (
                 [e.__class__.__name__ for e in self.authority.life.extensions if not getattr(e, "_is_stub", False)]
                 if self.authority is not None
@@ -1190,6 +1195,13 @@ class HouseDaemon:
             now = self.clock.now()
             sender = actor if actor in self.vocab.ROSTER else self.vocab.ROSTER[0]
             sender_name = self.vocab.NAMES.get(sender, sender)
+            # Her own proactive speech is hers. A reminder or any other notice written by code is not her words: it keeps
+            # its chat row and its ledger row, but under the program's name, so it is neither remembered by memory
+            # as something she said nor handed back to her later as her own line.
+            own_speech = str(payload.get("source") or "") == "proactive"
+            row_sender, row_name, row_badge, row_mode = (
+                (sender, sender_name, "主动", "outbox") if own_speech else ("program", "程序提醒", "提醒", "notice")
+            )
             ref = f"web-{delivery_id}"
             with contextlib.closing(sqlite3.connect(self.world_db)) as c:
                 with c:
@@ -1206,14 +1218,15 @@ class HouseDaemon:
                         return str(existing[0] or ref)
                     cur = c.execute(
                         "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, created_at) "
-                        "VALUES(?, ?, ?, ?, ?, '主动', 'outbox', ?)",
-                        (target_ch, sender, sender_name, str(payload.get("to_identity") or "owner"), text, now),
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (target_ch, row_sender, row_name, str(payload.get("to_identity") or "owner"), text,
+                         row_badge, row_mode, now),
                     )
                     c.execute(
                         "INSERT INTO webchat_deliveries(delivery_id, channel, msg_id, ref, created_at) VALUES(?, ?, ?, ?, ?)",
                         (str(delivery_id), target_ch, int(cur.lastrowid), ref, now),
                     )
-            if self.memory is not None and sender in self.vocab.ROSTER:
+            if own_speech and self.memory is not None and sender in self.vocab.ROSTER:
                 sc = "private" if target_ch.startswith("private:") else "group"
                 mem_ch = "" if sc == "private" else target_ch
                 self.memory.observe(sender, sc, "", channel=mem_ch, reply=text, now=now)
@@ -1307,6 +1320,21 @@ class HouseDaemon:
             "stats": self.send_gate.stats_view(),
         }
 
+    def get_listen_only_view(self, *, limit: int = 100) -> Dict[str, Any]:
+        """What the listen-only channels would have sent (`ONEBOT_LISTEN_ONLY=1`): the record each keeps, newest first.
+        Allowed drafts carry their text; a blocked one only its reason and length; media only kind, sha256 and size."""
+        out: List[Dict[str, Any]] = []
+        channels: List[Dict[str, Any]] = []
+        for ch in list(self.channels):
+            if getattr(ch, "listen_only", False) is not True:
+                continue
+            rows_fn = getattr(ch, "listen_only_rows", None)
+            rows = rows_fn(limit=limit) if callable(rows_fn) else []
+            channels.append({"channel_id": ch.channel_id, "rows": len(rows)})
+            out.extend({**r, "channel_id": ch.channel_id} for r in rows)
+        out.sort(key=lambda r: float(r.get("ts") or 0.0), reverse=True)
+        return {"ok": True, "listen_only": bool(channels), "channels": channels, "items": out[: max(1, min(int(limit or 100), 500))]}
+
     def get_group_behavior_view(self) -> Dict[str, Any]:
         stored = self.settings_store.get_plugins_map()
         enabled = "group_behavior" in {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored)}
@@ -1360,6 +1388,7 @@ class HouseDaemon:
         *,
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
+        listen_only: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
 
@@ -1379,7 +1408,7 @@ class HouseDaemon:
         responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
         ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
-            return self._converse(channel, text, speaker, actor=actor, attachments=attachments)
+            return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only)
 
     def _converse(
         self,
@@ -1389,6 +1418,7 @@ class HouseDaemon:
         *,
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
+        listen_only: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry shared by the web studio and chat plugins (OneBot).
 
@@ -1396,6 +1426,11 @@ class HouseDaemon:
         Channels: `group` (the house group, several roommates may answer), `private:<actor>`,
         or any other name for a plugin-owned group room (`actor` then names the one roommate who answers).
         Replies stopped by the reply guard come back with mode `blocked` and are never stored as the roommate's words.
+
+        `listen_only` is asked for by a channel that is in listen-only mode (it will not send): the inbound line is
+        stored and remembered as usual, but the draft reply is not something she said. It is kept as a chat row with
+        its own mode (`shadow`, left out of the recent history she is given) and memory observes the turn with no
+        reply, so nothing that was never said can be read back later as her words (or turned into a promise).
         """
         text = str(text or "").strip()
         if not text:
@@ -1722,8 +1757,8 @@ class HouseDaemon:
                                 sender_key if speaker.is_owner else speaker.name,
                                 rep["text"],
                                 rep["context_badge"],
-                                rep["mode"],
-                                json.dumps(stored_media, ensure_ascii=False),
+                                SHADOW_CHAT_MODE if (listen_only and rep["mode"] not in ("blocked", "sleeping")) else rep["mode"],
+                                json.dumps([] if listen_only else stored_media, ensure_ascii=False),
                                 now,
                             ),
                         )
@@ -1735,7 +1770,7 @@ class HouseDaemon:
                     speaker=speaker.name,
                     speaker_role=speaker_role,
                     speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
-                    reply="" if rep["mode"] in ("blocked", "sleeping") else rep["text"],
+                    reply="" if (listen_only or rep["mode"] in ("blocked", "sleeping")) else rep["text"],
                     now=now,
                 )
                 replies.append(rep)
@@ -2491,6 +2526,7 @@ class HouseDaemon:
             self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
             if getattr(self, "send_gate", None) is not None:
                 self.send_gate.reset()
+                self.media_provenance.clear()
             if getattr(self, "group_behavior", None) is not None:
                 self.group_behavior.reset()
             if getattr(self, "proactive", None) is not None:
@@ -2842,6 +2878,12 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 qs = parse_qs(parsed.query)
                 lim = _qs_int(qs, "limit", 50)
                 self._send_json(daemon.get_outbox_view(limit=lim))
+                return
+            if parsed.path == "/api/listen-only":
+                if not self._need(parsed, "owner"):
+                    return
+                qs = parse_qs(parsed.query)
+                self._send_json(daemon.get_listen_only_view(limit=_qs_int(qs, "limit", 100)))
                 return
             if parsed.path == "/api/backups":
                 if not self._need(parsed, "owner"):

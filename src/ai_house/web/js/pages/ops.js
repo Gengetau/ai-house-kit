@@ -335,7 +335,7 @@ export async function render(view, route, ctx){
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '当前世界包 (WorldPack)'), el('b', {}, state.pack_profile || 'life1')),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '对话驱动'), el('b', {}, state.brain && state.brain !== 'direct' ? `agent 外壳（${state.brain}）` : (state.llm_mode === 'live_api' ? '真实 OpenAI 兼容模型' : '零密钥离线演示引擎'))),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '发现的世界包'), el('span', {class: 'small'}, (plugs.packs || []).join('、') || 'default')),
-            el('div', {class: 'row between'}, el('span', {class: 'muted'}, '消息通道 (Channels)'), el('span', {class: 'small'}, (plugs.channels || []).join('、') || 'webchat')),
+            el('div', {class: 'row between'}, el('span', {class: 'muted'}, '消息通道 (Channels)'), el('span', {class: 'small'}, (plugs.channels || []).map(c => (plugs.listen_only_channels || []).includes(c) ? c + '（只听不发）' : c).join('、') || 'webchat')),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '扩展 (Extensions)'), el('span', {class: 'small'}, (plugs.extensions || []).join('、') || '无')),
             el('div', {class: 'row between'}, el('span', {class: 'muted'}, '大模型工具 (Tools)'), el('span', {class: 'small'}, (plugs.tools || []).join('、') || '默认内置工具')))),
 

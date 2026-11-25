@@ -420,6 +420,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "OneBot v11 WebSocket 配置与依赖就绪" + ("" if onebot_ping else "（加 --onebot-ping 可实际连一次协议端）")
             ),
         })
+        from .builtin_plugins.onebot_ws import parse_listen_only
+
+        try:
+            listen_on = parse_listen_only(eff_env.get("ONEBOT_LISTEN_ONLY"))
+            checks.append({
+                "name": "onebot_listen_only",
+                "ok": True,
+                "detail": (
+                    "只听不发已开启（ONEBOT_LISTEN_ONLY=1）：QQ 只读不写，本该发出的内容记在影子记录里（GET /api/listen-only）；网页聊天照常"
+                    if listen_on else "未开启（QQ 正常收发）"
+                ),
+            })
+        except ChannelConfigError as exc:
+            checks.append({"name": "onebot_listen_only", "ok": False, "detail": str(exc)})
         if onebot_ping and not ob_errs:
             from .onebot_probe import probe_onebot
 

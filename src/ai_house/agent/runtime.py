@@ -32,6 +32,7 @@ from ..llm import LLMDeadlineError, mask_secrets, remaining_budget
 from . import prompts
 from .engine import (
     MAX_MESSAGE_CHARS,
+    MAX_SENDS_PER_TURN,
     QUIET_TOOL_SPEC,
     SPEAK_TOOL_SPEC,
     AgentEngine,
@@ -80,6 +81,7 @@ class TurnRequest:
     tool_specs: Sequence[Dict[str, Any]] = ()
     tool_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
     allow_quiet: bool = False
+    max_sends: int = MAX_SENDS_PER_TURN  # `send_message` calls allowed in this turn; 0 = no per-turn limit
 
 
 @dataclass
@@ -452,7 +454,11 @@ class AgentRuntime:
             raise EngineUnavailable(reason)
         loop = self._ensure_loop()
         specs = [dict(s) for s in req.tool_specs if s.get("name") not in (SPEAK_TOOL_SPEC["name"], QUIET_TOOL_SPEC["name"])]
-        turn = Turn(allow_quiet=req.allow_quiet, tool_names=[str(s.get("name") or "") for s in specs])
+        turn = Turn(
+            allow_quiet=req.allow_quiet,
+            tool_names=[str(s.get("name") or "") for s in specs],
+            max_sends=req.max_sends,
+        )
         sess = self._session(req)
         t0 = self._mono()
         cf = asyncio.run_coroutine_threadsafe(self._turn(engine, sess, req, turn, specs), loop)

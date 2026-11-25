@@ -39,7 +39,26 @@ CREATE TABLE IF NOT EXISTS inbound_spool (
     reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_inbound_spool_state ON inbound_spool(state, kind, spool_id);
+CREATE TABLE IF NOT EXISTS listen_only_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    path TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    inbound_ids TEXT NOT NULL DEFAULT '[]',
+    delivery_id TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL,
+    text_len INTEGER NOT NULL DEFAULT 0,
+    bubbles_json TEXT NOT NULL DEFAULT '[]',
+    media_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_listen_only_log_ts ON listen_only_log(ts);
 """
+
+LISTEN_ONLY_KEEP_ROWS = 5000  # the listen-only record keeps at most this many rows ...
+LISTEN_ONLY_KEEP_S = 14 * 86400.0  # ... and none older than this
 
 # `<sep>`, `<sep/>`, `<sep />`, `</sep>` (any case, optional inner spaces) all end a bubble.
 _PARA_SPLIT_RE = re.compile(r"\s*<\s*/?\s*sep\s*/?\s*>\s*|\n\s*\n+", re.IGNORECASE)
@@ -483,6 +502,87 @@ class ChannelSpool:
                     f"UPDATE inbound_spool SET state=?, reason=?, updated_at=? WHERE spool_id IN ({marks})",
                     [eff_state, why, ts, *ids],
                 )
+
+    def close_ready_rows(self, reason: str, *, now: Optional[float] = None) -> int:
+        """Close every `reply_ready` row (state `skipped`, with `reason`). A listen-only channel must never resume a reply
+        that was saved before it was switched on: those would flood out the day the switch is turned off."""
+        ts = self._now(now)
+        with self._lock, self._connect() as c:
+            cur = c.execute(
+                "UPDATE inbound_spool SET state='skipped', raw_event_json='{}', reply_bubbles_json='[]', reason=?, "
+                "updated_at=? WHERE state='reply_ready'",
+                [str(reason or "")[:200], ts],
+            )
+            return int(cur.rowcount or 0)
+
+    def record_listen_only(
+        self,
+        *,
+        path: str,
+        verdict: str,
+        source: str = "",
+        kind: str = "",
+        target: str = "",
+        actor: str = "",
+        inbound_ids: Sequence[str] = (),
+        delivery_id: str = "",
+        text_len: int = 0,
+        bubbles: Sequence[str] = (),
+        media: Sequence[Mapping[str, Any]] = (),
+        now: Optional[float] = None,
+    ) -> int:
+        """Append one row to the listen-only record: what would have been sent and the gate's verdict. A blocked draft
+        is stored as its reason and length only (`bubbles` must then be empty); media as kind + sha256 + size."""
+        ts = self._now(now)
+        with self._lock, self._connect() as c:
+            cur = c.execute(
+                "INSERT INTO listen_only_log(ts, path, source, kind, target, actor, inbound_ids, delivery_id, verdict, "
+                "text_len, bubbles_json, media_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ts, str(path), str(source)[:40], str(kind)[:16], str(target)[:40], str(actor)[:40],
+                    json.dumps([str(x) for x in inbound_ids], ensure_ascii=False), str(delivery_id)[:80],
+                    str(verdict)[:120], int(text_len or 0),
+                    json.dumps([str(b) for b in bubbles], ensure_ascii=False),
+                    json.dumps([dict(m) for m in media], ensure_ascii=False),
+                ),
+            )
+            row_id = int(cur.lastrowid)
+            c.execute("DELETE FROM listen_only_log WHERE ts < ?", (ts - LISTEN_ONLY_KEEP_S,))
+            c.execute(
+                "DELETE FROM listen_only_log WHERE id <= (SELECT id FROM listen_only_log ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                (LISTEN_ONLY_KEEP_ROWS,),
+            )
+        return row_id
+
+    def has_listen_only(self, *, delivery_id: str, verdict: str, path: str = "") -> bool:
+        """True if the record already holds a row for this delivery id with exactly this verdict (and path, if given)."""
+        sql = "SELECT 1 FROM listen_only_log WHERE delivery_id=? AND verdict=?"
+        args: List[Any] = [str(delivery_id)[:80], str(verdict)[:120]]
+        if path:
+            sql += " AND path=?"
+            args.append(str(path))
+        with self._lock, self._connect() as c:
+            return c.execute(sql + " LIMIT 1", args).fetchone() is not None
+
+    def list_listen_only(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as c:
+            rows = c.execute(
+                "SELECT * FROM listen_only_log ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 500)),)
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            def _j(raw: str) -> Any:
+                try:
+                    return json.loads(raw or "[]")
+                except ValueError:
+                    return []
+            out.append({
+                "id": int(r["id"]), "ts": float(r["ts"]), "path": r["path"], "source": r["source"], "kind": r["kind"],
+                "target": r["target"], "actor": r["actor"], "inbound_ids": _j(r["inbound_ids"]),
+                "delivery_id": r["delivery_id"], "verdict": r["verdict"], "text_len": int(r["text_len"]),
+                "bubbles": _j(r["bubbles_json"]), "media": _j(r["media_json"]),
+            })
+        return out
 
     def prune(self, *, keep_done_s: float = 86400.0, now: Optional[float] = None) -> int:
         """Delete spool rows and expired dedup records untouched for `keep_done_s`.

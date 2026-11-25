@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from ..llm import _extract_http_error_detail, mask_secrets
+from ..media_provenance import register_for_tool
 from ..media_safety import (
     DEFAULT_MAX_MEDIA_BYTES,
     fetch_media_bytes,
@@ -153,18 +154,21 @@ def generate_image_asset(
     if not clean_prompt:
         return {"ok": False, "degraded": False, "status": "invalid_input", "error": "文生图提示词不能为空"}
 
+    clean_negative = str(negative_prompt or "").strip()[:300]
+    checked_texts = [t for t in (clean_prompt, clean_negative) if t]  # both end up in the engine's request
     if daemon is not None:
         check_ch = f"private:{actor}" if scope == "private" else "group"
         guard = getattr(daemon, "guard", None)
-        if guard is not None:
-            why = guard.check(check_ch, clean_prompt)
-            if why:
-                return {"ok": False, "degraded": False, "status": "blocked", "error": f"guard:{why}"}
         mem = getattr(daemon, "memory", None)
-        if scope != "private" and actor and mem is not None and actor in getattr(daemon.vocab, "ROSTER", ()):
-            now = float(daemon.clock.now())
-            if mem.check_outbound_leak(actor, "group", clean_prompt, now=now):
-                return {"ok": False, "degraded": False, "status": "blocked", "error": "memory_leak:private_to_public"}
+        for txt in checked_texts:
+            if guard is not None:
+                why = guard.check(check_ch, txt)
+                if why:
+                    return {"ok": False, "degraded": False, "status": "blocked", "error": f"guard:{why}"}
+            if scope != "private" and actor and mem is not None and actor in getattr(daemon.vocab, "ROSTER", ()):
+                now = float(daemon.clock.now())
+                if mem.check_outbound_leak(actor, "group", txt, now=now):
+                    return {"ok": False, "degraded": False, "status": "blocked", "error": "memory_leak:private_to_public"}
 
     conf = dict(cfg or {})
     engine = str(conf.get("engine") or "openai").strip().lower()
@@ -178,7 +182,7 @@ def generate_image_asset(
 
     req_spec: Dict[str, Any] = {
         "prompt": clean_prompt,
-        "negative_prompt": str(negative_prompt or "").strip()[:300],
+        "negative_prompt": clean_negative,
         "size": eff_size,
         "actor": str(actor or ""),
         "model": model,
@@ -395,6 +399,7 @@ def generate_image_asset(
         "media_rel": media_rel,
         "image_base64": base64.b64encode(img_bytes).decode("ascii"),
         "data_uri": to_data_uri(img_bytes, mime),
+        "checked_texts": checked_texts,  # what the image was made from: it is checked again when the image is sent
     }
 
 
@@ -422,6 +427,8 @@ def _tool_generate_image(
         is_owner=is_owner,
     )
     if res.get("ok"):
+        # bind these bytes to this chat and to the text they were made from (a group only gets media that has this)
+        register_for_tool(daemon, ctx, res.get("image_base64"), source_texts=res.get("checked_texts") or [prompt], kind="image")
         if ctx is not None and isinstance(ctx.pending_media, list):
             ctx.pending_media.append({
                 "kind": "image",

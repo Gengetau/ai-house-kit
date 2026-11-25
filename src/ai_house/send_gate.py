@@ -8,9 +8,11 @@ import sqlite3
 import threading
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, Mapping, Optional, Tuple
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from worldkernel.outbox import BlockedDelivery, NotSent
+
+from .media_provenance import MediaProvenance, media_b64, media_kind, sha256_of_b64
 
 JST = dt.timezone(dt.timedelta(hours=9))
 DEFAULT_QUIET_HOURS = "23:30-07:00"
@@ -20,6 +22,8 @@ DEFAULT_DIRECT_HOURLY_CAP = 60
 DEFAULT_DIRECT_DAILY_CAP = 300
 KIND_OUTBOX = "outbox"  # outbox deliveries: proactive talk, reminders, notices
 KIND_DIRECT = "direct"  # direct channel replies (OneBot answering a message); counted separately
+SHADOW_SUFFIX = "_shadow"  # listen-only mode keeps its own ledger rows: kind and recipient key never mix with live ones
+SHADOW_PREFIX = "shadow:"
 LOG_RETENTION_S = 3 * 86400.0  # send_gate_log rows older than this are deleted (only today's rows are ever counted)
 _LOG_PRUNE_EVERY_S = 600.0
 DAILY_COUNT_SQL = "SELECT COUNT(*) FROM send_gate_log WHERE kind=? AND day_jst=?"
@@ -75,6 +79,19 @@ def _safe_int(raw: Any, default: int) -> int:
         return default
 
 
+def is_listen_only(plugin: Any) -> bool:
+    """True only for a channel that says, with a real boolean, that it is in listen-only mode."""
+    return getattr(plugin, "listen_only", False) is True
+
+
+def _mode_kind(kind: str, shadow: bool) -> str:
+    return f"{kind}{SHADOW_SUFFIX}" if shadow else kind
+
+
+def _mode_key(key: str, shadow: bool) -> str:
+    return f"{SHADOW_PREFIX}{key}" if shadow else key
+
+
 class _GatedChannelAdapter:
     """`worldkernel.outbox.Dispatcher` adapter backed by `SendGate` + `ChannelPlugin`."""
 
@@ -114,6 +131,9 @@ class SendGate:
             "deferred_rate_limit": 0,
             "unknown": 0,
             "direct_limited": 0,
+            "deferred_muted": 0,
+            "leak_check_skipped": 0,
+            "listen_only": 0,
         }
         self._mem_ids: Dict[str, float] = {}
         self._last_log_prune = 0.0
@@ -142,6 +162,12 @@ class SendGate:
                     c.execute("UPDATE send_gate_log SET kind=? WHERE recip_key LIKE 'direct:%'", (KIND_DIRECT,))
             except sqlite3.OperationalError:
                 pass  # another connection migrated it first
+        if "shadow" not in cols:  # rows written in listen-only mode carry 1 (they are also kept apart by kind and key)
+            try:
+                with c:
+                    c.execute("ALTER TABLE send_gate_log ADD COLUMN shadow INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
         c.execute("CREATE INDEX IF NOT EXISTS idx_send_gate_log_ts ON send_gate_log(sent_at, day_jst)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_send_gate_log_kind_day ON send_gate_log(kind, day_jst)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_send_gate_log_recip ON send_gate_log(recip_key, sent_at)")
@@ -383,7 +409,13 @@ class SendGate:
         return False
 
     def _record_sent(
-        self, delivery_id: str, recip_key: str, done_day: str, done_now: float, kind: str = KIND_OUTBOX
+        self,
+        delivery_id: str,
+        recip_key: str,
+        done_day: str,
+        done_now: float,
+        kind: str = KIND_OUTBOX,
+        shadow: bool = False,
     ) -> bool:
         """Charge one send. A `delivery_id` that is already in the log is not charged again (returns False)."""
         if self._already_logged(delivery_id):
@@ -400,9 +432,9 @@ class SendGate:
             with contextlib.closing(c):
                 with c:
                     c.execute(
-                        "INSERT OR IGNORE INTO send_gate_log(delivery_id, recip_key, day_jst, sent_at, kind) "
-                        "VALUES(?, ?, ?, ?, ?)",
-                        (str(delivery_id), recip_key, done_day, float(done_now), kind),
+                        "INSERT OR IGNORE INTO send_gate_log(delivery_id, recip_key, day_jst, sent_at, kind, shadow) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        (str(delivery_id), recip_key, done_day, float(done_now), kind, 1 if shadow else 0),
                     )
                     if abs(done_now - self._last_log_prune) >= _LOG_PRUNE_EVERY_S:
                         self._last_log_prune = done_now
@@ -421,6 +453,223 @@ class SendGate:
                     cur = c.execute("DELETE FROM send_gate_log WHERE sent_at < ?", (ts - LOG_RETENTION_S,))
                     return int(cur.rowcount or 0)
 
+    # ---- shared checks -------------------------------------------------------------------------------------------
+    def _log(self, msg: str) -> None:
+        fn = getattr(self.daemon, "log", None)
+        if callable(fn):
+            try:
+                fn(f"[send_gate] {msg}")
+            except Exception:  # noqa: BLE001 - a log line never stops a send decision
+                pass
+
+    def _count(self, key: str) -> None:
+        with self._lock:
+            self._stats[key] = self._stats.get(key, 0) + 1
+
+    def _is_muted(self, eff_scope: str, out_ch: str, now: float) -> bool:
+        """A group the owner (or she herself) was told to be quiet in. Nothing goes there, whoever asks.
+        A mute lookup that fails counts as muted: the safe direction."""
+        if eff_scope == "private":
+            return False
+        fn = getattr(getattr(self.daemon, "group_behavior", None), "is_muted", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn(out_ch, now=now))
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"mute lookup failed ({type(exc).__name__}); treated as muted")
+            return True
+
+    def _media_texts(self, eff_scope: str, out_ch: str, items: Sequence[Mapping[str, Any]], declared: int) -> List[str]:
+        """Group only: the text every media item was made from, or `BlockedDelivery("media_provenance:<why>")`.
+
+        An image, a voice clip or a sticker cannot be read, so it goes into a group only when a built-in tool wrote a
+        record for exactly these bytes and this chat (see `media_provenance`). The owner's private chat is exempt."""
+        if eff_scope == "private" or declared <= 0:
+            return []
+        reg = getattr(self.daemon, "media_provenance", None)
+        if not isinstance(reg, MediaProvenance):
+            raise BlockedDelivery("media_provenance:unavailable")
+        if declared > len(items):
+            raise BlockedDelivery("media_provenance:unverifiable")  # media that is counted but not shown to the gate
+        texts: List[str] = []
+        for it in items:
+            digest = sha256_of_b64(media_b64(it))
+            if not digest or media_kind(it) not in ("image", "audio"):
+                raise BlockedDelivery("media_provenance:unverifiable")
+            rec, why = reg.lookup(digest, out_ch)
+            if rec is None:
+                raise BlockedDelivery(f"media_provenance:{why}")
+            for t in rec["texts"]:
+                if t not in texts:
+                    texts.append(t)
+        return texts
+
+    def _leak_checks(self, actor: str, texts: Sequence[str], out_ch: str, eff_scope: str, now: float) -> None:
+        """The privacy check for a group send. Raises `BlockedDelivery`; never holds the gate's lock.
+
+        It cannot run when there is no memory store or the actor is unknown, and it can raise. In a group that is not
+        leak-free that closes the send (`privacy_check_unavailable`, nothing charged); in a group listed as leak-free
+        it does not block and a log line says the check was skipped. A fallback inside the shared `leak()` (no
+        embedding service) is not a failure here: that code decides for itself."""
+        if eff_scope == "private":
+            return
+        wanted = [t for t in texts if str(t or "").strip()]
+        if not wanted:
+            return
+        d = self.daemon
+        mem = getattr(d, "memory", None)
+        free = False
+        if mem is not None:
+            try:
+                free = bool(mem.leak_free_in(out_ch))
+            except Exception:  # noqa: BLE001
+                free = False
+        roster = getattr(getattr(d, "vocab", None), "ROSTER", ())
+        runnable = mem is not None and bool(actor) and actor in roster
+        for t in wanted:
+            failed = ""
+            leaked = False
+            if not runnable:
+                failed = "no_memory_store" if mem is None else "no_known_actor"
+            else:
+                try:
+                    leaked = bool(mem.check_outbound_leak(actor, "group", t, channel=out_ch, now=now))
+                except Exception as exc:  # noqa: BLE001
+                    failed = type(exc).__name__
+            if failed:
+                if free:
+                    self._count("leak_check_skipped")
+                    self._log(f"privacy check skipped in a leak-free chat ({failed}); chat={out_ch}")
+                    return
+                self._count("blocked")
+                raise BlockedDelivery("privacy_check_unavailable")
+            if leaked:
+                self._count("blocked")
+                raise BlockedDelivery("memory_leak:private_to_public")
+
+    def _note_shadow(self, plugin: Any, **kw: Any) -> None:
+        fn = getattr(plugin, "record_listen_only", None)
+        if callable(fn):
+            try:
+                fn(**kw)
+            except Exception as exc:  # noqa: BLE001 - the record never decides the send
+                self._log(f"listen-only record failed ({type(exc).__name__})")
+
+    @staticmethod
+    def _shadow_seen(plugin: Any, delivery_id: str, verdict: str) -> bool:
+        """True if the listen-only record (the channel's table, so it survives a restart) already holds a row for this
+        delivery id and verdict. Any doubt counts as "not seen": a row too many is better than a missing one."""
+        try:
+            spool = getattr(plugin, "_spool", None)
+            if spool is not None:
+                return bool(spool.has_listen_only(delivery_id=delivery_id, verdict=verdict, path="outbox"))
+            rows = plugin.listen_only_rows(limit=500)
+            return any(r.get("delivery_id") == delivery_id[:80] and r.get("verdict") == verdict[:120] for r in rows)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _observe_own_speech(self, actor: str, eff_scope: str, out_ch: str, text: str, now: float) -> None:
+        """Her own proactive words that really went out are remembered as hers (a reminder or notice is not)."""
+        mem = getattr(self.daemon, "memory", None)
+        if mem is None or actor not in getattr(getattr(self.daemon, "vocab", None), "ROSTER", ()):
+            return
+        try:
+            private = eff_scope == "private"
+            mem.observe(actor, "private" if private else "group", "", channel="" if private else out_ch, reply=text, now=now)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"memory observe after send failed ({type(exc).__name__})")
+
+    @staticmethod
+    def _payload_media(payload: Mapping[str, Any]) -> List[Dict[str, str]]:
+        items: List[Dict[str, str]] = []
+        if str(payload.get("audio_base64") or "").strip():
+            items.append({"kind": "audio", "audio_base64": str(payload["audio_base64"]).strip()})
+        if str(payload.get("image_base64") or "").strip():
+            items.append({"kind": "image", "image_base64": str(payload["image_base64"]).strip()})
+        return items
+
+    # ---- outbox path ---------------------------------------------------------------------------------------------
+    def _outbox_checks(
+        self,
+        channel_id: str,
+        plugin: Any,
+        payload: Dict[str, Any],
+        text: str,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        is_webchat: bool,
+        shadow: bool,
+        note: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str, str, str, str]:
+        """Every check an outbox delivery passes before it may leave. Returns
+        `(payload, recip_key, out_ch, eff_scope, actor)`; raises `BlockedDelivery` / `NotSent`."""
+        d = self.daemon
+        with self._lock:
+            try:
+                eff_scope, eff_target, out_payload = self.resolve_destination(
+                    channel_id, plugin, payload, is_webchat=is_webchat
+                )
+            except BlockedDelivery:
+                self._stats["blocked"] += 1
+                raise
+            note.update(kind=eff_scope, target=eff_target, actor=str(out_payload.get("actor") or "").strip())
+            actor = str(out_payload.get("actor") or "").strip()
+            to_identity = str(out_payload.get("to_identity") or "").strip()
+            now = float(d.clock.now())
+            out_ch = group_channel_of(channel_id, eff_target, is_webchat=is_webchat)
+            if self._is_muted(eff_scope, out_ch, now):
+                # nothing passes a hold, reminders included; the delivery waits and goes out once the mute is over
+                self._stats["deferred_muted"] += 1
+                raise NotSent("group_muted")
+            if str(out_payload.get("source") or "") == "proactive":
+                created_ts = float(out_payload.get("created_ts") or 0.0)
+                if created_ts > 0 and (now - created_ts) > 1800.0:
+                    self._stats["blocked"] += 1
+                    raise BlockedDelivery("expired_ttl")
+            check_ch = f"private:{actor}" if eff_scope == "private" else out_ch
+            guard = getattr(d, "guard", None)
+            if guard is not None:
+                why = guard.check(check_ch, text, actor=actor)
+                if why:
+                    self._stats["blocked"] += 1
+                    raise BlockedDelivery(f"guard:{why}")
+            try:
+                media_texts = self._media_texts(eff_scope, out_ch, items, len(items)) if not is_webchat else []
+            except BlockedDelivery:
+                self._stats["blocked"] += 1
+                raise
+            if guard is not None:
+                for t in media_texts:
+                    why = guard.check(check_ch, t, actor=actor)
+                    if why:
+                        self._stats["blocked"] += 1
+                        raise BlockedDelivery(f"guard:{why}")
+
+        # the privacy check can be slow (a vector service): it runs without the gate's lock. It only reads the
+        # memory store and the caller's own text, and the quota below is decided after it, so nothing is lost by that.
+        self._leak_checks(actor, [text, *media_texts], out_ch, eff_scope, now)
+
+        with self._lock:
+            if not bool(out_payload.get("urgent")):
+                quiet_spec = str(d.env.get("AI_HOUSE_QUIET_HOURS", DEFAULT_QUIET_HOURS))
+                if in_quiet_hours(now, quiet_spec):
+                    self._stats["deferred_quiet_hours"] += 1
+                    raise NotSent("quiet_hours")
+
+            hourly_cap = _safe_int(d.env.get("AI_HOUSE_OUTBOX_HOURLY_CAP"), DEFAULT_HOURLY_CAP)
+            daily_cap = _safe_int(d.env.get("AI_HOUSE_OUTBOX_DAILY_CAP"), DEFAULT_DAILY_CAP)
+            recip_key = _mode_key(to_identity or f"{channel_id}:{eff_target or eff_scope}", shadow)
+            today_jst = dt.datetime.fromtimestamp(now, JST).date().isoformat()
+            h_count, d_count = self._rate_counts(recip_key, now, today_jst, _mode_kind(KIND_OUTBOX, shadow))
+            if h_count >= hourly_cap:
+                self._stats["deferred_rate_limit"] += 1
+                raise NotSent("hourly_cap")
+            if d_count >= daily_cap:
+                self._stats["deferred_rate_limit"] += 1
+                raise NotSent("daily_cap")
+        return out_payload, recip_key, out_ch, eff_scope, actor
+
     def deliver_gated(
         self,
         channel_id: str,
@@ -436,53 +685,40 @@ class SendGate:
             with self._lock:
                 self._stats["blocked"] += 1
             raise BlockedDelivery("empty_text")
+        shadow = (not is_webchat) and is_listen_only(plugin)
+        items = [] if is_webchat else self._payload_media(payload)
+        note: Dict[str, Any] = {"kind": "", "target": "", "actor": str(payload.get("actor") or "")}
+        source = str(payload.get("source") or "")
+        try:
+            out_payload, recip_key, out_ch, eff_scope, actor = self._outbox_checks(
+                channel_id, plugin, payload, text, items, is_webchat=is_webchat, shadow=shadow, note=note
+            )
+        except (BlockedDelivery, NotSent) as exc:
+            if shadow:
+                verdict = ("blocked:" if isinstance(exc, BlockedDelivery) else "limited:") + str(exc.reason)
+                # a held-back delivery stays pending and is tried again on every flush: one row per (id, reason)
+                if not (isinstance(exc, NotSent) and self._shadow_seen(plugin, str(delivery_id), verdict)):
+                    self._note_shadow(
+                        plugin, path="outbox", source=source, delivery_id=str(delivery_id), text_len=len(text),
+                        media=items, verdict=verdict, **note,
+                    )
+            raise
 
-        with self._lock:
-            try:
-                eff_scope, eff_target, out_payload = self.resolve_destination(
-                    channel_id, plugin, payload, is_webchat=is_webchat
-                )
-            except BlockedDelivery:
-                self._stats["blocked"] += 1
-                raise
-
-            actor = str(out_payload.get("actor") or "").strip()
-            to_identity = str(out_payload.get("to_identity") or "").strip()
-            now = float(d.clock.now())
-            if str(out_payload.get("source") or "") == "proactive":
-                created_ts = float(out_payload.get("created_ts") or 0.0)
-                if created_ts > 0 and (now - created_ts) > 1800.0:
-                    self._stats["blocked"] += 1
-                    raise BlockedDelivery("expired_ttl")
-            out_ch = group_channel_of(channel_id, eff_target, is_webchat=is_webchat)
-            check_ch = f"private:{actor}" if eff_scope == "private" else out_ch
-            if getattr(d, "guard", None) is not None:
-                why = d.guard.check(check_ch, text, actor=actor)
-                if why:
-                    self._stats["blocked"] += 1
-                    raise BlockedDelivery(f"guard:{why}")
-            if eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
-                if d.memory.check_outbound_leak(actor, "group", text, channel=out_ch, now=now):
-                    self._stats["blocked"] += 1
-                    raise BlockedDelivery("memory_leak:private_to_public")
-
-            if not bool(out_payload.get("urgent")):
-                quiet_spec = str(d.env.get("AI_HOUSE_QUIET_HOURS", DEFAULT_QUIET_HOURS))
-                if in_quiet_hours(now, quiet_spec):
-                    self._stats["deferred_quiet_hours"] += 1
-                    raise NotSent("quiet_hours")
-
-            hourly_cap = _safe_int(d.env.get("AI_HOUSE_OUTBOX_HOURLY_CAP"), DEFAULT_HOURLY_CAP)
-            daily_cap = _safe_int(d.env.get("AI_HOUSE_OUTBOX_DAILY_CAP"), DEFAULT_DAILY_CAP)
-            recip_key = to_identity or f"{channel_id}:{eff_target or eff_scope}"
-            today_jst = dt.datetime.fromtimestamp(now, JST).date().isoformat()
-            h_count, d_count = self._rate_counts(recip_key, now, today_jst, KIND_OUTBOX)
-            if h_count >= hourly_cap:
-                self._stats["deferred_rate_limit"] += 1
-                raise NotSent("hourly_cap")
-            if d_count >= daily_cap:
-                self._stats["deferred_rate_limit"] += 1
-                raise NotSent("daily_cap")
+        if shadow:
+            # listen-only: the whole verdict was reached, nothing is written to the channel; the draft is kept in the
+            # channel's own record and the quota is charged in the shadow ledger, so the limits are simulated
+            ref = f"shadow:{delivery_id}"
+            self._note_shadow(
+                plugin, path="outbox", source=source, delivery_id=str(delivery_id), text=text, media=items,
+                verdict="allowed", **note,
+            )
+            with self._lock:
+                done_now = float(d.clock.now())
+                done_day = dt.datetime.fromtimestamp(done_now, JST).date().isoformat()
+                self._record_sent(SHADOW_PREFIX + str(delivery_id), recip_key, done_day, done_now,
+                                  _mode_kind(KIND_OUTBOX, True), True)
+                self._stats["listen_only"] += 1
+            return ref
 
         try:
             if is_webchat:
@@ -508,6 +744,9 @@ class SendGate:
             done_now = float(d.clock.now())
             done_day = dt.datetime.fromtimestamp(done_now, JST).date().isoformat()
             self._record_sent(delivery_id, recip_key, done_day, done_now, KIND_OUTBOX)
+        if not is_webchat and source == "proactive":
+            # her own words that were really sent are remembered as hers; a reminder or other notice is not
+            self._observe_own_speech(actor, eff_scope, out_ch, text, done_now)
         return ref
 
     def _direct_hourly_cap(self, plugin: Any) -> int:
@@ -523,6 +762,60 @@ class SendGate:
         # configured value raises this cap instead of being clipped to the default.
         return max(DEFAULT_DIRECT_HOURLY_CAP, _safe_int(per_hour, DEFAULT_DIRECT_HOURLY_CAP))
 
+    # ---- direct channel replies ------------------------------------------------------------------------------------
+    def _direct_checks(
+        self,
+        channel_id: str,
+        plugin: Any,
+        *,
+        kind: str,
+        target: str,
+        actor: str,
+        body: str,
+        items: Sequence[Mapping[str, Any]],
+        declared_media: int,
+        urgent: bool = True,
+    ) -> Tuple[str, str, str, float]:
+        """Destination, mute, guard, media provenance and privacy check for one direct reply; charges nothing.
+        Returns `(eff_scope, eff_target, out_ch, now)`."""
+        d = self.daemon
+        with self._lock:
+            try:
+                eff_scope, eff_target, _ = self.resolve_destination(
+                    channel_id,
+                    plugin,
+                    {"kind": kind, "target": target, "actor": actor, "text": body, "urgent": urgent},
+                    is_webchat=False,
+                )
+            except BlockedDelivery:
+                self._stats["blocked"] += 1
+                raise
+            now = float(d.clock.now())
+            out_ch = group_channel_of(channel_id, eff_target, is_webchat=False)
+            if self._is_muted(eff_scope, out_ch, now):
+                self._stats["blocked"] += 1
+                raise BlockedDelivery("group_muted")
+            check_ch = f"private:{actor}" if eff_scope == "private" else out_ch
+            guard = getattr(d, "guard", None)
+            if body and guard is not None:
+                why = guard.check(check_ch, body, actor=actor)
+                if why:
+                    self._stats["blocked"] += 1
+                    raise BlockedDelivery(f"guard:{why}")
+            try:
+                media_texts = self._media_texts(eff_scope, out_ch, items, declared_media)
+            except BlockedDelivery:
+                self._stats["blocked"] += 1
+                raise
+            if guard is not None:
+                for t in media_texts:
+                    why = guard.check(check_ch, t, actor=actor)
+                    if why:
+                        self._stats["blocked"] += 1
+                        raise BlockedDelivery(f"guard:{why}")
+        self._leak_checks(actor, [body, *media_texts], out_ch, eff_scope, now)  # no lock held, see `_outbox_checks`
+        return eff_scope, eff_target, out_ch, now
+
     def authorize_direct_send(
         self,
         channel_id: str,
@@ -536,51 +829,43 @@ class SendGate:
         urgent: bool = True,
         enforce_rate_cap: bool = True,
         media_count: int = 0,
+        media: Sequence[Mapping[str, Any]] = (),
+        dry_run: bool = False,
     ) -> str:
-        """Gate a direct channel reply (e.g. OneBot WS) through destination, guard, leak & cap checks.
+        """Gate a direct channel reply (e.g. OneBot WS) through destination, mute, guard, media provenance, leak & cap checks.
 
         Nothing is charged here: the caller must call `record_direct_sent(delivery_id, <returned key>)` once the
         reply really went out, so a failed send costs no quota. A reply whose `delivery_id` is already in the log
         (resumed or authorised again) is not stopped by the caps and is not charged twice. Direct replies have their
-        own hourly (per target) and daily counters, independent of outbox traffic. `media_count` lets a reply that
-        is nothing but pictures/voice (empty `text`) through."""
-        d = self.daemon
+        own hourly (per target) and daily counters, independent of outbox traffic.
+
+        `media` are the reply's pictures / voice clips (`{"kind": "image", "image_base64": ...}`): in a group each
+        one needs a provenance record (see `media_provenance`) and the text it was made from is checked again.
+        `media_count` alone (no items) only lets a private reply of pure media through: in a group it is refused.
+
+        A channel in listen-only mode (`listen_only is True`) is refused here with `listen_only` after every other
+        check passed, unless the caller passes `dry_run=True` (the channel's own bookkeeping of what would have
+        been sent); then the returned key belongs to the shadow ledger."""
         body = str(text or "").strip()
-        if not body and int(media_count or 0) <= 0:
+        items = [dict(m) for m in (media or ()) if isinstance(m, Mapping)]
+        declared = max(int(media_count or 0), len(items))
+        if not body and declared <= 0:
             with self._lock:
                 self._stats["blocked"] += 1
             raise BlockedDelivery("empty_text")
+        shadow = is_listen_only(plugin)
+        eff_scope, eff_target, _out_ch, now = self._direct_checks(
+            channel_id, plugin, kind=kind, target=target, actor=actor, body=body, items=items,
+            declared_media=declared, urgent=urgent,
+        )
         with self._lock:
-            try:
-                eff_scope, eff_target, _ = self.resolve_destination(
-                    channel_id,
-                    plugin,
-                    {"kind": kind, "target": target, "actor": actor, "text": body, "urgent": urgent},
-                    is_webchat=False,
-                )
-            except BlockedDelivery:
-                self._stats["blocked"] += 1
-                raise
-
-            now = float(d.clock.now())
-            out_ch = group_channel_of(channel_id, eff_target, is_webchat=False)
-            check_ch = f"private:{actor}" if eff_scope == "private" else out_ch
-            if body and getattr(d, "guard", None) is not None:
-                why = d.guard.check(check_ch, body, actor=actor)
-                if why:
-                    self._stats["blocked"] += 1
-                    raise BlockedDelivery(f"guard:{why}")
-            if body and eff_scope != "private" and actor and actor in d.vocab.ROSTER and getattr(d, "memory", None) is not None:
-                if d.memory.check_outbound_leak(actor, "group", body, channel=out_ch, now=now):
-                    self._stats["blocked"] += 1
-                    raise BlockedDelivery("memory_leak:private_to_public")
-
-            recip_key = f"direct:{channel_id}:{eff_target or eff_scope}"
+            recip_key = _mode_key(f"direct:{channel_id}:{eff_target or eff_scope}", shadow)
             today_jst = dt.datetime.fromtimestamp(now, JST).date().isoformat()
-            if enforce_rate_cap and not self._already_logged(delivery_id):
+            did = (SHADOW_PREFIX if shadow else "") + str(delivery_id)
+            if enforce_rate_cap and not self._already_logged(did):
                 hourly_cap = self._direct_hourly_cap(plugin)
-                daily_cap = _safe_int(d.env.get("AI_HOUSE_DIRECT_DAILY_CAP"), DEFAULT_DIRECT_DAILY_CAP)
-                h_count, d_count = self._rate_counts(recip_key, now, today_jst, KIND_DIRECT)
+                daily_cap = _safe_int(self.daemon.env.get("AI_HOUSE_DIRECT_DAILY_CAP"), DEFAULT_DIRECT_DAILY_CAP)
+                h_count, d_count = self._rate_counts(recip_key, now, today_jst, _mode_kind(KIND_DIRECT, shadow))
                 if h_count >= hourly_cap:
                     self._stats["deferred_rate_limit"] += 1
                     self._stats["direct_limited"] += 1
@@ -589,11 +874,35 @@ class SendGate:
                     self._stats["deferred_rate_limit"] += 1
                     self._stats["direct_limited"] += 1
                     raise NotSent("daily_cap")
+            if shadow and not dry_run:
+                self._stats["blocked"] += 1
+                raise BlockedDelivery("listen_only")
             return recip_key
 
+    def recheck_direct_send(
+        self,
+        channel_id: str,
+        plugin: Any,
+        *,
+        kind: str,
+        target: str,
+        actor: str,
+        media: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
+        """The checks that cost nothing, asked again before the rest of a resumed reply goes out: the destination is
+        still allowed, the group has not been muted since, and the pictures / voice clips still have their record.
+        Raises `BlockedDelivery` / `NotSent`; charges and records nothing."""
+        items = [dict(m) for m in (media or ()) if isinstance(m, Mapping)]
+        self._direct_checks(
+            channel_id, plugin, kind=kind, target=target, actor=actor, body="", items=items, declared_media=len(items)
+        )
+
     def record_direct_sent(self, delivery_id: str, recip_key: str) -> bool:
-        """Charge one direct reply after it has really been sent. Recording the same `delivery_id` twice is a no-op."""
+        """Charge one direct reply after it has really been sent. Recording the same `delivery_id` twice is a no-op.
+        A key from listen-only mode charges the shadow ledger (what would have been sent), never the live one."""
+        shadow = str(recip_key).startswith(SHADOW_PREFIX)
         with self._lock:
             now = float(self.daemon.clock.now())
             day = dt.datetime.fromtimestamp(now, JST).date().isoformat()
-            return self._record_sent(str(delivery_id), str(recip_key), day, now, KIND_DIRECT)
+            did = (SHADOW_PREFIX if shadow else "") + str(delivery_id)
+            return self._record_sent(did, str(recip_key), day, now, _mode_kind(KIND_DIRECT, shadow), shadow)

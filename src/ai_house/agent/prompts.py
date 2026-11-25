@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
+from .engine import MAX_SENDS_PER_TURN
+
 FRESH_SESSION_NOTE = (
     "（程序提示）这是一个新的会话，你不记得这个对话里更早说过什么。"
     "下面列出了最近几句；还需要更早的事，就用 search_memory 查，查不到就照实说不记得，不要编。"
@@ -34,7 +36,12 @@ TEXT_ONLY_NUDGE = (
 TEXT_ONLY_NUDGE_GROUP = TEXT_ONLY_NUDGE + "如果其实不想接话，就调用 stay_quiet。"
 
 
-def system_prompt(persona: str, *, where: str, allow_quiet: bool) -> str:
+def sends_rule(max_sends: int) -> str:
+    """The rules-text sentence about how many messages one turn may send (the same number the turn enforces)."""
+    return f"一轮最多发 {int(max_sends)} 条。" if int(max_sends) > 0 else "一轮发几条不限，但别刷屏。"
+
+
+def system_prompt(persona: str, *, where: str, allow_quiet: bool, max_sends: int = MAX_SENDS_PER_TURN) -> str:
     """Stable for the life of a session: who she is and how speaking works. Per-turn facts go in the turn prompt."""
     room = "群聊" if where == "group" else "私聊"
     lines: List[str] = [
@@ -43,7 +50,7 @@ def system_prompt(persona: str, *, where: str, allow_quiet: bool) -> str:
         "每一轮开头程序会给出你此刻的真实屋内状态；只能依据这些事实说话，严禁编造没发生的事。",
         "怎么说话：",
         "- 想说的话必须调用 send_message 工具发出去。直接写出来的文字没有人看得到。",
-        "- 一条消息 1～3 句话（80 字以内），口吻自然、生活化，不要加引号或动作括号。一轮通常只发一条。",
+        "- 一条消息 1～3 句话（80 字以内），口吻自然、生活化，不要加引号或动作括号。" + sends_rule(max_sends),
     ]
     if allow_quiet:
         lines.append("- 群里的消息不是对你说的、或者没必要接话时，调用 stay_quiet，不要硬回。")
