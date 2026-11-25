@@ -48,6 +48,9 @@ def _compile_terms(text, vocab, party, names, beneficiary=None):
             t = t[:alias.start("name")] + t[alias.end("name"):]
     # A pronoun right after 帮/替/给/答应 is the person it is done for; anywhere else it stays residue.
     t = re.sub(r"(帮|替|给|答应)[他你]", r"\1", t)
+    # Made for the owner, a note in brackets that only says so, such as （替房主买）, adds nothing.
+    if beneficiary is not None and list(beneficiary) == ["owner"]:
+        t = re.sub(r"[（(]\s*(?:替|帮|给)(?:买|带)?的?\s*[）)]", "", t)
     t = re.sub(r"我们|我|她|打算|准备|答应|约好|说好|帮|替|给|要|会|再|顺便|顺路|去一趟|一下|吧|呢", "", t)
     terms = []
     handoff = bool(re.search(r"交给|送给|一起吃|拿给", str(text)))

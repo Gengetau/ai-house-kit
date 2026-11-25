@@ -222,6 +222,19 @@ class BareBring:
                 self.assertFalse([x for x in got if x["kind"] == "purchased"], text)
 
 
+    def test_bracket_note_saying_it_is_for_the_owner(self):
+        """Seen in a real run: the summary ended in （替房主买）, and the second 买 in it left the errand unsupported.
+        Fails if such a note still blocks it, or if a note that says anything else stops blocking."""
+        self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（替房主买）"), TEA)
+        self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（帮他买的）"), TEA)
+        self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（给房主）"), TEA)
+        for b in ([], None):
+            self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（替房主买）", b), UNSUPPORTED, b)
+        for text in ("奈尔出门时顺便买一盒红茶带回来（替房主买两盒）", "奈尔出门时顺便买一盒红茶带回来（不用替房主买）",
+                     "奈尔出门时顺便买一盒红茶带回来（替房主买伞）"):
+            self.assertEqual(self.c(text), UNSUPPORTED, text)
+
+
 class BareBringDefault(BareBring, Base, unittest.TestCase):
     rules, vocab = P, V
 
