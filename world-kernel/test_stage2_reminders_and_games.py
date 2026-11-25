@@ -158,5 +158,18 @@ class Stage2RemindersAndGamesTests(unittest.TestCase):
         self.assertEqual(res_x["reminder"]["state"], "cancelled")
 
 
+class SetReminderSpecTests(unittest.TestCase):
+    def test_the_tool_text_says_a_reminder_goes_to_the_person_who_asked(self) -> None:
+        """Fails if the description does not say plainly that the message is delivered at that time to the person who
+        asked for it, and that it is for when THEY ask to be reminded."""
+        from ai_house.builtin_plugins.reminders import _SET_SPEC
+
+        desc = _SET_SPEC["description"]
+        self.assertIn("到点时把这条消息发给请你设提醒的那个人", desc)
+        self.assertIn("对方要你提醒他某件事时才用", desc)
+        self.assertIn("in_minutes", desc)
+        self.assertIn("at_jst", desc)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,7 @@ BLOCK = "你今天已经做过的事"
 DONE = "已经办完了"
 PRIVATE_TEXT = "奈尔买2个鸡蛋"
 RULE = "只看“你今天已经做过的事”"
+NO_REMINDER_RULE = "你自己答应了要办的事不用设提醒，也不要说设了提醒，小屋会记着你答应过什么"
 KEY = "sk-ant-" + "a" * 40
 
 
@@ -137,6 +138,7 @@ class ChatContextTests(Base):
         self.assertIn("买了鸡蛋 ×2", got[-1])
         self.assertIn(f"「{PRIVATE_TEXT}」{DONE}", got[-1])
         self.assertIn(RULE, got[-1])
+        self.assertIn(NO_REMINDER_RULE, got[-1])
 
     def test_agent_brain_prompt_carries_the_block(self):
         """Fails if the agent brain's turn prompt (or its system rules) misses the block or the rule sentence."""
@@ -152,6 +154,7 @@ class ChatContextTests(Base):
         self.assertIn("买了鸡蛋 ×2", h.prompts[0])
         self.assertIn(DONE, h.prompts[0])
         self.assertIn(RULE, h.clients[0].kwargs["system_prompt"])
+        self.assertIn(NO_REMINDER_RULE, h.clients[0].kwargs["system_prompt"])
         self.assertNotIn("记下答应房主的事", h.clients[0].kwargs["system_prompt"])
 
 

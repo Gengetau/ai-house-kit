@@ -311,9 +311,41 @@ class VirtualClockRestartTests(Base):
         resumed = d2.clock.now()
         self.assertGreater(resumed, self.START + 20 * 3600)  # not back at 2026-11-21 09:00
         self.assertLessEqual(resumed, reached + 1)  # never ahead of where the house actually was
-        self.assertEqual(resumed, _latest_event_ts(rt))
+        self.assertGreaterEqual(resumed, _latest_event_ts(rt))  # was assertEqual: it pinned the bug (restart at the last event)
         d2.fast_forward(15)
         self.assertGreater(d2.clock.now(), resumed)
+
+    def test_restart_after_quiet_stretch_does_not_go_back(self) -> None:
+        # Steps that leave no stored event used to leave no trace: the house restarted at the last event, not where it got to.
+        rt = self.tmpdir()
+        d1 = self.daemon(rt, virtual_clock=True)
+        for m in (60, 60, 60, 60, 54):
+            d1.fast_forward(m)
+        reached = d1.clock.now()
+        self.assertGreater(reached, _latest_event_ts(rt))  # the quiet stretch: the clock is past every stored event
+        d1.close()
+        d2 = self.daemon(rt, virtual_clock=True)
+        self.assertEqual(d2.clock.now(), reached)
+
+    def test_restart_is_never_earlier_than_newest_chat_line(self) -> None:
+        rt = self.tmpdir()
+        d1 = self.daemon(rt, virtual_clock=True)
+        d1.fast_forward(60)
+        d1.close()
+        chat_ts = self.START + 8 * 3600
+        with contextlib.closing(sqlite3.connect(str(Path(rt) / "world.db"))) as c, c:
+            c.execute("INSERT INTO chat_messages(channel,sender,sender_name,text,created_at) VALUES('group','owner','房主','hi',?)", (chat_ts,))
+        (Path(rt) / "virtual_clock.json").unlink(missing_ok=True)  # even without the marker file
+        d2 = self.daemon(rt, virtual_clock=True)
+        self.assertGreaterEqual(d2.clock.now(), chat_ts)
+
+    def test_reset_house_forgets_the_reached_time(self) -> None:
+        rt = self.tmpdir()
+        d1 = self.daemon(rt, virtual_clock=True)
+        d1.fast_forward(120)
+        self.assertTrue((Path(rt) / "virtual_clock.json").is_file())
+        d1.reset_house()
+        self.assertFalse((Path(rt) / "virtual_clock.json").exists())
 
     def test_explicit_later_start_ts_still_wins(self) -> None:
         rt = self.tmpdir()

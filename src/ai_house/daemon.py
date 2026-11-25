@@ -159,16 +159,38 @@ class OffsetWallClock:
             pass
 
 
+VIRTUAL_CLOCK_FILE = "virtual_clock.json"
+
+
 def _latest_house_time(life_db: str | Path) -> float:
-    """Latest time the house reached according to the persisted event log (0.0 when there is none)."""
-    if not Path(life_db).is_file():
-        return 0.0
+    """Latest time the house is known to have reached (0.0 when there is nothing).
+
+    Three places remember it, and the newest wins: the kernel event log (`life1.db`), the house's own events and
+    stored chat lines (`world.db`, next to it), and `virtual_clock.json`, which a virtual-clock house writes every time
+    it moves the clock (steps through a quiet stretch leave no event, so the log alone is not enough).
+    """
+    life = Path(life_db)
+    best = 0.0
+    probes = [
+        (life, "SELECT MAX(MAX(recorded_at), MAX(occurred_at)) FROM events"),
+        (life.with_name("world.db"), "SELECT MAX(created_at) FROM chat_messages"),
+        (life.with_name("world.db"), "SELECT MAX(ts) FROM events"),
+    ]
+    for fp, sql in probes:
+        if not fp.is_file():
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{fp.as_posix()}?mode=ro", uri=True)) as c:
+                row = c.execute(sql).fetchone()
+            best = max(best, float(row[0] or 0.0))
+        except (sqlite3.Error, TypeError, ValueError):
+            continue
     try:
-        with contextlib.closing(sqlite3.connect(f"file:{Path(life_db).as_posix()}?mode=ro", uri=True)) as c:
-            row = c.execute("SELECT MAX(MAX(recorded_at), MAX(occurred_at)) FROM events").fetchone()
-        return float(row[0] or 0.0)
-    except (sqlite3.Error, TypeError, ValueError):
-        return 0.0
+        doc = json.loads((life.parent / VIRTUAL_CLOCK_FILE).read_text(encoding="utf-8"))
+        best = max(best, float(doc.get("now") or 0.0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return best
 
 
 class DaemonLockError(RuntimeError):
@@ -723,6 +745,7 @@ class HouseDaemon:
                 pass
         if hasattr(self, "_lock"):
             with self._lock:
+                self._persist_virtual_time()
                 self._teardown_world()
         else:
             self._teardown_world()
@@ -755,6 +778,11 @@ class HouseDaemon:
                 self.memory.backfill_vectors()
             except Exception as exc:  # noqa: BLE001
                 self.log(f"memory vector backfill error: {type(exc).__name__}")
+            if self.intents is not None:
+                try:  # a promise the kernel just closed becomes a memory of hers (once)
+                    self.intents.record_completions(now)
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"promise completion memory error: {type(exc).__name__}: {exc}")
             if due_diary_day(now) is not None:
                 try:
                     stored_pl = self.settings_store.get_plugins_map()
@@ -832,6 +860,18 @@ class HouseDaemon:
                         self._plugin_runtime_errors.append(err)
                 self.log(f"plugin task {defn.plugin_id}.{task.task_id} skipped: {err['error']}")
 
+    def _persist_virtual_time(self) -> None:
+        """A virtual-clock house writes down how far it has got, so a restart continues from there (best effort)."""
+        if not self._virtual_clock or self.needs_onboarding or self.authority is None:
+            return  # a reset house starts over: nothing to remember
+        try:
+            fp = self.runtime_dir / VIRTUAL_CLOCK_FILE
+            tmp = fp.with_name(fp.name + ".tmp")
+            tmp.write_text(json.dumps({"now": float(self.clock.now())}), encoding="utf-8")
+            os.replace(tmp, fp)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
     def step_once(self) -> Dict[str, Any]:
         with self._lock:
             if self.needs_onboarding or self.authority is None:
@@ -870,6 +910,7 @@ class HouseDaemon:
             for _ in range(minutes):
                 self.clock.advance(60)
                 self.authority.step()
+            self._persist_virtual_time()
         self._run_post_step_jobs()
         snap = self.get_state()
         self._broadcast("state", {"now": snap["now_jst"], "fast_forwarded_min": minutes})
@@ -2517,6 +2558,7 @@ class HouseDaemon:
                 self.runtime_dir / "channel_spool.db-wal",
                 self.runtime_dir / "channel_spool.db-shm",
                 self.runtime_dir / "clock_offset.json",
+                self.runtime_dir / VIRTUAL_CLOCK_FILE,
                 self.runtime_dir / "house_setup.json",
                 self.runtime_dir / "proactive_state.json",
                 self.runtime_dir / "group_behavior.json",

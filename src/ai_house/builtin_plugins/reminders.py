@@ -385,7 +385,10 @@ def _route_cancel(ctx: PluginRequestContext) -> Dict[str, Any]:
 
 _SET_SPEC = {
     "name": "set_reminder",
-    "description": "为用户设置一个定时提醒（支持相对分钟数 in_minutes 或 JST 时刻 at_jst）。",
+    "description": (
+        "设置一个定时提醒：到点时把这条消息发给请你设提醒的那个人（不是提醒你自己）。"
+        "只在对方要你提醒他某件事时才用。（支持相对分钟数 in_minutes 或 JST 时刻 at_jst）"
+    ),
     "parameters": {
         "type": "object",
         "properties": {

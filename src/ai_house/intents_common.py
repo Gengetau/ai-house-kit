@@ -16,6 +16,12 @@ What it does
   the house's pack (`bound(vocab)`).
 - `init()`: carries an existing `world.db` over (see there), then lets the shared module make its tables.
 - pass-through: `sweep`, `kernel_context`, `errands`, `request_reopen`, `card_lines`, `listing`.
+- `record_completions()`: the memory side of a finished promise. The kernel closes a promise (`intents.status` becomes
+  `completed`) and writes nothing to memory, so from the next day recall would only say she had promised. Each
+  completed row gets ONE memory of hers, in the audience the promise was made in (a private promise: her private chat
+  with the owner; a group promise: that group). Done once per row: the kit-owned table `kit_intent_done_memos` in
+  `world.db` holds a marker per (id, created); the shared `intents` table is not touched. A house that already has
+  completed rows when the table is first made marks them without writing (no flood of old news).
 - `list_intents`: `listing()` in the row shape the web page reads.
 
 Names. The shared `_party_key` knows the owner as "房主", "owner" and the aliases of the roster; the roster made here
@@ -332,7 +338,76 @@ class CommonIntents:
                         c.execute("alter table owner_chat_queue rename column created_at to created")
             self._w.init()
             self._i.init()
+            self._init_done_memos()
             self._carry_memos()
+
+    def _init_done_memos(self) -> None:
+        """The marker table of `record_completions`. Made once; the first time it is made, whatever is already completed
+        is marked as seen (those were finished before the house wrote such memories)."""
+        with self._conn() as c:
+            fresh = not c.execute("select 1 from sqlite_master where type='table' and name='kit_intent_done_memos'").fetchone()
+            c.execute("create table if not exists kit_intent_done_memos(intent_id integer not null, created real not null,"
+                      " written_at real not null, outcome text not null, primary key(intent_id, created))")
+            if fresh and c.execute("select 1 from sqlite_master where type='table' and name='intents'").fetchone():
+                c.execute("insert or ignore into kit_intent_done_memos select id, created, ?, 'before' from intents "
+                          "where status='completed'", (self._ambient_now(),))
+
+    def record_completions(self, now: Optional[float] = None) -> int:
+        """Write one memory for each promise that is completed and has none yet. -> rows written. Never raises.
+
+        Same audience as the promise: private -> `private` scope (her private chat with the owner, so recall keeps
+        every rule that already covers private memories); group -> the group the promise was made in (the web group
+        when its refs name none, as for a promise the kernel made among housemates). Kind `event`, never merged into an
+        older row. The time in the text is the completion time on the house clock (`updated`), in JST. A write that
+        fails for another reason than a refusal is left unmarked and tried again on the next call. INTENTS=0: nothing."""
+        mem = self._memory
+        if mem is None or not self.world_db or not self._i.ON:
+            return 0
+        try:
+            with self._conn() as c:
+                pending = c.execute(
+                    "select * from intents where status='completed' and not exists (select 1 from kit_intent_done_memos m "
+                    "where m.intent_id=intents.id and m.created=intents.created) order by updated, id").fetchall()
+        except sqlite3.Error as exc:
+            log.warning("promise completions not read: %s", type(exc).__name__)
+            return 0
+        wrote = 0
+        for r in pending:
+            try:
+                outcome = self._write_completion(mem, r)
+            except Exception as exc:  # noqa: BLE001  # memory trouble must never reach the step loop; tried again later
+                log.warning("promise completion memory not written (intent %s): %s: %s", r["id"], type(exc).__name__, exc)
+                continue
+            try:
+                with self._conn() as c:
+                    c.execute("insert or ignore into kit_intent_done_memos values (?,?,?,?)",
+                              (r["id"], r["created"], self._ambient_now() if now is None else float(now), outcome))
+            except sqlite3.Error as exc:
+                log.warning("promise completion marker not written (intent %s): %s", r["id"], type(exc).__name__)
+                continue
+            wrote += outcome == "written"
+        return wrote
+
+    def _write_completion(self, mem: Any, r: sqlite3.Row) -> str:
+        actor = str(r["actor"])
+        done_at = float(r["updated"])
+        t = _dt.datetime.fromtimestamp(done_at, _JST)
+        name = str((getattr(mem, "names", None) or {}).get(actor) or actor)
+        owner_asked = "owner" in json.loads(r["beneficiary"] or "[]")
+        text = f"{t.month}月{t.day}日 {t:%H:%M} {name}把{'答应房主的' if owner_asked else '约好的'}事办完了：{r['text']}"
+        if r["visibility"] == "private":
+            scope, channel = "private", ""
+        else:
+            scope = "group"
+            chats = [str(f["chat"]) for f in json.loads(r["refs"]) if isinstance(f, dict) and str(f.get("chat", "")).startswith("group:")]
+            channel = mem._channel_of_chat(chats[0], actor) if chats else "group"
+        try:
+            mem.add(actor, scope, text, channel=channel, about="房主" if owner_asked else "", kind="event",
+                    source="promise_done", merge=False, now=done_at)
+        except ValueError as exc:  # refused by the store (a name no longer living here, text it will not keep): not retried
+            log.info("promise completion memory refused (intent %s): %s", r["id"], exc)
+            return "refused"
+        return "written"
 
     def _carry_memos(self) -> None:
         if self._memory is None:
