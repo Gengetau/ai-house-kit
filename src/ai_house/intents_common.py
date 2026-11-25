@@ -63,6 +63,33 @@ _JST = _dt.timezone(_dt.timedelta(hours=9))
 # the owner asks for something anew in the batch (so a repeated item is a real second errand, never a restatement)
 _NEW_REQUEST = re.compile(r"再|又|另外|还要|还想|还得|多买|多带|第二|两次|重新")
 _OWNER_NAME_BAD = re.compile(r"\(你\)|（你）|·头衔.*$")
+# A bracketed note that only says a relative day ("（后天）"). It goes stale the next day, so it is cut from a promise's
+# text when the text also has an absolute date.
+_REL_DAY_NOTE = re.compile(r"[（(]\s*(?:原话说?|即|也就是)?\s*[“\"「]?\s*(?:今天|明天|后天|大后天|昨天|前天|今晚|明晚)"
+                           r"\s*[”\"」]?\s*[）)]")
+_ABS_DATE = re.compile(r"\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d")
+
+
+def strip_stale_day_notes(text: Any) -> Any:
+    """Remove a bracketed relative-day note from a promise text when an absolute date is still in it."""
+    if not isinstance(text, str):
+        return text
+    rest = _REL_DAY_NOTE.sub("", text)
+    return rest if rest != text and _ABS_DATE.search(rest) else text
+
+
+def _clean_ops(ops: Any) -> Any:
+    """Copy of `ops` where each intent op's text has no stale day note; other ops and the caller's dicts stay as they are."""
+    if not isinstance(ops, (list, tuple)):
+        return ops
+    out = []
+    for op in ops:
+        if isinstance(op, dict) and op.get("op") == "intent" and isinstance(op.get("text"), str):
+            text = strip_stale_day_notes(op["text"])
+            if text != op["text"]:
+                op = dict(op, text=text)
+        out.append(op)
+    return out
 
 
 class _OsProxy:
@@ -175,6 +202,10 @@ class CommonIntents:
             tl.owner_cards = owner_cards(lines)
             try:
                 now = k.get("now", a[0] if a else None)
+                try:
+                    ops = _clean_ops(ops)
+                except Exception:  # noqa: BLE001  # on doubt the texts stay as the model wrote them
+                    pass
                 try:
                     kept, dropped = self._without_restated(i, consumer, chat, private, ops, lines, now)
                 except Exception:  # noqa: BLE001  # this guard never holds the memories back: on doubt nothing is dropped

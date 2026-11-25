@@ -153,5 +153,45 @@ class OtherPack(Base, unittest.TestCase):
             self.assertEqual(r.compile_terms(text, V, PARTY, b), P.compile_terms(text, V, PARTY, b), text)
 
 
+class WhenAdverbials:
+    """`出门时` and the like say only when; they are dropped like 下次. Anything else around them still blocks."""
+    name, party = "奈尔", PARTY
+
+    def c(self, text, beneficiary=["owner"]):
+        return self.compile(text.replace("奈尔", self.name), self.party, beneficiary)
+
+    def test_going_out_is_a_when_word(self):
+        self.assertEqual(self.c("奈尔答应房主：11月21日出门时顺路买一盒红茶带回来"), TEA)
+        self.assertEqual(self.c("奈尔答应房主：11月23日出门时帮买六个鸡蛋"),
+                         [{"kind": "purchased", "item": "egg", "qty": 6}])
+        for when in ("出门的时候", "出去的时候", "出去时", "出门", "等下", "等会儿", "等会", "待会儿", "待会", "一会儿"):
+            self.assertEqual(self.c("奈尔答应房主：" + when + "顺路买一盒红茶带回来"), TEA, when)
+
+    def test_what_the_when_word_must_not_turn_into_an_errand(self):
+        for text in ("奈尔答应房主：下次出门先去找红茶，买到马上告诉房主", "奈尔答应房主：出门前把红茶喝完",
+                     "奈尔答应房主：出门时不买红茶", "奈尔答应房主：出门时顺路做咖喱"):
+            self.assertEqual(self.c(text), UNSUPPORTED, text)
+
+    def test_day_after_the_day_after_tomorrow_is_a_date_note(self):
+        a = self.compile("和房主11月25日（大后天）一起去公园散步", self.party_pair)
+        self.assertEqual(a, self.compile("和房主11月25日一起去公园散步", self.party_pair))
+        self.assertEqual(self.c("奈尔答应房主：11月24日（后天）帮房主带一瓶可乐回来"), errand("cola", 1))
+
+
+class WhenAdverbialsDefault(WhenAdverbials, Base, unittest.TestCase):
+    rules, vocab = P, V
+    party_pair = ["nell", "owner"]
+
+
+class WhenAdverbialsBound(WhenAdverbials, Base, unittest.TestCase):
+    name, party = "苍空", ["sora"]
+    party_pair = ["sora", "owner"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vocab = V.load_pack(PACK)
+        cls.rules = P.bound(cls.vocab)
+
+
 if __name__ == "__main__":
     unittest.main()

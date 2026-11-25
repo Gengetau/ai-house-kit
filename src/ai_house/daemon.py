@@ -821,9 +821,12 @@ class HouseDaemon:
 
     def _unbuyable_item(self, owner_text: str, rep: Mapping[str, Any]) -> str:
         """The thing the owner asked to have bought that is not in the catalog (so cannot be), or ""."""
+        return self._unbuyable_from(owner_text, str(rep.get("text") or ""))
+
+    def _unbuyable_from(self, owner_text: str, reply_text: str = "") -> str:
         if self.intents is None or buy_words.detect_errand_item(self.vocab, owner_text)[0]:
             return ""
-        noun = buy_words.extract_buy_request_noun(owner_text, str(rep.get("text") or ""))
+        noun = buy_words.extract_buy_request_noun(owner_text, reply_text)
         return "" if not noun or buy_words.resolve_item_id(self.vocab, noun) else noun
 
     def _run_plugin_tasks(self, now: float) -> None:
@@ -1669,6 +1672,16 @@ class HouseDaemon:
             today = self._today_lines(aid, now, is_private)
             if today:
                 mem_ctx = "\n".join(filter(None, [mem_ctx, "你今天已经做过的事（屋里的记录，按时间）：", *today]))
+            if speaker.is_owner:
+                # told before she replies; the "买不了" tail after her reply stays as the fallback
+                try:
+                    cant_buy = self._unbuyable_from(text)
+                except Exception as exc:  # noqa: BLE001  # a hint never stops her reply
+                    cant_buy = ""
+                    self.log(f"unbuyable hint error: {type(exc).__name__}")
+                if cant_buy:
+                    mem_ctx = "\n".join(filter(None, [mem_ctx, f"房主这句话里要买的「{cant_buy}」，附近的店里买不到（小屋的清单里没有）。"
+                                                      "照实告诉他买不了，不要答应去买；清单里有相近的东西可以问他要不要换。"]))
             turn_media: List[Dict[str, Any]] = []
 
             def _run_tool(
