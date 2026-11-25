@@ -219,7 +219,7 @@ def _bound_yes(who, quote_at, spoken):
         if speaker != who or i <= quote_at:
             continue
         text = side_questions_off(text)
-        if _unreal(text) or NO.search(text) or NO_EVIDENCE.search(text):
+        if _unreal(text) or NO.search(text.replace('要不要', '')) or NO_EVIDENCE.search(text):
             continue
         # A later, explicit quote of this particular proposal can identify the reply without time metadata.
         cited = re.findall(r'[「“\"]([^」”\"]+)[」”\"]', text)
@@ -254,7 +254,7 @@ def _bound_yes(who, quote_at, spoken):
 
 def _agrees(text):
     t = str(text or "").strip()
-    return bool(YES.search(t)) and not NO.search(t) and not ASKING.search(t)
+    return bool(YES.search(t)) and not NO.search(t.replace('要不要', '')) and not ASKING.search(t)
 
 
 def _said_yes(who, quote_by, spoken):
@@ -662,7 +662,7 @@ def _new(c, actor, chat, private, op, spoken, talked, now, worn=frozenset(), tim
     if not said_by or said_by not in party + beneficiaries:
         raise ValueError("quote not said by anyone in it")
     line = spoken[quote_at][1] if EVIDENCE_GATE else _quote_line(quote, spoken)
-    if NO.search(line) or FICTION.search(line) or (EVIDENCE_GATE and _unreal(line)):
+    if NO.search(line.replace('要不要', '')) or FICTION.search(line) or (EVIDENCE_GATE and _unreal(line)):
         raise ValueError("the quote turns it down, or it is a dream / a what-if")
     if EVIDENCE_GATE and not _same_topic(text, line):
         raise ValueError('proposal quote cannot be linked to this matter')
@@ -759,7 +759,7 @@ def _end(c, actor, chat, private, op, spoken, talked, now):
         raise ValueError("a question is not evidence")
     if kind == "intent_done" and (NOT_YET.search(line) or not DONE.search(line)):
         raise ValueError("not said to be done")
-    if EVIDENCE_GATE and kind == "intent_done" and (DENIED_DONE.search(line) or NO.search(line)
+    if EVIDENCE_GATE and kind == "intent_done" and (DENIED_DONE.search(line) or NO.search(line.replace('要不要', ''))
                                                    or not _same_topic(r['text'], line)):
         raise ValueError('completion is denied or cannot be linked to this matter')
     status = "completed" if kind == "intent_done" else ("declined" if op.get("why") == "declined" else "cancelled")

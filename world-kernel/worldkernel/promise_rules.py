@@ -60,6 +60,10 @@ def _compile_terms(text, vocab, party, names, beneficiary=None):
     # `带<item>回来` without 买: bringing a shop item home means buying it (the judge still needs both events).
     # The words in between stay in the text, so anything that is not an ingredient is residue.
     bring = None if brought or re.search(r"买到?|采购|补买", t) else re.search(r"带(?P<what>[^带]+?)回(?:来|家)", t)
+    # Made for the owner, a bare `带<item>` at the end of the clause is the same errand.
+    if bring is None and not brought and beneficiary is not None and list(beneficiary) == ["owner"] \
+            and not re.search(r"买到?|采购|补买", t):
+        bring = re.search(r"带(?P<what>[^带去到在，。！？,.!?：:\s]+?)(?:过?来)?[，。！？,.!?\s]*$", t)
     if bring:
         brought = True
         t = t[:bring.start()] + bring.group("what") + t[bring.end():]

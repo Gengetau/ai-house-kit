@@ -78,6 +78,13 @@ from .settings_store import SettingsStore
 JST = dt.timezone(dt.timedelta(hours=9))
 SHADOW_CHAT_MODE = "shadow"  # a chat row holding a draft that a listen-only channel did not send
 
+
+def _house_time_line(now: float) -> str:
+    d = dt.datetime.fromtimestamp(float(now), JST)
+    return (f"小屋现在的时间：{d.year}年{d.month}月{d.day}日 星期{'一二三四五六日'[d.weekday()]} {d:%H:%M}（日本时间）。"
+            "说“今天、明天、后天”都按这个日期算，不要用别处看到的日期。")
+
+
 HOST_EXTRA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1660,6 +1667,8 @@ class HouseDaemon:
             asker: Dict[str, Any] = {"speaker": speaker.name, "speaker_role": speaker_role,
                                      "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else "")}
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now, **asker)
+            # first line of every turn, both brains: the house's own date (the engine's clock may differ)
+            mem_ctx = "\n".join(filter(None, [_house_time_line(now), mem_ctx]))
             if self.intents is not None:
                 # with INTENTS_SHOW on: what she agreed in a group chat and is due soon (as on her card); off: nothing
                 try:

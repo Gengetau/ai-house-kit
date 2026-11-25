@@ -115,10 +115,10 @@ class NeverStricter(unittest.TestCase):
 
 
 class EndToEnd(Dir):
-    def stored(self, reply):
+    def stored(self, reply, quote="今天出门的时候帮我带一盒红茶回来"):
         d = self.daemon(env={"INTENTS": "1"})
         op = {"op": "intent", "text": "奈尔答应房主：帮房主带一盒红茶回来", "kind": "promise", "for": ["房主"],
-              "agreed": ["奈尔"], "scope": "world", "when": "vague", "quote": "今天出门的时候帮我带一盒红茶回来"}
+              "agreed": ["奈尔"], "scope": "world", "when": "vague", "quote": quote}
         d.memory.observe("nell", "private", P, speaker_role="owner", speaker="房主", reply=reply, now=T0)
         d.memory.extract(force=True, now=T0 + 5, llm_fn=fake_model([op]))
         with d.intents._conn() as c:
@@ -131,6 +131,33 @@ class EndToEnd(Dir):
     def test_reply_with_an_unrelated_later_question_is_accepted(self):
         """Fails if the promise is stored as anything but accepted."""
         self.assertEqual(self.stored(R2), ["accepted"])
+
+    def test_quoting_her_line_with_an_offer_in_it_is_accepted(self):
+        """Fails if a quote of her line is rejected as "turns it down" because the line also says 要不要 (an offer)."""
+        reply = "好呀，我记下了，出门时顺路给你带一盒红茶回来。我这边法式吐司快好了，你要不要先来一块？"
+        self.assertEqual(self.stored(reply, quote="出门时顺路给你带一盒红茶回来"), ["accepted"])
+
+    def test_a_real_refusal_in_her_line_still_rejects(self):
+        """Fails if a line with 不要 (not part of 要不要) or 算了 stops turning the promise down."""
+        self.assertEqual(self.stored("不要，我今天不出门。", quote="不要，我今天不出门"), [])
+        self.assertEqual(self.stored("好呀，不过算了吧，要不要改天？", quote="好呀，不过算了吧，要不要改天"), [])
+
+
+class OfferIsNotARefusal(unittest.TestCase):
+    def test_a_statement_with_an_offer_is_still_a_yes(self):
+        """Fails if 要不要 inside a statement (no question mark) makes a plain yes "not a yes"."""
+        for r in ("好呀，红茶我记下了，要不要我顺便带点牛奶。", "好呀，红茶我这就去买，要不要牛奶我也带。",
+                  "好呀，红茶这就去买。你要不要也来一杯？"):
+            with self.subTest(r):
+                self.assertTrue(yes(r))
+        self.assertTrue(I._agrees("好呀，红茶我记下了，要不要我顺便带点牛奶。"))
+
+    def test_real_refusals_beside_an_offer_still_count(self):
+        """Fails if removing 要不要 also hides a real 不要 / 算了 in the same reply."""
+        for r in ("好呀，不过算了，要不要改天？", "好呀，红茶不要了，要不要牛奶我也带。"):
+            with self.subTest(r):
+                self.assertFalse(yes(r))
+                self.assertFalse(I._agrees(r))
 
 
 if __name__ == "__main__":

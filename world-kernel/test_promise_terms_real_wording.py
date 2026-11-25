@@ -193,5 +193,47 @@ class WhenAdverbialsBound(WhenAdverbials, Base, unittest.TestCase):
         cls.rules = P.bound(cls.vocab)
 
 
+class BareBring:
+    """Made for the owner, `带<item>` with no `回来` is the same errand as `带<item>回来`; otherwise nothing changes."""
+    name, party = "奈尔", PARTY
+
+    def c(self, text, beneficiary=["owner"]):
+        return self.compile(text.replace("奈尔", self.name), self.party, beneficiary)
+
+    def test_bare_bring_for_the_owner_is_an_errand(self):
+        """Fails if `带一包薯片` / `带两盒牛奶` for the owner stays unsupported, or loses an event or the count."""
+        self.assertEqual(self.c("奈尔答应房主下次出门顺路带一包薯片"), errand("chips", 1))
+        self.assertEqual(self.c("奈尔答应房主：明天带两盒牛奶"), errand("milk", 2))
+        self.assertEqual(self.c("奈尔答应房主：带一包薯片给他。"), errand("chips", 1))
+
+    def test_without_the_owner_as_beneficiary_it_stays_unsupported(self):
+        """Fails if the bare form is read as an errand when nobody says it is for the owner."""
+        for b in ([], None, ["nell"], ["owner", "nell"]):
+            self.assertEqual(self.c("奈尔答应房主：明天带两盒牛奶", b), UNSUPPORTED, b)
+            self.assertEqual(self.c("奈尔答应房主下次出门顺路带一包薯片", b), UNSUPPORTED, b)
+
+    def test_not_an_ingredient_or_not_an_errand_stays_unsupported(self):
+        """Fails if anything but an ingredient, or a trip somewhere, turns into a purchase."""
+        for text in ("奈尔答应房主：带伞", "奈尔答应房主：带他去公园", "奈尔答应房主：带一包薯片去公园",
+                     "奈尔答应房主：带一包薯片和伞", "奈尔答应房主：不带薯片"):
+            for b in (["owner"], None):
+                got = self.c(text, b)
+                self.assertEqual(got, UNSUPPORTED, text)
+                self.assertFalse([x for x in got if x["kind"] == "purchased"], text)
+
+
+class BareBringDefault(BareBring, Base, unittest.TestCase):
+    rules, vocab = P, V
+
+
+class BareBringBound(BareBring, Base, unittest.TestCase):
+    name, party = "苍空", ["sora"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vocab = V.load_pack(PACK)
+        cls.rules = P.bound(cls.vocab)
+
+
 if __name__ == "__main__":
     unittest.main()
