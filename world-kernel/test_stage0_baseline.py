@@ -363,8 +363,11 @@ class Stage0ModelCompatTests(unittest.TestCase):
         secret_key = "sk-localMockTestKey123456"
         base_url, recorded = self._start_mock_llm_server("gpt5_compat", secret_key)
 
+        # A fixed evening hour: on the wall clock this case failed whenever it ran while she was asleep (02:00-06:00).
         d = HouseDaemon(
             Path(tmp.name) / "rt",
+            virtual_clock=True,
+            start_ts=dt.datetime(2026, 11, 21, 20, 0, tzinfo=JST).timestamp(),
             env={
                 "AI_HOUSE_WORLD_PACK": "life1",
                 "AI_HOUSE_BASE_URL": base_url,

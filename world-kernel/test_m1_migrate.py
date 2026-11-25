@@ -343,14 +343,17 @@ class ReportTests(MigrateCase):
             self.assertIn("没有找到旧记忆库", describe(rep)[0])
 
     def test_the_command_line_prints_sentences_and_a_dry_run_changes_nothing(self):
+        # The command line takes "now" from the wall clock; the fixture has a memory that comes due about 28 hours
+        # after T0, so on the real clock this case started to fail the day after T0. The clock is the fixture's here.
+        at_now = mock.patch.object(memory_migrate._time, "time", lambda: NOW)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), at_now:
             self.assertEqual(memory_migrate.main([self.dir, "--dry-run", "--names", "nia=妮娅,xingli=星璃"]), 0)
         self.assertIn("试运行", out.getvalue())
         self.assertIn("旧记忆库里共 18 条记忆", out.getvalue())
         self.assertFalse(self.new_path.exists())
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), at_now:
             self.assertEqual(memory_migrate.main([self.dir]), 0)
         self.assertIn("这次搬进新库 14 条", out.getvalue())
         self.assertTrue(self.new_path.exists())
