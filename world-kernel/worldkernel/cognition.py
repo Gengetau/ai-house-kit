@@ -253,6 +253,23 @@ class Cognition:
                 out.append(self._submit_step(job["actor"], first=True))
         return out
 
+    def _drop_plan_for_outing(self, actor, plan, res):
+        """a move turned into an outing leaves her at home waiting to depart; drop any remaining
+        steps in this model reply instead of running them at home while holding her busy."""
+        dropped = [s.get("action_type") for s in plan["steps"][plan["i"] + 1:]]
+        del self.plans[actor]
+        self._save_plan(actor)
+        if dropped:
+            self.k.audit(
+                "cognition_steps_dropped_for_outing",
+                actor=actor,
+                plan_id=res.get("plan_id"),
+                action_id=res.get("action_id") or plan.get("action_id"),
+                to=res.get("to"),
+                dropped_count=len(dropped),
+                dropped_actions=dropped,
+            )
+
     def advance_plans(self):
         """After ticks: start the next step of any plan whose current step succeeded; drop failed plans."""
         out = []
@@ -273,6 +290,15 @@ class Cognition:
                 self._point(actor, plan["kind"], f"step_{st}", "replan_needed")
                 del self.plans[actor]
                 self._save_plan(actor)
+                continue
+            row = self.s.db.execute(
+                "SELECT c.result FROM actions a JOIN commands c ON c.command_id=a.command_id WHERE a.action_id=?",
+                (plan["action_id"],),
+            ).fetchone()
+            cmd_res = json.loads(row[0] or "{}") if row else {}
+            if isinstance(cmd_res, dict) and cmd_res.get("outing") == "started_for_you":
+                with self.s.tx():
+                    self._drop_plan_for_outing(actor, plan, cmd_res)
                 continue
             self._fault('completed_before_advance')
             plan["i"] += 1
@@ -327,6 +353,9 @@ class Cognition:
         with self.s.tx():
             res = self.k.submit(cmd)
             self._fault('submitted_before_attach')
+            if res["status"] == "succeeded" and res.get("outing") == "started_for_you":
+                self._drop_plan_for_outing(actor, plan, res)
+                return res
             plan['action_id'] = res.get('action_id')
             self._save_plan(actor)
         if res["status"] in ("failed", "conflict"):

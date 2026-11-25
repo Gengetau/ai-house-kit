@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from .kernel import Refused
+from .store import dumps
 from .wallet import Wallet, local, JST
 from .trips import Trips
 from .shopping import Shopping
@@ -57,6 +58,7 @@ class Outings:
         self.shopping = Shopping(self,targets)
         self.k.instant['buy'] = self.buy
         self.k.on_complete.append(self.completed)
+        self.k.accept_intercepts.append(self._move_as_outing)
         self.l.plans.validators.update(outing=self.validate,trip=self.validate)
         respond = self.k.instant['respond_invite']
         def checked_response(k,db,aid,actor,args,cmd):
@@ -76,6 +78,40 @@ class Outings:
 
     def job(self,actor):
         return self.l.get(f'outing:active:{actor}')
+
+    def _move_as_outing(self,k,db,command_id,actor,atype,args,cmd):
+        """her own `move` from home to a place:* (city places included) becomes a one-person outing.
+
+        The plan is the same row a confirmed invitation leaves, run by the same machinery afterwards (local
+        places by this class, city places by the city bridge). It goes through the same validators as an invite
+        (route, rain, money, schedule conflicts, trip notice), so none of them is bypassed; a failed check is
+        the command's failure reason. Anything else (home rooms, routine origins, an outing already on, a busy
+        or away actor) is left to the guard as before."""
+        if atype!='move' or cmd.get('origin')!='model':
+            return None
+        to=args.get('to'); me=actor['actor_id']; here=actor['location']
+        if set(args)!={'to'} or not isinstance(to,str) or not self.v.place_id(to):
+            return None
+        if here=='away' or self.v.place_id(here) or actor['action_id'] or not self.k.city_visits.home_allowed(me):
+            return None
+        j=self.job(me)
+        if j and j['state'] in ('running','returning','paused'):
+            return None
+        now=self.s.clock.now()
+        plans=self.l.plans
+        if to not in self.v.LOCATIONS and not any(fn('outing',to,actor,dict(location=to)) for fn in plans.location_checkers):
+            raise Refused('unknown_location')
+        plan_id=self.s.new_id('plan')
+        plan=dict(kind='outing',what='',location=to,start_at=float(now),end_at=None,members=[me],
+                  _proposed_at=now,_plan_id=plan_id)
+        validator=plans.validators.get('outing')
+        if validator:
+            validator(k,db,actor,plan)
+        db.execute("INSERT INTO plans(plan_id,host,kind,what,location,start_at,end_at,members,state,note,created_at,updated_at,event_id)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                   (plan_id,me,'outing','',to,float(now),None,dumps([me]),'confirmed','move_as_outing',now,now))
+        k.audit('move_became_outing',actor=me,plan_id=plan_id,to=to,command_id=command_id)
+        return {'status':'succeeded','plan_id':plan_id,'outing':'started_for_you','to':to}
 
     def save(self,actor,job):
         self.l.put(f'outing:active:{actor}',job)

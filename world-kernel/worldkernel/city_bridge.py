@@ -58,6 +58,11 @@ DEFAULT_CARRY_YEN = 20000
 DEFAULT_SAFETY_MARGIN_YEN = 200
 DEFAULT_MAX_DECISIONS_PER_VISIT = 12
 DEFAULT_CITY_PLAN_DURATION_S = 7200
+# how long after start_at a confirmed city outing keeps waiting for a bridge that is briefly unreachable
+# before it may fall back to the local catalog route; retries back off 30s -> 300s.
+CITY_DEPART_WAIT_WINDOW_S = 1800
+CITY_DEPART_BACKOFF_S = (30, 60, 120, 240, 300)
+LEGACY_BRIDGE_SKIP_REASON = "city_bridge_unavailable"
 DEFAULT_CATALOG_WARM_TIMEOUT_S = 1.5
 DEFAULT_CATALOG_WARM_COOLDOWN_MS = 300_000
 
@@ -390,6 +395,22 @@ class CityBridgeAdapter:
             for p in self.l.plans.upcoming(actor_id, 3600)
             if p["state"] == "confirmed" and p["start_at"] > now and self.claims_plan(p)
         ]
+        # a plan waiting out a bridge outage keeps its members for the next retry.
+        with self.s.read() as db:
+            waits = db.execute("SELECT key, value FROM life_runtime WHERE key LIKE 'cityplan:wait:%'").fetchall()
+            for key, value in waits:
+                pid = key[len("cityplan:wait:"):]
+                row = db.execute("SELECT * FROM plans WHERE plan_id=?", (pid,)).fetchone()
+                if not row or row["state"] not in ("confirmed", "running") or actor_id not in json.loads(row["members"]):
+                    continue
+                next_try = float(json.loads(value).get("next_try", 0))
+                if next_try <= now:
+                    continue  # stale record: never hold her to a time that has passed
+                if db.execute(
+                    "SELECT 1 FROM city_visit_carry WHERE plan_id=? AND actor_id=? LIMIT 1", (pid, actor_id)
+                ).fetchone() or self._is_member_skipped(row, actor_id, now_s=now, db=db):
+                    continue  # she already left, or was dropped from this plan
+                due.append(next_try)
         return min(due) if due else None
 
     def _warm_catalog(self, *, force=False):
@@ -421,12 +442,36 @@ class CityBridgeAdapter:
         if not isinstance(cmd, dict):
             return
         atype = self.k.V.CATALOG["aliases"].get(cmd.get("action_type"), cmd.get("action_type"))
-        if atype != "invite" or cmd.get("actor_id") not in self.allowed_actors:
+        actor_id = cmd.get("actor_id")
+        if actor_id not in self.allowed_actors:
             return
         args = cmd.get("args")
-        if not isinstance(args, dict) or args.get("plan_id") or args.get("kind") not in ("outing", "trip"):
+        if not isinstance(args, dict):
             return
-        loc = str(args.get("location") or "").strip()
+        if atype == "invite":
+            if args.get("plan_id") or args.get("kind") not in ("outing", "trip"):
+                return
+            loc = str(args.get("location") or "").strip()
+        elif atype == "move":
+            if cmd.get("origin") != "model" or self._outings is None:
+                return
+            to = args.get("to")
+            if set(args) != {"to"} or not isinstance(to, str) or not self.k.V.place_id(to):
+                return
+            if not self.v.home_allowed(actor_id) or self._outings.owns(actor_id):
+                return
+            actor = self.k.actor(actor_id)
+            if (
+                not actor
+                or not actor["simulated"]
+                or actor["location"] == "away"
+                or self.k.V.place_id(actor["location"])
+                or actor["action_id"]
+            ):
+                return
+            loc = to.strip()
+        else:
+            return
         if not loc or loc in self.k.V.LOCATIONS or city_projection._ENTRANCE_RE.search(loc):
             return
         pid = loc.split(":", 1)[1] if loc.startswith("place:") else loc
@@ -1490,6 +1535,7 @@ class CityBridgeAdapter:
             if carry.get("plan_id"):
                 plan = self.l.plans.plan(carry["plan_id"])
                 if plan and plan["state"] not in ("done", "cancelled", "lapsed"):
+                    now_s = self.s.clock.now()
                     with self.s.read() as db:
                         done_members = {
                             r[0]
@@ -1499,12 +1545,12 @@ class CityBridgeAdapter:
                                 (carry["plan_id"],),
                             ).fetchall()
                         }
-                    if all(m in done_members for m in plan["members"]):
-                        self.l.plans.finish(carry["plan_id"], "done")
-                    elif done_members and all(
-                        m in done_members or bool(self.l.get(f"cityplan:skipped:{carry['plan_id']}:{m}"))
-                        for m in plan["members"]
-                    ):
+                        all_done = all(m in done_members for m in plan["members"])
+                        all_done_or_skipped = bool(done_members) and all(
+                            m in done_members or self._is_member_skipped(plan, m, now_s=now_s, db=db)
+                            for m in plan["members"]
+                        )
+                    if all_done or all_done_or_skipped:
                         self.l.plans.finish(carry["plan_id"], "done")
 
         self._confirm_release(visit_id)
@@ -2061,10 +2107,92 @@ class CityBridgeAdapter:
             return False
         if plan.get("kind") not in ("outing", "trip"):
             return False
+        if plan.get("plan_id") and self.l.get(f"cityplan:local:{plan['plan_id']}"):
+            return False  # degraded to the local catalog route; same plan, no city visit
         if not self._plan_city_destination(plan, require_place_prefix_for_alias=True):
             return False
         members = plan.get("members") or ()
         return bool(members) and all(m in self.allowed_actors for m in members)
+
+    def _member_skip_reason(self, pid, actor, *, db=None):
+        key = f"cityplan:skipped:{pid}:{actor}"
+        if db is not None:
+            row = db.execute("SELECT value FROM life_runtime WHERE key=?", (key,)).fetchone()
+            return json.loads(row[0]) if row else None
+        return self.l.get(key)
+
+    def _plan_is_departable(self, plan, now_s, *, db=None):
+        if not self.intercept_plans or not plan or plan["state"] not in ("confirmed", "running"):
+            return False
+        end_s = self.plan_effective_end(plan, db=db)
+        return end_s is not None and now_s < end_s
+
+    def _plan_still_claimable(self, plan, *, db=None):
+        """Same take-over test the departure scheduler applies (claims_plan), usable from
+        hold_until() (sqlite Row, members as JSON text) and from settlement inside a read."""
+        p = dict(plan)
+        members = p.get("members")
+        if isinstance(members, str):
+            try:
+                members = json.loads(members)
+            except ValueError:
+                return False
+        p["members"] = list(members or ())
+        pid = p.get("plan_id")
+        if pid and db is not None:
+            row = db.execute("SELECT 1 FROM life_runtime WHERE key=?", (f"cityplan:local:{pid}",)).fetchone()
+            if row:
+                return False  # degraded to the local route; the scheduler no longer takes it over
+            p["plan_id"] = None  # local-route marker already checked on this read
+        return self.claims_plan(p)
+
+    def _is_member_skipped(self, plan, actor, *, now_s=None, db=None):
+        """Return True iff actor is effectively skipped for plan.
+
+        Upgrade compatibility: older builds wrote
+        cityplan:skipped:{plan_id}:{actor} = 'city_bridge_unavailable' when a
+        bridge precheck failed after another member had already started. For a
+        plan the departure scheduler can still take over (claims_plan: every
+        member on the access list, city destination, not degraded to local)
+        and that can still depart (confirmed/running and within its window),
+        treat that legacy marker as pending departure instead of skipped.
+        Otherwise the marker keeps its skip meaning so a returned plan can
+        finish (the access list may have shrunk across a restart).
+        """
+        pid = plan["plan_id"]
+        reason = self._member_skip_reason(pid, actor, db=db)
+        if not reason:
+            return False
+        if reason == LEGACY_BRIDGE_SKIP_REASON:
+            if now_s is None:
+                now_s = self.s.clock.now()
+            if (
+                actor in self.allowed_actors
+                and self._plan_is_departable(plan, now_s, db=db)
+                and self._plan_still_claimable(plan, db=db)
+            ):
+                return False
+        return True
+
+    def _reprocess_legacy_bridge_skip(self, pid, actor):
+        """Clear a legacy city_bridge_unavailable skip marker and audit once (idempotently)."""
+        if self._member_skip_reason(pid, actor) != LEGACY_BRIDGE_SKIP_REASON:
+            return False
+        skip_key = f"cityplan:skipped:{pid}:{actor}"
+        audit_key = f"cityplan:legacyskip_audit:{pid}:{actor}"
+        with self.s.tx() as db:
+            row = db.execute("SELECT value FROM life_runtime WHERE key=?", (skip_key,)).fetchone()
+            if not row or json.loads(row[0]) != LEGACY_BRIDGE_SKIP_REASON:
+                return False
+            db.execute("DELETE FROM life_runtime WHERE key=?", (skip_key,))
+            if self.l.once(audit_key):
+                self.k.audit(
+                    "city_plan_legacy_skip_reprocessed",
+                    plan_id=pid,
+                    actor=actor,
+                    reason=LEGACY_BRIDGE_SKIP_REASON,
+                )
+            return True
 
     def _activate_due_city_plans(self):
         if not self.intercept_plans:
@@ -2085,8 +2213,20 @@ class CityBridgeAdapter:
             city_dest = self._plan_city_destination(plan, require_place_prefix_for_alias=True)
             if not city_dest:
                 continue
+            wait_key = f"cityplan:wait:{pid}"
+            hold_key = f"cityplan:holdaudit:{pid}"
             end_s = self.plan_effective_end(plan)
             if now_s >= end_s:
+                wait_rec = self.l.get(wait_key)
+                if wait_rec:
+                    with self.s.tx() as db:
+                        self.k.audit(
+                            "city_plan_wait_expired",
+                            plan_id=pid,
+                            reason="plan_window_passed",
+                            code=wait_rec.get("code") if isinstance(wait_rec, dict) else None,
+                        )
+                        db.execute("DELETE FROM life_runtime WHERE key IN (?, ?)", (wait_key, hold_key))
                 with self.s.read() as db:
                     carries = db.execute(
                         "SELECT c.actor_id, v.state FROM city_visit_carry c JOIN city_visits v USING(visit_id)"
@@ -2099,8 +2239,11 @@ class CityBridgeAdapter:
                     outcome = "done" if any(r["state"] in ("closed", "reconcile") for r in carries) else "cancelled"
                     self.l.plans.finish(pid, outcome)
                 continue
+            wait = self.l.get(wait_key)
+            if wait and now_s < float(wait["next_try"]) and now_s < float(wait["deadline"]):
+                continue  # backing off: no /catalog retry on every step
             for actor in plan["members"]:
-                if self.l.get(f"cityplan:skipped:{pid}:{actor}"):
+                if self._is_member_skipped(plan, actor, now_s=now_s):
                     continue
                 with self.s.read() as db:
                     already = db.execute(
@@ -2109,6 +2252,7 @@ class CityBridgeAdapter:
                     ).fetchone()
                 if already:
                     continue
+                self._reprocess_legacy_bridge_skip(pid, actor)
                 if not self.v.home_allowed(actor) or self.l.busy(actor):
                     continue
                 act_row = self.k.actor(actor)
@@ -2126,6 +2270,13 @@ class CityBridgeAdapter:
                         plan_id=pid,
                     )
                 except Refused as exc:
+                    if exc.reason == "city_bridge_unavailable":
+                        self._bridge_unavailable(plan, actor, exc, now_s, end_s)
+                        break
+                    if wait:
+                        with self.s.tx() as db:
+                            db.execute("DELETE FROM life_runtime WHERE key IN (?, ?)", (wait_key, hold_key))
+                        wait = None
                     with self.s.read() as db:
                         started_any = db.execute(
                             "SELECT 1 FROM city_visit_carry c JOIN city_visits v USING(visit_id)"
@@ -2136,7 +2287,87 @@ class CityBridgeAdapter:
                         self.l.plans.set_state(pid, "cancelled", exc.reason)
                         break
                     self.l.put(f"cityplan:skipped:{pid}:{actor}", exc.reason)
-                    self.k.audit("city_plan_member_skipped", plan_id=pid, actor=actor, reason=exc.reason)
+                    extra = {"code": exc.extra["code"]} if (exc.extra or {}).get("code") else {}
+                    self.k.audit("city_plan_member_skipped", plan_id=pid, actor=actor, reason=exc.reason, **extra)
+                else:
+                    if wait:
+                        with self.s.tx() as db:
+                            db.execute("DELETE FROM life_runtime WHERE key IN (?, ?)", (wait_key, hold_key))
+                        wait = None
+        with self.s.read() as db:
+            stale_waits = db.execute("SELECT key, value FROM life_runtime WHERE key LIKE 'cityplan:wait:%'").fetchall()
+        for wait_key, raw_wait in stale_waits:
+            pid = wait_key[len("cityplan:wait:"):]
+            plan = self.l.plans.plan(pid)
+            if plan and plan["state"] in ("confirmed", "running"):
+                continue
+            wait_rec = json.loads(raw_wait)
+            with self.s.tx() as db:
+                if plan and plan["state"] == "lapsed":
+                    self.k.audit(
+                        "city_plan_wait_expired",
+                        plan_id=pid,
+                        reason="plan_window_passed",
+                        code=wait_rec.get("code") if isinstance(wait_rec, dict) else None,
+                    )
+                db.execute("DELETE FROM life_runtime WHERE key IN (?, ?)", (wait_key, f"cityplan:holdaudit:{pid}"))
+
+    def _bridge_unavailable(self, plan, actor, exc, now_s, end_s):
+        """depart() refused before freezing anything because the bridge is unreachable.
+
+        Returns 'wait' (retry later), 'local' (degraded to the local route), or 'cancel'."""
+        pid = plan["plan_id"]
+        wait_key = f"cityplan:wait:{pid}"
+        hold_key = f"cityplan:holdaudit:{pid}"
+        rec = self.l.get(wait_key)
+        code = (exc.extra or {}).get("code") or (rec or {}).get("code")
+        deadline = min(float(plan["start_at"]) + CITY_DEPART_WAIT_WINDOW_S, float(end_s))
+        if now_s < deadline:
+            attempts = (rec["attempts"] if rec else 0) + 1
+            backoff = CITY_DEPART_BACKOFF_S[min(attempts - 1, len(CITY_DEPART_BACKOFF_S) - 1)]
+            self.l.put(
+                wait_key,
+                {"since": rec["since"] if rec else now_s, "deadline": deadline, "attempts": attempts,
+                 "next_try": min(now_s + backoff, deadline), "code": code},
+            )
+            self.k.audit(
+                "city_plan_wait", plan_id=pid, actor=actor, attempt=attempts, next_try_in_s=backoff,
+                deadline=deadline, code=code, phase="entered" if attempts == 1 else "retry",
+            )
+            return "wait"
+        with self.s.tx() as db:
+            # One transaction: nothing handed over (no carry row at all, aborted ones included) -> may degrade.
+            carried = db.execute("SELECT 1 FROM city_visit_carry WHERE plan_id=? LIMIT 1", (pid,)).fetchone()
+            outings = self._outings
+            loc = plan.get("location")
+            local_pid = self.k.V.place_id(loc) if loc else None
+            has_local = bool(outings is not None and local_pid and local_pid in outings.places)
+            if carried:
+                # Existing carry rows (preparing, active, aborted, etc.): keep the plan and pending members
+                # waiting on the same plan so bridge recovery can depart remaining members without dropping anyone.
+                if self.l.once(hold_key):
+                    self.k.audit("city_plan_wait", plan_id=pid, actor=actor, phase="hold_carry_rows", code=code)
+                self.l.put(
+                    wait_key,
+                    {"since": (rec or {}).get("since", now_s), "deadline": float(end_s),
+                     "attempts": (rec or {}).get("attempts", 0),
+                     "next_try": min(now_s + 300, float(end_s)), "code": code},
+                )
+                return "wait"
+            if has_local:
+                db.execute(
+                    "INSERT OR REPLACE INTO life_runtime VALUES(?,?)",
+                    (f"cityplan:local:{pid}", dumps({"at": now_s, "place": local_pid})),
+                )
+                db.execute("DELETE FROM life_runtime WHERE key IN (?, ?)", (wait_key, hold_key))
+                self.k.audit("city_plan_degraded_local", plan_id=pid, actor=actor, place=local_pid, code=code,
+                             waited_s=round(now_s - float(plan["start_at"])))
+                return "local"
+            db.execute("DELETE FROM life_runtime WHERE key IN (?, ?)", (wait_key, hold_key))
+            self.k.audit("city_plan_cancelled_bridge", plan_id=pid, actor=actor,
+                         reason="bridge_unavailable_no_local_route", code=code)
+            self.l.plans.set_state(pid, "cancelled", "bridge_unavailable_no_local_route")
+            return "cancel"
 
     def step(self):
         """Synchronous runner step hook for Life.extensions."""
