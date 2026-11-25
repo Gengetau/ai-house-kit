@@ -129,7 +129,7 @@ class Stage3ImageGenTests(unittest.TestCase):
         self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_port}"
 
-        d.memory.add("sora", "private", "房主的隐私备忘：「金库小盒子密码」藏在书房床底", kind="fact", source="chat", now=t0)
+        d.memory.add("sora", "private", "房主的隐私备忘：金库小盒子钥匙藏在书房床底", kind="fact", source="chat", now=t0)
 
         # 0) Default disabled -> text chat completely unaffected
         self.assertNotIn("generate_image", d._active_tools)
@@ -174,11 +174,14 @@ class Stage3ImageGenTests(unittest.TestCase):
         mock_srv.fail_mode = False
 
         # Group prompt leaking private memory MUST be blocked before reaching upstream server
+        # changed: the memory is no longer password-like (refused by the secret filter), and the prompt repeats most of it
+        # (the old key-phrase rule is gone). Positive control: the memory is recalled in private.
+        self.assertIn("金库小盒子钥匙", d.memory.recall("sora", "private", "金库小盒子钥匙藏在哪里"))
         before_cnt = len(mock_srv.seen_openai)
         _, res_leak = _http_json(
             f"{base}/api/plugins/image_gen/generate",
             token=owner_tok,
-            body={"prompt": "画一个金库小盒子密码", "scope": "group", "actor": "sora"},
+            body={"prompt": "画一个房主的隐私备忘：金库小盒子钥匙藏在书房床底", "scope": "group", "actor": "sora"},
         )
         self.assertEqual(res_leak["status"], "blocked")
         self.assertEqual(len(mock_srv.seen_openai), before_cnt)

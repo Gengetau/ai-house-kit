@@ -333,6 +333,12 @@ class ReviewBatchCChannelsMediaTests(unittest.TestCase):
         # C4: Pre-wire ConnectionError (left_wire=False) leaves reply_ready pending (NOT failed_wire) & clears _ws
         ch = OneBotChannel(OneBotConfig(url="ws://127.0.0.1:1", owners=frozenset({"8001"}), send_retries=0))
         ch._spool = sp
+        # M4 (SPEC G9): a channel with no host/send gate no longer writes at all, so this pre-wire case gets a real host.
+        host_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(host_dir.cleanup)
+        host = HouseDaemon(host_dir.name, env={}, start_ts=1000.0, virtual_clock=True, allow_onboarding=False)
+        self.addCleanup(host.close)
+        ch._host = host
         class _DeadWS:
             def send(self, _txt: str) -> None:
                 raise ConnectionError("broken pipe before send")

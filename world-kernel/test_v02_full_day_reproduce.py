@@ -1,7 +1,7 @@
 """Flagship 24-hour end-to-end turnkey v0.2 lifecycle test.
 
 Covers in one continuous synthetic day + restart:
-1. Private owner secret DM vs. group errand promise (`house_intents` + `Shopping`/evidence -> `completed`)
+1. Private owner secret DM vs. group errand promise (promise found by the memory extraction, then purchase evidence -> `completed`)
 2. Real kernel outing gate (`Outings.guard` -> `CityMcpOutingExtension.is_door_move`) for public city trip + encounter + return
 3. 22:45 JST per-roommate personal diaries (`DiaryService` + `kind="diary"`) isolated from private DMs
 4. 23:35 JST `DayNote` & `MemoryStore` extraction
@@ -36,7 +36,7 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
         leak_attempt = [False]
 
         def llm_fn(sys_prompt: str, user_prompt: str):
-            if "长期记忆整理员" in sys_prompt:
+            if "记忆整理员" in sys_prompt:
                 if "蓝花盆" in user_prompt:
                     return json.dumps({
                         "ops": [{
@@ -44,10 +44,15 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
                             "text": "2026年11月21日房主私下说备用钥匙藏在庭院蓝花盆底下",
                             "about": ["房主", "钥匙"],
                             "kind": "fact",
-                            "shared": False,
-                            "src": [1],
                         }]
                     }, ensure_ascii=False), 25
+                if "买2个鸡蛋" in user_prompt:
+                    # the owner's errand and her yes, found by the extraction (the shared promise module checks the quote)
+                    return json.dumps({"ops": [{
+                        "op": "intent", "text": "奈尔买2个鸡蛋", "kind": "promise", "for": ["房主"],
+                        "agreed": ["奈尔"], "scope": "world", "when": "vague",
+                        "quote": "奈尔，今天有空帮家里买2个鸡蛋好不好",
+                    }]}, ensure_ascii=False), 25
                 return '{"ops": []}', 10
             if "睡前小日记" in sys_prompt:
                 return "今天在樱丘洋馆安排了买菜和日常，还去晴空都灯火吃茶馆逛了逛，遇到了小葵，感觉很充实。", 35
@@ -64,13 +69,16 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
                 )[:280]
                 return json.dumps({"text": note_body}, ensure_ascii=False), 30
             if leak_attempt[0] and "花盆" in user_prompt:
-                return "备用钥匙就藏在庭院蓝花盆底下哦！", 15
+                # changed: the reply repeats most of the memory (the old key-phrase rule is gone)
+                return "房主私下说备用钥匙藏在庭院蓝花盆底下哦！", 15
             if "昨晚日记" in user_prompt:
                 return "我昨天在日记里记了去灯火吃茶馆逛街和洋馆日常的事呀。", 18
             if "备用钥匙" in user_prompt or "花盆" in user_prompt:
                 return "放心吧，你私下说的事我都记在心里不会对别人讲。", 16
             if "角色" in sys_prompt or "JSON" in sys_prompt or "action" in sys_prompt.lower():
                 return "{}", 10
+            if "买2个鸡蛋" in user_prompt:
+                return "好的，我今天去买2个鸡蛋", 15
             return "收到啦！我已经记下来并看一看厨房和日程安排。", 15
 
         tmp_dir = tempfile.TemporaryDirectory()
@@ -101,20 +109,30 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
         # 1) 09:00 JST: private secret + group errand promise
         d.send_chat("private:nell", "我的备用钥匙藏在庭院蓝花盆底下，千万别在群里说")
         d.send_chat("group", "奈尔，今天有空帮家里买2个鸡蛋好不好？晚上想吃咖喱")
+        self.assertEqual(d.intents.list_intents(actor="nell"), [])  # the chat turns alone record nothing
+        d.memory.extract(force=True, now=d.clock.now())
         egg_intents = [r for r in d.intents.list_intents(actor="nell") if r["item"] == "egg"]
         self.assertTrue(egg_intents and egg_intents[0]["state"] == "open")
+        self.assertEqual(len(egg_intents), 1)
 
         # 2) Errand purchase evidence -> completed via Authority.step()/promises.run() sweep
         import contextlib
         import sqlite3
         ev_at = d.clock.now() + 120
-        ev_body = json.dumps({"kind": "purchased", "actor": "nell", "item": "egg", "qty": 2, "at": ev_at}, ensure_ascii=False)
+        ev_body = json.dumps({
+            "key": "purchased:e2e:egg", "kind": "purchased", "actor": "nell", "item": "egg", "qty": 2, "at": ev_at,
+            "account": "nell", "action_id": "act-e2e", "resource_id": "res-e2e",
+            "intent_ref": int(egg_intents[0]["intent_id"]), "beneficiary": ["owner"],
+        }, ensure_ascii=False)
         with contextlib.closing(sqlite3.connect(d.world_db)) as c:
             with c:
+                stream = c.execute("SELECT v FROM kernel_bind WHERE k='world'").fetchone()[0]
                 c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 1, ?, ?)",
-                    ("purchased:e2e:egg", ev_at, ev_body),
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, 1, ?, ?)",
+                    ("purchased:e2e:egg", stream, ev_at, ev_body),
                 )
+        d.intents.sweep(ev_at - 60)
+        self.assertEqual([r["state"] for r in d.intents.list_intents(actor="nell") if r["item"] == "egg"], ["open"])  # not before its time
         d.intents.sweep(ev_at)
         egg_after = [r for r in d.intents.list_intents(actor="nell") if r["item"] == "egg"]
         self.assertEqual(egg_after[0]["state"], "completed")
@@ -190,9 +208,10 @@ class FullDayTurnkeyV02Tests(unittest.TestCase):
         self.assertEqual(grp_res["replies"][0]["mode"], "blocked")
         self.assertIn("已被拦下", grp_res["replies"][0]["text"])
 
-        # Group chat recalls public evening diary (world scope) across restart
-        diary_recall = d2.memory.recall("nell", "group", "昨晚日记写了什么", now=day2)
-        self.assertIn("日记", diary_recall)
+        # Group chat recalls public evening diary (changed: the question shares content words with the diary text; recall has no vector match here) (world scope) across restart
+        diary_recall = d2.memory.recall("nell", "group", "昨天去灯火吃茶馆逛了逛，遇到小葵了吗", now=day2)
+        self.assertIn("日记", diary_recall)  # the diary line carries its kind label
+        self.assertIn("灯火吃茶馆", diary_recall)
         ok_res = d2.send_chat("group", "奈尔，昨晚日记写了什么呀？")
         self.assertEqual(ok_res["replies"][0]["mode"], "live_api")
 

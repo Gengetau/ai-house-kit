@@ -8,7 +8,7 @@
 
 - **三行命令开箱即住（零前端构建、跨 Windows / Linux）**：核心运行时仅靠 Python 3.11+ 标准库与 SQLite；不填 API Key 也能以零成本内置演示模式体验完整一天的生活，填入任意 OpenAI 兼容端点（OpenAI / Gemini / DeepSeek / Claude / 本地 Ollama）即切换真实智能体，并支持主备模型自动故障转移（`AI_HOUSE_FALLBACK_*`）。
 - **挂机一整天只需百次级调用（省掉 98% 无效轮询）**：睡觉、洗漱、日常消遣由零成本 L0 规则驱动，只在需要拿主意的节点（做饭、邀约、购物、搭话、外出）预留 `Budget` 调一次模型；对话与日记生成均在内核写锁外执行，慢模型不会冻结状态面板。
-- **从聊天约定到真实采购履行的闭环**：在群聊或私聊里和室友约好「帮忙买 2 个鸡蛋」，会进入 `house_intents` 并驱动 `Shopping` 外出下单采购，结合内核 `intent_evidence` / `script` 自动对账标记为 `completed`。
+- **从聊天约定到真实采购履行的闭环**：在群聊或私聊里和室友约好「帮忙买 2 个鸡蛋」，记忆整理时由模型提出、程序核对原话后记为约定（`intents` 表，共享代码 `common/intents.py`），并驱动 `Shopping` 外出下单采购，结合内核 `intent_evidence` 自动对账标记为 `completed`。
 - **受众隔离长期记忆 & 每晚室友个人日记**：Built-in SQLite `MemoryStore` 严格隔离 `private` / `group` / `world` 三重边界（群聊默认不召回、不泄露房主私聊秘密；维护者可用 `AI_HOUSE_MEMORY_PRIVATE_IN_GROUPS` 与 `AI_HOUSE_MEMORY_LEAK_FREE_GROUPS` 开启，见 `docs/CHAT-AND-QQ.md`；支持在工作台一键「忘掉」）；每晚 22:30 JST 自动生成第一人称个人日记（仅基于当日客观 `daylog`/`script`），23:30 JST 生成「今天的小屋」。
 - **四轴插件、工具循环 & 自定义世界包 (`WorldPack`)**：内置表情贴纸（`sticker_pack`）、桌游掷骰（`dice_tabletop`）、共享书架便签（`book_nook`）三款示例插件；通过 `ai-house pack-check indie-studio-3` 一键切换 3 人独立游戏工作室模板（已随包内置）。
 - **双模联动「晴空都」([bot-game-mcp](https://github.com/Gengetau/bot-game-mcp))**：
@@ -82,12 +82,12 @@ docker compose --profile city up -d --build
 ## 架构与插件生态
 
 - **`src/ai_house/`**：开箱即用宿主守护进程（`daemon.py`）、首位住客与大模型初始化引擎（`onboarding.py`）、受众隔离对话与轻量约定提取（`chat_agent.py`）、四轴插件 SDK（`plugin_api.py`）、暖灯像素可视化控制台（`web/` 含两层剖面/等轴房间引擎与 `#/setup` 向导）以及内置标准 MCP 端点（`POST /mcp`）。
-- **内置核心扩展**：长期记忆库（`memory.py`）、个人睡前日记（`diary.py`）、CLI 体检工具（`cli.py init/doctor`）及工具插件（`sticker_pack` / `dice_tabletop` / `book_nook`）。
+- **内置核心扩展**：长期记忆库（`common/memory.py` + `memory_common.py`）、个人睡前日记（`diary.py`）、CLI 体检工具（`cli.py init/doctor`）及工具插件（`sticker_pack` / `dice_tabletop` / `book_nook`）。
 - **聊天入口**：网页和 QQ（`builtin_plugins/onebot_ws.py`，可选依赖 `pip install -e ".[onebot]"`）共用 `HouseDaemon.converse`；发言人身份在 `chat_identity.py`，发送前过滤在 `chat_guard.py`；详见 [docs/CHAT-AND-QQ.md](docs/CHAT-AND-QQ.md)。
-- **`world-kernel/`**：单写者事务、命令管线、R1/R2 视图、受众隔离材料、L0 日常、预算账本、轻量约定与履行（`intents_lite.py`）、衣柜与晴空都桥接客户端。
+- **`world-kernel/`**：单写者事务、命令管线、R1/R2 视图、受众隔离材料、L0 日常、预算账本、约定的内核一侧（`promises.py`、`promise_rules.py`）、衣柜与晴空都桥接客户端。
 - **`world-catalog/`**：统一词表、`load_pack()`、守卫校验 `guard()` 与默认樱丘六人示例世界 `life1/`。
 - **`world-contract-tests/`**：黄金契约测试与离线判定器 `oracle.py`。
-- **`src/ai_house/common/`、`memory-conformance-tests/`**：与维护者私有部署逐行共用的记忆代码及其原有测试（尚未接入运行路径，见 [docs/PORTING-PLAN.md](docs/PORTING-PLAN.md) 第 15 节）。
+- **`src/ai_house/common/`、`memory-conformance-tests/`**：与维护者私有部署逐行共用的记忆代码及其原有测试；小屋的记忆就跑在这份代码上（见 [docs/PORTING-PLAN.md](docs/PORTING-PLAN.md) 第 15 节）。
 - 插件开发与自定义世界包详见 **[docs/CUSTOM-WORLD-TUTORIAL.md](docs/CUSTOM-WORLD-TUTORIAL.md)** 与 **[docs/PLUGINS-AND-CITY.md](docs/PLUGINS-AND-CITY.md)**。
 
 ## 跑全套测试

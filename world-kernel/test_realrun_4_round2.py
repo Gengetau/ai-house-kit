@@ -2,10 +2,11 @@
 
 Every sentence, event and line below is taken from that run's evidence (life1.db / world.db / terra.jsonl).
 
-1. 「米娜，明天上午陪我去逛街买衣服，可以吗？」 was agreed to, but no 约定 was recorded: 「逛街」「陪我」 were not words
-   of a plan, and the sentence is neither a purchase (「买衣服」) nor a question about the past;
-2. 「婉妲，下午要不要一起喝下午茶呀？」 (Saturday 14:00) had no due window at all, so it got the default 24 hours and was
-   closed by the tea party of Sunday 11:40, 21 hours later; a time word in the sentence now sets the window;
+1. 「米娜，明天上午陪我去逛街买衣服，可以吗？」 was agreed to; 「陪我去…买衣服」 is company for the owner's own shopping, never
+   an errand for the resident (what is still checked: `buy_words`; an agreed outing closes on arrival at its place and
+   otherwise ends quietly). Recording such a sentence by rule is gone with the kit's own promise code;
+2. 「婉妲，下午要不要一起喝下午茶呀？」 (Saturday 14:00) was closed by the tea party of Sunday 11:40, 21 hours later; a time
+   given for the promise (now the extraction model's `due`) bounds what can close it;
 3. the fact list wrote 「米娜和阿尔玛、艾莎、奈尔、婉妲、由纪一起吃了牛丼」 for a table where only 奈尔 and 米娜 ate the
    牛丼 (the others ate 豚汁), and a walk line 「奈尔从超市去超市」 whose start and end are the same place.
 No test calls a model.
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import List
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +29,8 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
         sys.path.insert(0, p)
 
 import test_daylog  # noqa: E402
-from test_realrun_1_promises import H, JST, T0, _StoreCase  # noqa: E402
-from worldkernel import daylog, legacy  # noqa: E402
-from worldkernel.intents_lite import owner_proposes_plan, parse_due_window  # noqa: E402
+from test_realrun_1_promises import H, JST, T0, _StoreCase, plan_ops  # noqa: E402
+from worldkernel import buy_words, daylog, legacy, vocab_life1  # noqa: E402
 
 M = test_daylog.M  # 2026-11-07 00:00 JST
 NAMES = {"nell": "奈尔", "elsa": "艾莎", "alma": "阿尔玛", "mina": "米娜", "yuki": "由纪", "wanda": "婉妲", "kai": "凯"}
@@ -42,116 +43,95 @@ def _at(day: int, hh: int, mm: int = 0) -> float:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# 1. an invitation to go out together is a promise
+# 1. an invitation to go out together
 # ---------------------------------------------------------------------------------------------------------------
-class GoingOutTogetherIsRecorded(_StoreCase):
+class CompanionShoppingIsNotAnErrand(unittest.TestCase):
     SAID = "米娜，明天上午陪我去逛街买衣服，可以吗？"
-    REPLY = "明天上午啊，有点考验我这个夜猫子！不过陪你逛街没问题，几点出发呀？"
-
-    def test_the_real_sentence_is_recorded_as_an_outing_for_tomorrow_morning(self) -> None:
-        self.say("mina", self.SAID, self.REPLY, now=SAT_1730)
-        rows = self.rows("mina")
-        self.assertEqual([(r["kind"], r["state"], r["item"], r["raw_item"]) for r in rows],
-                         [("outing", "open", None, "")], rows)
-        self.assertEqual(dt.datetime.fromtimestamp(rows[0]["due_from"], JST).strftime("%d %H:%M"), "22 07:00")
-        self.assertGreaterEqual(rows[0]["expires_at"], _at(22, 12))
-        self.assertLess(rows[0]["expires_at"], _at(22, 15))
-
-    def test_invitations_in_other_words(self) -> None:
-        for said in ("陪我去书店转转吧", "周末陪我去趟医院好吗", "我们去逛逛街吧", "明天一起逛逛商店街怎么样？",
-                     "下午陪我出去走走吧"):
-            with self.subTest(said=said):
-                self.setUp()
-                self.say("mina", said, "好呀，没问题")
-                self.assertEqual(len(self.rows("mina")), 1, said)
-                self.assertEqual(self.rows("mina")[0]["kind"], "outing", said)
-
-    def test_looking_back_or_small_talk_is_not_a_plan(self) -> None:
-        for said in ("昨天说好的逛街，后来去了吗？", "上次陪我逛街的时候你买了什么？", "你平时喜欢逛街吗？",
-                     "你昨天陪我去逛街，累不累？", "你陪我聊天的时候真开心"):
-            with self.subTest(said=said):
-                self.assertFalse(owner_proposes_plan(said), said)
-                self.setUp()
-                self.say("mina", said, "去了呀，挺开心的")
-                self.assertEqual(self.rows("mina"), [], said)
 
     def test_buying_clothes_is_not_a_supermarket_errand(self) -> None:
-        self.say("mina", self.SAID, self.REPLY, now=SAT_1730)
-        self.say("mina", "陪我去商店街买衣服好不好？", "好呀", now=SAT_1730 + 600)
-        for r in self.rows("mina"):
-            self.assertNotEqual(r["kind"], "errand", r)
-            self.assertFalse(r["item"] or r["raw_item"], r)
+        """Fails if the owner asking for company while she buys clothes ("陪我去商店街买衣服") is read as an errand for
+        the resident (an item, a request noun, or the "买不了" tail); the control is a real request for eggs."""
+        for said in (self.SAID, "陪我去商店街买衣服好不好？"):
+            with self.subTest(said=said):
+                self.assertIsNone(buy_words.detect_errand_item(vocab_life1, said)[0])
+                self.assertEqual(buy_words.extract_buy_request_noun(said, "好呀，没问题"), "")
+                self.assertEqual(buy_words.unbuyable_noun(vocab_life1, said), "")
+        self.assertEqual(buy_words.detect_errand_item(vocab_life1, "米娜，帮我买两个鸡蛋回来")[0], "egg")
+        self.assertEqual(buy_words.unbuyable_noun(vocab_life1, "米娜，帮我买个榴莲回来"), "榴莲")
+
+
+class AnAgreedOutingClosesOnArrivalAndExpiresOtherwise(_StoreCase):
+    SAID = "我明天上午去商店街"
+
+    def agree(self) -> None:
+        ops = plan_ops("米娜明天上午去商店街", self.SAID, due="2026-11-22 09:00", when="exact")
+        self.assertEqual(self.chat("mina", [("mina", self.SAID)], ops, now=SAT_1730)["intents"], 1)
+        row = self.rows("mina")[0]
+        self.assertEqual((row["state"], dt.datetime.fromtimestamp(row["due_from"], JST).strftime("%d %H:%M"),
+                          dt.datetime.fromtimestamp(row["due_to"], JST).strftime("%d %H:%M")), ("open", "22 08:00", "22 11:00"))
 
     def test_an_agreed_outing_closes_on_arrival_and_expires_otherwise(self) -> None:
-        self.say("mina", self.SAID, self.REPLY, now=SAT_1730)
-        self.evidence({"kind": "arrived", "actor": "mina", "place": "place:shotengai", "at": _at(22, 10)})
-        self.store.sweep(_at(22, 11))
-        self.assertEqual(self.rows("mina")[0]["state"], "completed")
+        """Fails if arriving at the shopping street inside the window does not close it (and name the evidence), or if
+        the same promise with no evidence is still open the evening after its window (quiet expiry, no notice)."""
+        self.agree()
+        key = self.evidence({"kind": "arrived", "actor": "mina", "place": "place:shotengai", "at": _at(22, 10)})
+        self.sweep(_at(22, 11))
+        row = self.rows("mina")[0]
+        self.assertEqual((row["state"], row["evidence_key"]), ("completed", key))
         self.setUp()
-        self.say("mina", self.SAID, self.REPLY, now=SAT_1730)
-        self.store.sweep(_at(23, 8))
+        self.agree()
+        self.sweep(_at(22, 20))
+        self.assertEqual(self.rows("mina")[0]["state"], "open")  # still inside the grace after the window
+        self.sweep(_at(23, 8))
         self.assertEqual(self.rows("mina")[0]["state"], "expired")
 
-    def test_a_reply_that_declines_still_records_nothing(self) -> None:
-        self.say("mina", self.SAID, "明天上午不行，我要睡觉，改天吧", now=SAT_1730)
-        self.assertEqual(self.rows("mina"), [])
+    def test_an_arrival_the_day_before_does_not_close_it(self) -> None:
+        """Fails if an arrival at the same street before the promise was made (Saturday evening) closes it; the
+        arrival inside the window (the control) does."""
+        self.agree()
+        self.evidence({"kind": "arrived", "actor": "mina", "place": "place:shotengai", "at": SAT_1730 - 3 * H})
+        self.sweep(_at(22, 11))
+        self.assertEqual(self.rows("mina")[0]["state"], "open")
+        self.evidence({"kind": "arrived", "actor": "mina", "place": "place:shotengai", "at": _at(22, 10)})
+        self.sweep(_at(22, 11))
+        self.assertEqual(self.rows("mina")[0]["state"], "completed")
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# 2. a time word in the sentence sets the window of the promise
+# 2. a time given for the promise bounds what can close it
 # ---------------------------------------------------------------------------------------------------------------
-class TimeWordsSetTheWindow(_StoreCase):
-    TEA = "婉妲，下午要不要一起喝下午茶呀？"
-    TEA_PARTY = {"kind": "plan_finished", "actor": "wanda", "plan_id": "plan-2ee60ec729a9", "place": "living",
-                 "outcome": "done", "members": ["wanda", "yuki"]}
+class ATimeGivenBoundsThePromise(_StoreCase):
+    FILM = "我们下午一起看电影吧"
+    FILM_NIGHT = {"kind": "activity", "activity": "movie_night", "place": "living", "outcome": "succeeded"}
 
-    def test_this_afternoon_tea_is_not_closed_by_tomorrows_tea_party(self) -> None:
-        # the real run: said Saturday 14:00, closed by the 11:40 tea party of Sunday (event 1133)
-        self.say("wanda", self.TEA, "当然好呀", now=T0)
+    def agree(self) -> None:
+        ops = [{"op": "intent", "text": "婉妲和由纪一起看电影", "kind": "joint", "with": ["由纪"],
+                "agreed": ["由纪", "婉妲"], "quote": self.FILM, "due": "2026-11-21 16:00", "when": "exact", "scope": "world"}]
+        self.assertEqual(self.chat("wanda", [("wanda", self.FILM), ("yuki", "好呀")], ops, now=T0)["intents"], 1)
         row = self.rows("wanda")[0]
-        self.assertEqual(row["kind"], "together")
-        self.assertLessEqual(row["expires_at"], _at(21, 19))
-        self.assertGreater(row["expires_at"], _at(21, 18))
-        self.evidence({**self.TEA_PARTY, "activity": "tea_party", "at": _at(22, 11, 40)})
-        self.store.sweep(_at(22, 12))
-        self.assertEqual(self.rows("wanda")[0]["state"], "expired")
+        self.assertEqual((row["status"], dt.datetime.fromtimestamp(row["due_to"], JST).strftime("%d %H:%M")),
+                         ("accepted", "21 18:00"))
 
-    def test_the_same_afternoon_tea_party_still_closes_it(self) -> None:
-        self.say("wanda", self.TEA, "当然好呀", now=T0)
-        self.evidence({**self.TEA_PARTY, "activity": "tea_party", "at": _at(21, 16, 30)})
-        self.store.sweep(_at(21, 17))
+    def film_night(self, start: float) -> List[str]:
+        return [self.evidence({**self.FILM_NIGHT, "actor": who, "plan_id": f"film-{int(start)}", "started_at": start,
+                               "ended_at": start + 1800, "at": start + 1800}) for who in ("wanda", "yuki")]
+
+    def test_this_afternoon_film_is_not_closed_by_tomorrows_film_night(self) -> None:
+        """Fails if a film night of both the next day (11:40, long after the window of 15:00-18:00) closes the promise,
+        or if it is still open after its window and grace; the same-afternoon film night (the control, a second house)
+        closes it."""
+        self.agree()
+        self.film_night(_at(22, 11, 40))
+        self.sweep(_at(22, 12))
         row = self.rows("wanda")[0]
-        self.assertEqual((row["state"], row["evidence_key"]), ("completed", "k1"))
-
-    def test_without_a_time_word_the_window_is_the_old_24_hours(self) -> None:
-        self.say("wanda", "婉妲，要不要一起喝茶呀？", "好呀", now=T0)
+        self.assertEqual((row["state"], row["status"]), ("expired", "missed"))
+        self.setUp()
+        self.agree()
+        keys = self.film_night(_at(21, 16, 30))
+        self.sweep(_at(21, 17))
         row = self.rows("wanda")[0]
-        self.assertEqual((row["due_from"], row["due_to"]), (None, None))
-        self.assertEqual(row["expires_at"], T0 + 24 * H)
-
-    def test_parse_due_window_periods(self) -> None:
-        def win(text: str, now: float) -> tuple:
-            a, b = parse_due_window(text, now)
-            f = lambda x: None if x is None else dt.datetime.fromtimestamp(x, JST).strftime("%d %H:%M")  # noqa: E731
-            return f(a), f(b)
-
-        self.assertEqual(win("下午要不要一起喝下午茶呀", T0), ("21 14:00", "21 18:30"))
-        self.assertEqual(win("今天下午一起去逛逛", _at(21, 10)), ("21 12:00", "21 18:30"))
-        self.assertEqual(win("今天上午去图书馆", _at(21, 8)), ("21 08:00", "21 12:30"))
-        self.assertEqual(win("中午一起吃饭", _at(21, 9)), ("21 11:00", "21 14:00"))
-        self.assertEqual(win("晚上一起看电影", _at(21, 14)), ("21 18:00", "21 23:59"))
-        self.assertEqual(win("明天上午陪我去逛街", SAT_1730), ("22 07:00", "22 12:30"))
-        self.assertEqual(win("明天下午去公园", SAT_1730), ("22 12:00", "22 18:30"))
-        self.assertEqual(win("明天中午吃拉面", SAT_1730), ("22 11:00", "22 14:00"))
-        self.assertEqual(win("今天一起大扫除", _at(21, 9)), ("21 09:00", "21 23:59"))
-        # said after the period is over: it means tomorrow's
-        self.assertEqual(win("下午一起喝茶", _at(21, 20)), ("22 12:00", "22 18:30"))
-        # 「下午茶」 is a thing to drink, not a time
-        self.assertEqual(win("要不要一起喝下午茶", T0), (None, None))
-        # the words that were there before keep their windows
-        self.assertEqual(win("明早去跑步", SAT_1730), ("22 07:00", "22 11:30"))
-        self.assertEqual(win("明天去跑步", SAT_1730), ("22 08:00", "22 23:59"))
-        self.assertEqual(win("今晚做咖喱", T0), ("21 18:00", "21 23:59"))
+        self.assertEqual(row["state"], "completed")
+        self.assertIn(row["evidence_key"], keys)
 
 
 # ---------------------------------------------------------------------------------------------------------------

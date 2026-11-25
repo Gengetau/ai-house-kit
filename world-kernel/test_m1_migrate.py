@@ -1,4 +1,4 @@
-"""M1 step 3: `ai_house.memory_migrate` carries a house's memories from `memory.db` (old `MemoryStore`) into
+"""M1 step 3: `ai_house.memory_migrate` carries a house's memories from `memory.db` (the earlier store) into
 `memory-common.db` (`CommonMemoryStore`).
 
 The old house is built with the real old store through its public calls; what comes out is checked through the new
@@ -22,7 +22,7 @@ from unittest import mock
 from test_m1_adapter_support import NAMES, NOTHING_FOUND, T0, FakeModel, add_op, quiet_resource_warnings
 
 from ai_house import memory_migrate
-from ai_house.memory import MemoryStore
+from legacy_memory_store import MemoryStore  # the earlier store, kept only to write old-format files
 from ai_house.memory_common import CommonMemoryStore
 from ai_house.memory_migrate import describe, id_map, migrate
 
@@ -236,8 +236,8 @@ class CarryTests(MigrateCase):
         mine = sorted(table(self.new_path, f"select {cols} from mem where status='active'"))
         want = sorted(table(Path(ref.db_path), f"select {cols} from mem where status='active'"))
         self.assertEqual(mine, want)
-        self.assertEqual(sorted(table(self.new_path, "select * from kit_origin where scope='world' order by mem_id")
-                                and [("world",)]), [("world",)])
+        # the one world memory that is not a diary sits in the place kept for world memories
+        self.assertEqual(table(self.new_path, "select text from mem where chat='group:0'"), [("小屋的钟在整点会敲三下。",)])
 
     def test_times_counts_expiry_and_kind_are_kept(self):
         self.run_migrate()
@@ -343,14 +343,17 @@ class ReportTests(MigrateCase):
             self.assertIn("没有找到旧记忆库", describe(rep)[0])
 
     def test_the_command_line_prints_sentences_and_a_dry_run_changes_nothing(self):
+        # The command line takes "now" from the wall clock; the fixture has a memory that comes due about 28 hours
+        # after T0, so on the real clock this case started to fail the day after T0. The clock is the fixture's here.
+        at_now = mock.patch.object(memory_migrate._time, "time", lambda: NOW)
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), at_now:
             self.assertEqual(memory_migrate.main([self.dir, "--dry-run", "--names", "nia=妮娅,xingli=星璃"]), 0)
         self.assertIn("试运行", out.getvalue())
         self.assertIn("旧记忆库里共 18 条记忆", out.getvalue())
         self.assertFalse(self.new_path.exists())
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), at_now:
             self.assertEqual(memory_migrate.main([self.dir]), 0)
         self.assertIn("这次搬进新库 14 条", out.getvalue())
         self.assertTrue(self.new_path.exists())
@@ -365,7 +368,7 @@ def files(folder) -> List[str]:
 class AgainTests(MigrateCase):
     def dump(self) -> Dict[str, List[tuple]]:
         return {t: table(self.new_path, f"select * from {t} order by 1, 2") for t in
-                ("mem", "seen", "log", "kit_numbers", "kit_channels", "kit_origin")} | {
+                ("mem", "seen", "log", "kit_numbers", "kit_channels")} | {
             "map": table(self.new_path, "select what, old_id, new_id, state, outcome, reason, old_trust, "
                                         "trust_applied from kit_migrated order by 1, 2")}
 
@@ -428,8 +431,7 @@ class ResumeTests(MigrateCase):
     def snapshot(p: Path) -> Dict[str, List[tuple]]:
         return {"mem": table(p, "select * from mem order by id"), "seen": table(p, "select * from seen order by id"),
                 "map": table(p, "select what, old_id, new_id, state, outcome, reason, old_trust, trust_applied "
-                                "from kit_migrated order by 1, 2"),
-                "origin": table(p, "select * from kit_origin order by 1")}
+                                "from kit_migrated order by 1, 2")}
 
     def interrupted(self, method: str, after: int, *, real_call_first: bool) -> None:
         real = getattr(CommonMemoryStore, method)
@@ -641,3 +643,45 @@ class DamagedOldRowTests(unittest.TestCase):
         self.addCleanup(st.close)
         rows = st.list_entries("nia", "private", now=NOW)
         self.assertEqual([r["expires_at"] for r in rows], [None, None])  # as in the old store: it never came due
+
+
+class VeryOldFileTests(unittest.TestCase):
+    """A file last opened before the old store's third schema step: group memories nobody checked against the owner's
+    words are still marked verified there. The old store demoted them on its next start; the carry-over does the same."""
+    CLAIM = "阿甲在群里说房主其实不吃香菜。"
+    CHECKED = "房主在群里说自己周三晚上要加班。"
+    PRIVATE = "房主私下说过他对花生过敏。"
+
+    def build(self, forget_the_third_step):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = MemoryStore(tmp.name, names=NAMES, env={}, clock=Clock(T0))
+        old.add("nia", "group", self.CLAIM, channel="group", now=T0)
+        old.add("nia", "group", self.CHECKED, channel="group", source="owner_verified", now=T0)
+        old.add("nia", "private", self.PRIVATE, now=T0)
+        old.close()
+        with contextlib.closing(sqlite3.connect(Path(tmp.name) / "memory.db")) as c, c:
+            self.assertEqual({r[0] for r in c.execute("select trust from mem")}, {"verified"})  # as such a file has them
+            if forget_the_third_step:
+                c.execute("delete from schema_migrations where version>=3")
+        on = {"AI_HOUSE_MEMORY_TRUST": "1"}
+        rep = migrate(tmp.name, env=on, names=NAMES, now=NOW)
+        st = CommonMemoryStore(tmp.name, names=NAMES, env=on, clock=Clock(NOW))
+        self.addCleanup(st.close)
+        rows = st.list_entries("nia", "group", channel="group", now=NOW) + st.list_entries("nia", "private", now=NOW)
+        return rep, {r["text"]: (r["kind"], r["trust"]) for r in rows}
+
+    def test_unchecked_group_memories_come_over_as_unverified_claims(self):
+        rep, got = self.build(forget_the_third_step=True)
+        self.assertEqual(got[self.CLAIM], ("claim", "group_stated"))
+        self.assertEqual(got[self.CHECKED], ("fact", "verified"))   # checked against the owner's words: kept
+        self.assertEqual(got[self.PRIVATE], ("fact", "verified"))   # not a group memory: kept
+        self.assertEqual(rep["demoted"], 1)
+        self.assertIn("未核实", "\n".join(describe(rep)))
+
+    def test_a_file_that_already_took_that_step_is_carried_as_it_stands(self):
+        rep, got = self.build(forget_the_third_step=False)
+        self.assertEqual(got[self.CLAIM], ("fact", "verified"))  # the owner of that file had it so after the step
+        self.assertEqual(rep["demoted"], 0)
+        self.assertNotIn("停在很早的版本", "\n".join(describe(rep)))
+

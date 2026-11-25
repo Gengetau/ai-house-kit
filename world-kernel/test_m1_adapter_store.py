@@ -3,6 +3,7 @@
 No network, no real model: the memory model is a fake function. Names and numbers are made up.
 """
 
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -245,11 +246,11 @@ class LinesAndSpeakerTests(StoreCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("你们好呀", lines[0])
 
-    def test_the_world_scope_is_kept_as_lines_of_the_web_group(self):
+    def test_the_world_scope_is_kept_as_lines_of_its_own_place(self):
         st = self.make()
         self.assertEqual(st.observe("nia", "world", "屋里今天停电了", now=T0), 1)
         row = self.rows(st, "select chat, line from seen")[0]
-        self.assertEqual((row["chat"], row["line"]), ("group:1", "屋里今天停电了"))
+        self.assertEqual((row["chat"], row["line"]), ("group:0", "屋里今天停电了"))
 
     def test_observe_checks_its_arguments_like_the_old_store(self):
         st = self.make()
@@ -449,6 +450,84 @@ class AddListInvalidateTests(StoreCase):
         self.assertEqual(got, [ASK_PLAN])  # no space put before it on the way
 
 
+class WorldPlaceTests(StoreCase):
+    """`world` memories (the house's own doings, said in no chat) are kept apart from every chat's memories."""
+
+    RULE = "小屋的规矩是每周六晚上一起大扫除。"
+    MINT = "妮娅今天把阳台的薄荷移到了窗边。"
+    ASK_MINT = "阳台的薄荷移到了窗边吗"
+
+    def test_the_same_words_as_world_and_in_the_web_group_stay_two_memories(self):
+        for first, second in (("world", "group"), ("group", "world")):
+            with self.subTest(first=first):
+                st = self.make()
+                a, how_a = st.add("nia", first, self.RULE, now=T0)
+                b, how_b = st.add("nia", second, self.RULE, now=T0 + 1)
+                self.assertEqual((how_a, how_b), ("added", "added"))
+                self.assertEqual([r["id"] for r in st.list_entries("nia", first)], [a])
+                self.assertEqual([r["id"] for r in st.list_entries("nia", second)], [b])
+                st.invalidate("nia", second, b)  # taking one out leaves the other
+                self.assertEqual([r["id"] for r in st.list_entries("nia", first)], [a])
+                self.assertEqual(st.list_entries("nia", second), [])
+
+    def test_a_world_memory_comes_to_mind_in_every_group_and_in_private_and_stays_hers(self):
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                st = self.make(unified_groups=unified)
+                st.add("nia", "world", self.MINT, now=T0)
+                st.add("nia", "world", self.RULE, shared=True, now=T0)
+                for scope, channel in (("group", ""), ("group", GROUP), ("private", ""), ("world", "")):
+                    self.assertIn("薄荷", st.recall("nia", scope, self.ASK_MINT, channel=channel, now=T0 + 60), scope)
+                    self.assertNotIn("薄荷", st.recall("xingli", scope, self.ASK_MINT, channel=channel, now=T0 + 60))
+                    self.assertIn("大扫除", st.recall("xingli", scope, "每周六晚上一起大扫除吗", channel=channel,
+                                                   now=T0 + 60), scope)
+
+    def test_a_group_cannot_reword_or_remove_a_world_memory(self):
+        st = self.make()
+        mid, _ = st.add("nia", "world", self.MINT, now=T0)
+        for channel in ("", GROUP):
+            with self.assertRaises(ValueError):
+                st.invalidate("nia", "group", mid, channel=channel)
+            with self.assertRaises(ValueError):
+                st.update("nia", "group", mid, "妮娅把薄荷送人了。", channel=channel)
+        self.assertEqual([r["text"] for r in st.list_entries("nia", "world")], [self.MINT])
+
+    def test_lines_are_tidied_in_the_place_they_were_noted(self):
+        model = FakeModel([add_op("屋里今天停电了一个小时。", about=[])])
+        st = self.make(llm_fn=model)
+        st.observe("nia", "world", "屋里今天停电了一个小时", now=T0)
+        st.observe("nia", "group", "大家晚上好，今天有人去爬山吗", speaker="阿甲", now=T0)
+        self.assertEqual(st.extract("nia", scope="world", force=True, now=T0 + 5)["buckets"], 1)
+        self.assertIn("停电", model.calls[0][1])
+        self.assertNotIn("爬山", model.calls[0][1])
+        self.assertEqual([r["scope"] for r in st.list_entries("nia", "world")], ["world"])
+        self.assertEqual(st.list_entries("nia", "group"), [])
+        self.assertEqual(self.rows(st, "select count(*) n from seen where done=0 and chat='group:1'")[0]["n"], 1)
+        self.assertEqual(st.extract("nia", scope="group", force=True, now=T0 + 9)["buckets"], 1)
+        self.assertIn("爬山", model.calls[-1][1])
+        self.assertNotIn("停电了一个小时", model.calls[-1][1].split("聊天记录")[-1])
+
+    def test_a_database_from_when_world_rows_sat_in_the_web_group_is_put_right_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        st = self.make(tmp.name)
+        w, _ = st.add("nia", "world", self.MINT, now=T0)
+        g, _ = st.add("nia", "group", "阿甲在网页群里说他周末要去爬山。", about=["阿甲"], now=T0)
+        st.close()
+        conn = sqlite3.connect(str(st.db_path))  # the way such a database looked: a marker table, one shared chat
+        with conn:
+            conn.execute("create table kit_origin(mem_id integer primary key, scope text not null)")
+            conn.execute("insert into kit_origin values (?, 'world')", (w,))
+            conn.execute("update mem set chat='group:1' where id=?", (w,))
+        conn.close()
+        for _ in range(2):
+            st = self.make(tmp.name)
+            self.assertEqual([r["id"] for r in st.list_entries("nia", "world")], [w])
+            self.assertEqual([r["id"] for r in st.list_entries("nia", "group")], [g])
+            self.assertEqual(self.rows(st, "select name from sqlite_master where name='kit_origin'"), [])
+            st.close()
+
+
 class OldInterfaceTests(StoreCase):
     """Methods the old store had that callers and tools may still use."""
 
@@ -516,7 +595,7 @@ class DecidedExtrasTests(StoreCase):
     """The four things the old store had that went into the shared file (decided 2026-11-24), through the adapter."""
 
     def test_a_question_about_what_she_remembers_that_finds_nothing_gets_the_note(self):
-        from ai_house.memory import NO_MEMORY_NOTE  # the old store's wording, carried over word for word
+        from legacy_memory_store import NO_MEMORY_NOTE  # the earlier store's wording, carried over word for word
         self.assertEqual(NOTHING_FOUND, NO_MEMORY_NOTE)
         st = self.make()
         self.assertEqual(st.recall("nia", "private", ASK_PLAN, now=T0), NOTHING_FOUND)

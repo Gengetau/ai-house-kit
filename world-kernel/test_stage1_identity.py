@@ -43,6 +43,14 @@ def _http_json(url: str, *, token: str = "", body: dict | None = None) -> tuple[
         return exc.code, json.loads(raw or "{}")
 
 
+OWNER_HEAD = "|1] (message_id="  # rendered line header of the owner (number 1)
+
+
+def _seen_lines(rt: Path) -> list:
+    with contextlib.closing(sqlite3.connect(rt / "memory-common.db")) as c:
+        return [r[0] for r in c.execute("SELECT line FROM seen ORDER BY id").fetchall()]
+
+
 class Stage1IdentityTests(unittest.TestCase):
     def test_identity_store_resolves_cross_channel_owner_and_auto_visitors(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -85,27 +93,11 @@ class Stage1IdentityTests(unittest.TestCase):
         self.assertTrue(bot_spk.is_bot)
         self.assertEqual(bot_spk.identity_id, "bot:helper")
 
-    def test_memory_seen_speaker_id_migration_daemon_api_and_onebot_bot_filter(self) -> None:
+    def test_memory_seen_speaker_identity_daemon_api_and_onebot_bot_filter(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rt = Path(tmp.name) / "rt"
         rt.mkdir(parents=True, exist_ok=True)
-
-        # Create a legacy memory.db WITHOUT speaker_id column to verify idempotent ALTER migration
-        legacy_db = rt / "memory.db"
-        with contextlib.closing(sqlite3.connect(legacy_db)) as c:
-            with c:
-                c.executescript(
-                    "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);"
-                    "CREATE TABLE mem(id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, scope TEXT NOT NULL,"
-                    " channel TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'fact', about TEXT NOT NULL DEFAULT '',"
-                    " text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created REAL NOT NULL, updated REAL NOT NULL);"
-                    "CREATE TABLE mem_ver(id INTEGER PRIMARY KEY AUTOINCREMENT, mem_id INTEGER NOT NULL,"
-                    " text TEXT NOT NULL, noted REAL NOT NULL, replaced REAL NOT NULL);"
-                    "CREATE TABLE seen(id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, scope TEXT NOT NULL,"
-                    " channel TEXT NOT NULL, speaker TEXT NOT NULL DEFAULT '', speaker_role TEXT NOT NULL DEFAULT 'member',"
-                    " line TEXT NOT NULL, ts REAL NOT NULL, done INTEGER NOT NULL DEFAULT 0);"
-                )
 
         owner_tok = "tok-owner-identity-alpha"
         d = HouseDaemon(
@@ -156,13 +148,11 @@ class Stage1IdentityTests(unittest.TestCase):
         )
         self.assertEqual(st_bb, 200)
 
-        # Web owner chat records unified speaker_id='user:owner' in seen
+        # Web owner chat is recorded in `seen` as a line headed with the owner's number (1)
+        # (changed: the new store has no speaker_id column; the speaker is part of the rendered line)
         d.converse("private:sora", "今天我做了咖喱饭", owner_speaker())
-        with contextlib.closing(sqlite3.connect(rt / "memory.db")) as c:
-            cols = {r[1] for r in c.execute("PRAGMA table_info(seen)").fetchall()}
-            self.assertIn("speaker_id", cols)
-            seen_rows = c.execute("SELECT speaker_role, speaker_id, line FROM seen ORDER BY id").fetchall()
-        self.assertTrue(any(r[0] == OWNER and r[1] == "user:owner" for r in seen_rows))
+        seen_rows = _seen_lines(rt)
+        self.assertTrue(any(OWNER_HEAD in ln and "今天我做了咖喱饭" in ln for ln in seen_rows), seen_rows)
 
         # Direct converse with bot speaker is ignored and does not enter seen or intents
         res_bot = d.converse("group", "请帮我买鸡蛋", bot_speaker("报时器", "8019", "bot:noise"))
@@ -184,14 +174,14 @@ class Stage1IdentityTests(unittest.TestCase):
             "sender": {"nickname": "手机端老板"},
         })
         self.assertNotIn("ignored", outcome_dm)
-        with contextlib.closing(sqlite3.connect(rt / "memory.db")) as c:
-            latest = c.execute("SELECT speaker_id, speaker_role FROM seen WHERE speaker_role='owner' ORDER BY id DESC LIMIT 1").fetchone()
-        self.assertEqual(tuple(latest), ("user:owner", "owner"))
+        # the bound QQ account is recorded as the owner (number 1), not as a stranger
+        latest = [ln for ln in _seen_lines(rt) if "记得收衣服" in ln]
+        self.assertEqual(len(latest), 1, latest)
+        self.assertIn(OWNER_HEAD, latest[0])
 
         # Bound bot account on OneBot group is ignored silently with bot_speaker
-        before_cnt = 0
-        with contextlib.closing(sqlite3.connect(rt / "memory.db")) as c:
-            before_cnt = c.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+        before_cnt = len(_seen_lines(rt))
+        self.assertGreaterEqual(before_cnt, 2)  # positive control: real lines were recorded above
         outcome_bot = ch.handle_event({
             "post_type": "message",
             "message_type": "group",
@@ -202,9 +192,9 @@ class Stage1IdentityTests(unittest.TestCase):
             "sender": {"nickname": "其他Bot"},
         })
         self.assertEqual(outcome_bot, "ignored:bot_speaker")
-        with contextlib.closing(sqlite3.connect(rt / "memory.db")) as c:
-            after_cnt = c.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
-        self.assertEqual(after_cnt, before_cnt)
+        after = _seen_lines(rt)
+        self.assertEqual(len(after), before_cnt)
+        self.assertFalse(any("整点报时" in ln for ln in after))
 
         # Unbind works via HTTP API
         st_ub, res_ub = _http_json(

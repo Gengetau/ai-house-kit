@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ..chat_identity import quote_untrusted
+from ..media_provenance import register_for_tool
 from ..llm import LLMAPIError, _extract_http_error_detail, clamp_timeout, mask_secrets
 from ..media_safety import (
     DEFAULT_MAX_MEDIA_BYTES,
@@ -560,6 +561,8 @@ def _tool_synthesize_voice(
     )
     # Keep tool output compact for LLM tool loop while staging rich audio attachment for channel delivery
     if res.get("ok"):
+        # bind these bytes to this chat and to the words that were spoken (a group only gets media that has this)
+        register_for_tool(daemon, ctx, res.get("audio_base64"), source_texts=[str(text or "").strip()[:400]], kind="audio")
         if ctx is not None and isinstance(ctx.pending_media, list):
             ctx.pending_media.append({
                 "kind": "audio",

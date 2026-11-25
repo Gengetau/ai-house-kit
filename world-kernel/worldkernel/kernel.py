@@ -51,6 +51,10 @@ class Kernel:
         self.instant = {}
         self.on_complete = []
         self.before_submit = []
+        # a module may answer a command before it becomes an action, inside the acceptance transaction:
+        #   hook(kernel, db, command_id, actor, atype, args, cmd) -> result dict | None (None = carry on as usual)
+        # It may raise Refused (the command fails with that reason).
+        self.accept_intercepts = []
         from .city_visits import CityVisits
         self.city_visits = CityVisits(self)
 
@@ -327,12 +331,22 @@ class Kernel:
         policy = act["interrupt_policy"] if act else spec["interrupt_policy"]
         if cmd.get("interrupt_policy") not in (None, policy):
             raise Refused("interrupt_policy_fixed_by_catalog", catalog=policy)
+        answered = None  # checks that can still refuse come before a module writes anything
+        for hook in self.accept_intercepts:
+            answered = hook(self, db, command_id, actor, atype, args, cmd)
+            if answered is not None:
+                break
         db.execute("INSERT INTO actions(action_id,command_id,actor_id,origin,goal_id,guide_id,action_type,args,state,"
                    "generation,interrupt_policy,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                    (action_id, command_id, actor["actor_id"], cmd["origin"], cmd.get("goal_id"), cmd.get("guide_id"),
                     atype, dumps(args), "accepted", actor["generation"], policy, now))
         db.execute("INSERT INTO home_action_epochs VALUES(?,?)",
                    (action_id, self.city_visits.authority(actor["actor_id"])["domain_epoch"]))
+        if answered is not None:
+            # the module did the work in this transaction; leave a finished action behind like an instant one, so
+            # her model plan sees the step succeed (it follows the action_id) and moves on
+            self._finish(db, action_id, "succeeded", None, now)
+            return dict(answered, status="succeeded", action_id=action_id)
         if not spec["body"]:
             return self._instant(db, action_id, actor, atype, args, cmd)
         if actor["action_id"]:

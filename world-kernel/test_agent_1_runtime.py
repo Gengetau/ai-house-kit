@@ -25,7 +25,7 @@ from ai_house.llm import LLMDeadlineError
 ENV = {"AI_HOUSE_AGENT_API_KEY": "k" * 24}
 TOOLS = [
     {"name": "inspect_house", "description": "看屋里", "parameters": {"type": "object", "properties": {}}},
-    {"name": "record_promise", "description": "记约定", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}}},
+    {"name": "check_fridge", "description": "看冰箱", "parameters": {"type": "object", "properties": {"item": {"type": "string"}}}},
 ]
 
 
@@ -56,8 +56,8 @@ class Rig:
     def runner(self, name, args):
         self.tool_threads.append(threading.get_ident())
         self.tool_calls.append((name, args))
-        if name == "record_promise":
-            return {"recorded": True, "intent": {"text": args.get("summary"), "kind": "chat_promise"}}
+        if name == "check_fridge":
+            return {"item": args.get("item"), "left": 1}
         return {"weather": "晴"}
 
     def session(self, actor="nell", channel=""):
@@ -135,19 +135,24 @@ class SpeakingTests(unittest.TestCase):
         res = r.turn()
         self.assertEqual(res.messages, ["等一下。", "好了，我来了。"])
 
-    def test_house_tools_run_on_the_callers_thread_and_promises_are_collected(self):
+    def test_house_tools_run_on_the_callers_thread_and_their_results_are_collected(self):
+        """Fails if a house tool runs on another thread than the caller's, a call is dropped or run twice, the tool
+        runner's results do not reach the turn (count and what she sees), or the reply after the tools is lost.
+        (The `record_promise` tool and `recorded_intents` are gone; the thread and counting guarantees stay.)"""
         r = Rig(self)
         r.hub.script = [[
             ("tool", "inspect_house", {}),
-            ("tool", "record_promise", {"summary": "明早买牛奶"}),
-            ("tool", "send_message", {"text": "记下了，明早去买。"}),
+            ("tool", "check_fridge", {"item": "milk"}),
+            ("tool", "send_message", {"text": "冰箱里还有一盒牛奶。"}),
         ]]
         res = r.turn()
-        self.assertEqual([c[0] for c in r.tool_calls], ["inspect_house", "record_promise"])
+        self.assertEqual([c[0] for c in r.tool_calls], ["inspect_house", "check_fridge"])
+        self.assertEqual(r.tool_calls[1][1], {"item": "milk"})
         self.assertEqual(set(r.tool_threads), {threading.get_ident()})
-        self.assertEqual(res.recorded_intents, [{"text": "明早买牛奶", "kind": "chat_promise"}])
+        self.assertEqual(r.hub.tool_results[1][1], {"item": "milk", "left": 1})
         self.assertEqual(res.tool_calls, 2)
-        self.assertEqual(res.messages, ["记下了，明早去买。"])
+        self.assertEqual(res.messages, ["冰箱里还有一盒牛奶。"])
+        self.assertFalse(hasattr(res, "recorded_intents"))
 
     def test_stay_quiet_in_a_group(self):
         r = Rig(self)

@@ -243,11 +243,14 @@ class Stage3VoiceTests(unittest.TestCase):
         mock_srv.fail_mode = False
 
         # Group TTS carrying private secret MUST be blocked BEFORE contacting upstream server
+        # changed: the text repeats most of the memory (the old "item + allergy word" rule is gone).
+        # Positive control: the memory is recalled in private.
+        self.assertIn("海胆", d.memory.recall("sora", "private", "房主的隐私忌口是什么"))
         before_tts = len(mock_srv.tts_requests)
         _, res_leak = _http_json(
             f"{base}/api/plugins/voice_io/speak",
             token=owner_tok,
-            body={"text": "其实房主对海胆过敏", "scope": "group", "actor": "sora"},
+            body={"text": "其实房主的隐私忌口：海胆过敏", "scope": "group", "actor": "sora"},
         )
         self.assertEqual(res_leak["status"], "blocked")
         self.assertEqual(len(mock_srv.tts_requests), before_tts)

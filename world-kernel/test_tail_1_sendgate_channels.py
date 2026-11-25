@@ -321,12 +321,20 @@ class RichMediaTests(Base):
     IMG = {"kind": "image", "image_base64": IMG_B64}
     AUD = {"kind": "audio", "audio_base64": AUD_B64}
 
+    def made_for_the_group(self, d: Any, *items: Mapping[str, Any]) -> None:
+        """What the built-in media tools do when they make or pick media: bind the bytes to the chat and to the text
+        they were made from. A group is sent only media that has this record (SPEC G5/G7/G12)."""
+        for it in items:
+            b64 = it.get("image_base64") or it.get("audio_base64")
+            d.media_provenance.register(b64, chat="qq-group:9001", source_texts=["a small test picture"], kind=it["kind"])
+
     def test_3_failed_media_send_is_recorded_and_not_reported_done(self) -> None:
         d = self.mk_daemon()
         srv = _FakeOneBotServer()
         self.addCleanup(srv.close)
         srv.fail_types = {"image"}
         ch = self.mk_channel(d, srv)
+        self.made_for_the_group(d, self.IMG)  # group media needs its record; this test is about the wire failing
         sid = self.new_sid(ch, "m-fail")
         ok = ch._send_bubbles("group", "9001", ["text first"], spool_ids=[sid], media=[self.IMG])
         self.assertTrue(ok, "the text bubble did go out")
@@ -341,6 +349,7 @@ class RichMediaTests(Base):
         ch._host = d
         ch._spool = ChannelSpool(self.tmp)
         self.addCleanup(ch._spool.close)
+        self.made_for_the_group(d, self.IMG, self.AUD)
         sid = self.new_sid(ch, "m-resume-media")
         self.assertFalse(ch._send_bubbles("group", "9001", ["hello"], spool_ids=[sid], media=[self.IMG, self.AUD]))
         self.assertEqual(self.spool_row(ch, sid)["state"], "reply_ready")
@@ -360,6 +369,7 @@ class RichMediaTests(Base):
         srv = _FakeOneBotServer()
         self.addCleanup(srv.close)
         ch = self.mk_channel(d, srv)
+        self.made_for_the_group(d, self.IMG)
         sid = self.new_sid(ch, "m-resume-2")
         plan_media = [dict(self.IMG)]
         ch._spool.save_reply_plan([sid], ["hello"], target="9001", kind="group", at="", media=plan_media)
@@ -390,7 +400,13 @@ class RichMediaTests(Base):
         # a group that is not whitelisted: media-only is blocked before the wire
         self.assertFalse(ch._send_bubbles("group", "99999", [], media=[self.IMG]))
         self.assertEqual(srv.frames, [])
-        # media-only replies are charged like any other reply
+        # changed from "a bare image is sent into the group": an image nobody made for this chat is NOT sent (SPEC G5),
+        # and the refused try costs nothing, so the two quota slots below are still there
+        self.assertFalse(ch._send_bubbles("group", "9001", [], media=[self.IMG]))
+        self.assertEqual(srv.frames, [])
+        self.assertEqual(self.log_rows(d), 0)
+        self.made_for_the_group(d, self.IMG)
+        # media-only replies that have their record are charged like any other reply
         self.assertTrue(ch._send_bubbles("group", "9001", [], media=[self.IMG]))
         self.assertTrue(ch._send_bubbles("group", "9001", [], media=[self.IMG]))
         self.assertFalse(ch._send_bubbles("group", "9001", [], media=[self.IMG]))

@@ -119,8 +119,24 @@ class Stage0ClockTests(unittest.TestCase):
         self.assertEqual(d2.clock.offset_s, 0.0)
 
 
+def _owner_asks(d, actor, line, ops, now):
+    """The owner says `line` to `actor` in private (she answers with a plain yes), then one forced memory extraction
+    runs with a fake model that answers `ops`: the only way a promise comes to exist."""
+    d.memory.observe(actor, "private", line, speaker_role="owner", speaker="房主", reply="好呀", now=now)
+    d.memory.extract(force=True, now=now + 2, llm_fn=lambda system, user: {"ops": ops})
+
+
+def _errand_op(text, quote):
+    return {"op": "intent", "text": text, "kind": "promise", "for": ["房主"], "agreed": ["奈尔"], "scope": "world",
+            "when": "vague", "quote": quote}
+
+
 class Stage0ErrandIntentTests(unittest.TestCase):
-    def test_tool_promise_with_empty_or_chinese_item_falls_back_and_completes_shopping(self):
+    def test_two_agreed_errands_are_carried_out_by_the_kernel_and_closed_by_its_receipts(self):
+        """Fails if an agreed errand (a quantity of 3, or a Chinese item label) is not read as a catalogue item, is not
+        listed as an errand for her, is not carried out in the daytime shopping window, or is not closed with the
+        kernel's own evidence key. (The `record_promise` tool that used to pass the item is gone, dropped item D2;
+        the item is now read from the promise text.)"""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rt = Path(tmp.name) / "rt"
@@ -128,45 +144,30 @@ class Stage0ErrandIntentTests(unittest.TestCase):
         d = HouseDaemon(runtime_dir=rt, virtual_clock=True, start_ts=start, env={})
         self.addCleanup(d.close)
 
-        # Case 1: Model returned errand intent without `item`
-        d.intents.enqueue_chat(
-            "nell",
-            "帮我买 3 个洋葱",
-            "好呀，我待会儿顺路买",
-            where="group",
-            intents=[{"text": "帮房主买 3 个洋葱", "kind": "errand", "qty": 3, "答应了的": ["nell"]}],
-            now=d.clock.now(),
-        )
-        # Case 2: Model returned errand intent with Chinese label `鸡蛋` instead of canonical `egg`
-        d.intents.enqueue_chat(
-            "nell",
-            "再带两个鸡蛋回来",
-            "没问题，记下啦",
-            where="group",
-            intents=[{"text": "买鸡蛋", "kind": "errand", "item": "鸡蛋", "qty": 2, "答应了的": ["nell"]}],
-            now=d.clock.now(),
-        )
+        _owner_asks(d, "nell", "帮我买 3 个洋葱", [_errand_op("奈尔帮房主买3个洋葱", "帮我买 3 个洋葱")], d.clock.now())
+        _owner_asks(d, "nell", "再带两个鸡蛋回来", [_errand_op("奈尔买2个鸡蛋", "再带两个鸡蛋回来")], d.clock.now() + 10)
 
-        rows = {r["item"]: r for r in d.intents.list_intents(actor="nell")}
-        self.assertIn("onion", rows)
-        self.assertEqual(rows["onion"]["qty"], 3)
-        self.assertEqual(rows["onion"]["state"], "open")
-        self.assertIn("egg", rows)
-        self.assertEqual(rows["egg"]["qty"], 2)
-        self.assertEqual(rows["egg"]["state"], "open")
-
-        errands = d.intents.errands("nell", d.clock.now())
-        self.assertEqual({e["item"] for e in errands}, {"onion", "egg"})
+        # a promise made in the owner's private chat is listed without its words, so the items are read from `errands`
+        listed = d.intents.list_intents(actor="nell")
+        self.assertEqual([r["state"] for r in listed], ["open", "open"])
+        errands = d.intents.errands("nell", d.clock.now() + 30)
+        self.assertEqual({(e["item"], e["qty"]) for e in errands}, {("onion", 3), ("egg", 2)})
 
         d.fast_forward(60)  # Daytime supermarket errand runs inside 09:30-16:00 JST
 
-        after = {r["item"]: r for r in d.intents.list_intents(actor="nell")}
-        self.assertEqual(after["onion"]["state"], "completed")
-        self.assertEqual(after["egg"]["state"], "completed")
-        self.assertTrue(str(after["onion"]["evidence_key"]).startswith("ai-house/"))
-        self.assertTrue(str(after["egg"]["evidence_key"]).startswith("ai-house/"))
+        self.assertEqual([r["state"] for r in d.intents.list_intents(actor="nell")], ["completed", "completed"])
+        self.assertEqual(d.intents.errands("nell", d.clock.now() + 30), [])
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            refs = [json.loads(r[0]) for r in c.execute("SELECT refs FROM intents WHERE status='completed'")]
+        keys = [next(f["kernel"] for f in ref if isinstance(f, dict) and f.get("kernel")) for ref in refs]
+        self.assertEqual(len(keys), 2)
+        self.assertTrue(all(k.startswith("ai-house/") for k in keys), keys)
 
-    def test_record_promise_tool_schema_and_allergy_note_not_completed_by_cooking(self):
+    def test_an_allergy_note_is_a_memory_that_cooking_does_not_touch(self):
+        """Fails if the standing allergy note is turned into a promise (diet notes are memories now, dropped item D3),
+        is changed or removed when she cooks dinner, or if no dinner was settled in the window (the control: the
+        kernel did plan a meal for her, so 'not completed by cooking' is not just 'nothing happened'). The tool
+        schema half of the old case went with the `record_promise` tool (dropped item D2)."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rt = Path(tmp.name) / "rt"
@@ -174,26 +175,24 @@ class Stage0ErrandIntentTests(unittest.TestCase):
         d = HouseDaemon(runtime_dir=rt, virtual_clock=True, start_ts=start, env={})
         self.addCleanup(d.close)
 
-        specs = RoommateChatAgent(d.vocab)._builtin_tool_specs()
-        rec_spec = next(s for s in specs if s["name"] == "record_promise")
-        desc = rec_spec["parameters"]["properties"]["item"]["description"]
-        self.assertIn("onion=洋葱", desc)
-        self.assertIn("egg=鸡蛋", desc)
-
-        d.intents.enqueue_chat(
-            "nell",
-            "记住我对花生过敏",
-            "我记牢啦，绝不让你误食",
-            where="private",
-            intents=[{"text": "记得房主对花生过敏", "kind": "cook", "答应了的": ["nell"]}],
-            now=d.clock.now(),
-        )
+        ops = [{"op": "add", "text": "房主对花生过敏", "kind": "preference", "about": ["房主"]}]
+        _owner_asks(d, "nell", "记住我对花生过敏", ops, d.clock.now())
+        notes = d.memory.list_entries("nell", "private")
+        self.assertEqual([n["text"] for n in notes], ["房主对花生过敏"])
+        self.assertEqual(d.intents.list_intents(actor="nell"), [])
         d.fast_forward(120)  # Crosses dinner cooking window 17:45 -> 19:45 JST
-        allergy_rows = [r for r in d.intents.list_intents(actor="nell") if "花生过敏" in r["summary"]]
-        self.assertTrue(allergy_rows)
-        self.assertNotEqual(allergy_rows[0]["state"], "completed")
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            meals = [r[0] for r in c.execute("SELECT body FROM intent_evidence") if '"plan_kind": "meal"' in r[0]]
+        self.assertTrue(meals, "no dinner was settled in the window")
+        after = d.memory.list_entries("nell", "private")
+        self.assertEqual([(n["id"], n["text"], n["status"]) for n in after], [(n["id"], n["text"], n["status"]) for n in notes])
+        self.assertEqual(d.intents.list_intents(actor="nell"), [])
 
     def test_errand_not_closed_by_unrelated_arrival_and_handles_over_500_evidences(self):
+        """Fails if an arrival at the park, or an egg purchase that belongs to no errand, closes an errand to buy eggs,
+        if the errand is lost from `errands`, or if the errand's own purchase receipt is not seen behind 505 later unrelated evidence rows (the read window), or does
+        not close it with that receipt's key. The errand is created through extraction (rule-based recording at chat
+        time is gone, dropped item D1); the same promise being open before and completed after is the control."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rt = Path(tmp.name) / "rt"
@@ -201,52 +200,80 @@ class Stage0ErrandIntentTests(unittest.TestCase):
         d = HouseDaemon(runtime_dir=rt, virtual_clock=True, start_ts=start, env={})
         self.addCleanup(d.close)
 
-        # Case A: "去超市买鸡蛋" + park arrival evidence must NOT auto-complete the errand
-        d.intents.enqueue_chat("nell", "去超市买鸡蛋", "好嘞，我去看看", where="group", now=start + 10.0)
+        _owner_asks(d, "nell", "去超市买鸡蛋", [_errand_op("奈尔去超市买2个鸡蛋", "去超市买鸡蛋")], start + 10.0)
+
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:  # the promise code reads only the bound kernel stream
+            stream = c.execute("SELECT v FROM kernel_bind WHERE k='world'").fetchone()[0]
+
+        def body(key, doc):  # the kernel's own rows carry their key and stream inside the body
+            return json.dumps({**doc, "key": key, "stream": stream})
+
+        # Case A: a park arrival and an egg purchase that belongs to no errand must NOT complete the errand
+        errand = d.intents.errands("nell", start + 30.0)[0]
+        self.assertEqual((errand["item"], errand["qty"]), ("egg", 2))
         with contextlib.closing(sqlite3.connect(d.world_db)) as c:
             with c:
                 c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, ?, ?, ?)",
                     (
                         "ev-park-arrive",
+                        stream,
                         1,
                         start + 20.0,
-                        json.dumps({"kind": "arrived", "actor": "nell", "place": "park", "at": start + 20.0}),
+                        body("ev-park-arrive", {"kind": "arrived", "actor": "nell", "place": "place:park",
+                                                "plan_id": "plan-park", "at": start + 20.0}),
+                    ),
+                )
+                c.execute(
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, ?, ?, ?)",
+                    (
+                        "ev-buy-egg-stray",
+                        stream,
+                        2,
+                        start + 25.0,
+                        body("ev-buy-egg-stray", {"kind": "purchased", "actor": "nell", "item": "egg", "qty": 2,
+                                                  "plan_id": "plan-park", "at": start + 25.0}),
                     ),
                 )
         d.intents.sweep(start + 30.0)
-        egg_rows = [r for r in d.intents.list_intents(actor="nell") if r.get("item") == "egg"]
-        self.assertEqual(len(egg_rows), 1)
-        self.assertEqual(egg_rows[0]["state"], "open")
-        self.assertEqual(len(d.intents.errands("nell", start + 30.0)), 1)
+        listed = d.intents.list_intents(actor="nell")
+        self.assertEqual([r["state"] for r in listed], ["open"])
+        self.assertEqual([(e["item"], e["qty"]) for e in d.intents.errands("nell", start + 30.0)], [("egg", 2)])
 
-        # Case B: Insert 505 earlier unrelated evidence rows; 506th matching purchase must still complete!
+        # Case B: 505 unrelated evidence rows after the promise; the errand's own arrival at the supermarket and receipt behind them must still complete it
+        arrival = {"kind": "arrived", "actor": "nell", "place": "place:supermarket", "plan_id": "plan-shop",
+                   "at": start + 50.0}
+        receipt = {"kind": "purchased", "actor": "nell", "item": "egg", "qty": 2, "plan_id": "plan-shop", "at": start + 60.0,
+                   "intent_ref": errand["intent"], "account": errand["account"], "beneficiary": errand["beneficiary"],
+                   "fingerprint": errand["fingerprint"], "action_id": "act-egg-1", "resource_id": "res-egg-1"}
         with contextlib.closing(sqlite3.connect(d.world_db)) as c:
             with c:
                 for idx in range(505):
-                    ev_ts = start - 5000.0 + idx
+                    ev_ts = start + 31.0 + idx * 0.01
                     c.execute(
-                        "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
+                        "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, ?, ?, ?)",
                         (
                             f"ev-noise-{idx}",
+                            stream,
                             10 + idx,
                             ev_ts,
-                            json.dumps({"kind": "activity", "actor": "sora", "activity": "reading", "at": ev_ts}),
+                            body(f"ev-noise-{idx}", {"kind": "activity", "actor": "sora", "activity": "reading", "at": ev_ts}),
                         ),
                     )
                 c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
-                    (
-                        "ev-buy-egg-506",
-                        600,
-                        start + 60.0,
-                        json.dumps({"kind": "purchased", "actor": "nell", "item": "egg", "qty": 2, "at": start + 60.0}),
-                    ),
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, ?, ?, ?)",
+                    ("ev-arrive-market", stream, 599, start + 50.0, body("ev-arrive-market", arrival)),
+                )
+                c.execute(
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, ?, ?, ?)",
+                    ("ev-buy-egg-506", stream, 600, start + 60.0, body("ev-buy-egg-506", receipt)),
                 )
         d.intents.sweep(start + 70.0)
-        after_rows = [r for r in d.intents.list_intents(actor="nell") if r.get("item") == "egg"]
-        self.assertEqual(after_rows[0]["state"], "completed")
-        self.assertEqual(after_rows[0]["evidence_key"], "ev-buy-egg-506")
+        self.assertEqual([r["state"] for r in d.intents.list_intents(actor="nell")], ["completed"])
+        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+            refs = json.loads(c.execute("SELECT refs FROM intents WHERE status='completed'").fetchone()[0])
+        self.assertEqual(sorted(f["kernel"] for f in refs if isinstance(f, dict) and f.get("kernel")),
+                         ["ev-arrive-market", "ev-buy-egg-506"])
         self.assertEqual(d.intents.errands("nell", start + 70.0), [])
 
 
@@ -327,13 +354,20 @@ class Stage0ModelCompatTests(unittest.TestCase):
         return f"http://127.0.0.1:{srv.server_port}", recorded
 
     def test_gpt5_compat_auto_adapts_test_llm_chat_and_memory_extractor(self):
+        """Fails if the connection test, the chat turn, the life model call that follows the owner's line, or the memory
+        extractor keeps sending `max_tokens` / `temperature` to a model that refuses them (or too small a completion
+        budget). The life model call is now woken by the owner's line reaching the world at extraction time, not by the
+        chat turn (dropped item D1); without that line no life call is made (checked by hand), so the assertion is real."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         secret_key = "sk-localMockTestKey123456"
         base_url, recorded = self._start_mock_llm_server("gpt5_compat", secret_key)
 
+        # A fixed evening hour: on the wall clock this case failed whenever it ran while she was asleep (02:00-06:00).
         d = HouseDaemon(
             Path(tmp.name) / "rt",
+            virtual_clock=True,
+            start_ts=dt.datetime(2026, 11, 21, 20, 0, tzinfo=JST).timestamp(),
             env={
                 "AI_HOUSE_WORLD_PACK": "life1",
                 "AI_HOUSE_BASE_URL": base_url,
@@ -357,9 +391,23 @@ class Stage0ModelCompatTests(unittest.TestCase):
         self.assertTrue(replies)
         self.assertEqual(replies[0]["mode"], "live_api")
         self.assertEqual(replies[0]["text"], "OK，没问题！")
-        self.assertGreaterEqual(len(recorded) - before, 2)
+        self.assertGreaterEqual(len(recorded) - before, 1)
         self.assertNotIn("max_tokens", recorded[-1])
         self.assertNotIn("temperature", recorded[-1])
+
+        # The owner's line reaches the world when the memory extraction runs; the life model then thinks about it,
+        # and that call adapts to the model the same way (a chat turn alone no longer wakes the life model).
+        before = len(recorded)
+        ops = [{"op": "intent", "text": "奈尔晚上泡热茶", "kind": "promise", "for": ["房主"], "agreed": ["奈尔"],
+                "scope": "world", "when": "vague", "quote": "晚上好"}]
+        d.memory.extract(force=True, now=d.clock.now() + 1, llm_fn=lambda system, user: {"ops": ops})
+        d.fast_forward(1)
+        life = [r for r in recorded[before:] if "你现在的情况" in json.dumps(r["messages"], ensure_ascii=False)]
+        self.assertTrue(life, "the life model was never asked after the owner's line reached the world")
+        for r in life:
+            self.assertNotIn("max_tokens", r)
+            self.assertNotIn("temperature", r)
+            self.assertGreaterEqual(r["max_completion_tokens"], 1024)
 
         ext = _openai_json_extractor(
             "extractor_json",

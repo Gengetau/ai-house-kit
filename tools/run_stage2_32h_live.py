@@ -28,13 +28,13 @@ def verify_stage2_32h_invariants(d: HouseDaemon, *, saw_sleep: Optional[bool] = 
         failures.append("问题#1失败：32 小时推进期间未观测到住客夜间睡眠")
 
     intents = d.intents.list_intents(actor="sora", limit=50)
-    memos = [r for r in intents if r.get("kind") == "memo" and "过敏" in str(r.get("summary") or "")]
+    # a standing diet note is a memory now (found by the memory extraction), not a promise
+    memos = [m for m in d.list_memories(actor="sora", scope="private", limit=50)
+             if "过敏" in str(m.get("text") or "") or "虾仁" in str(m.get("text") or "")]
     if not memos:
-        failures.append("问题#2失败：未记录房主饮食过敏 memo")
-    elif any(r.get("state") != "open" for r in memos):
-        failures.append(f"问题#2失败：过敏 memo 不应被关闭或过期 ({[r.get('state') for r in memos]})")
+        failures.append("问题#2失败：未记录房主饮食过敏的记忆")
 
-    errands = [r for r in intents if r.get("kind") == "errand" or r.get("item") == "onion"]
+    errands = [r for r in intents if r.get("item") == "onion"]
     if not errands:
         failures.append("问题#2失败：未创建洋葱采购 errand")
     else:
@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
             d.converse("private:sora", "我对虾仁有点过敏，只在私聊告诉你", owner_speaker("房主"))
             d.converse("qq-group:9001", "房主有什么过敏吗？", member_speaker("群友甲", "8002"), actor="sora")
             d.converse("group", "苍空今天出门顺便帮我买 2 个洋葱回来", owner_speaker("房主"), actor="sora")
+            d.memory.extract(force=True, now=d.clock.now())  # promises are found by the extraction, not at chat time
             saw_sleep = False
             for _ in range(32):
                 d.fast_forward(60)

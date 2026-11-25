@@ -405,6 +405,69 @@ class ShelfAndWardrobeTests(unittest.TestCase):
             else:
                 os.environ["WARDROBE_SHELF_ASSETS"] = old_env
 
+    def test_free_time_prompt_guides_shelf_pick_and_other_decisions_do_not(self):
+        captured = {}
+
+        def capture_chat(system, user):
+            captured["user"] = user
+            return '{"steps": []}', 10
+
+        model = LM.LiveLifeModel(capture_chat, {"nell": "奈尔"})
+        shelf_hint = "也可以去公共货架（shelf_picks）挑一件喜欢的衣服或套装，用 pick_shelf_garment 收进自己衣柜，再换上。"
+
+        picks = [{"asset_id": "shelf_1", "kind": "garment", "label": "米色针织开衫"}]
+
+        def ask_prompt(decision, shelf=True):
+            captured.clear()
+            life = {"now": "2026-11-03 10:00", "weekday": "二"}
+            if shelf:
+                life["shelf_picks"] = picks
+            model({
+                "actor": "nell",
+                "decision": decision,
+                "location": "living",
+                "life": life,
+            })
+            user = captured["user"]
+            reason_line = user.split("\n让你想一想的原因：", 1)[1].split("\n\n", 1)[0]
+            return user, reason_line
+
+        free_user, free_reason = ask_prompt("free_time")
+        self.assertEqual(shelf_hint, LM.SHELF_HINT)
+        self.assertIn(shelf_hint, free_user)
+        self.assertIn("公共货架", free_reason)
+        self.assertIn("shelf_picks", free_reason)
+        self.assertIn("pick_shelf_garment", free_reason)
+        self.assertTrue(free_reason.endswith(shelf_hint))
+
+        # 货架上没有她能挑的（没有 shelf_picks 或为空）：空闲时间也不提货架，免得她去拿不存在的 asset_id
+        for empty in (False, None):
+            with self.subTest(shelf=empty):
+                if empty is None:
+                    captured.clear()
+                    model({"actor": "nell", "decision": "free_time", "location": "living",
+                           "life": {"now": "2026-11-03 10:00", "weekday": "二", "shelf_picks": []}})
+                    user = captured["user"]
+                    reason = user.split("\n让你想一想的原因：", 1)[1].split("\n\n", 1)[0]
+                else:
+                    user, reason = ask_prompt("free_time", shelf=False)
+                self.assertNotIn(shelf_hint, user)
+                self.assertNotIn("货架", reason)
+                self.assertIn("约人用 invite", reason)
+
+        other_decisions = tuple(k for k in LM.WHY if k != "free_time") + (
+            "head_cook:lunch",
+            "scheduled_meal_own_choice:lunch",
+            "invitation:inv_1",
+        )
+        for kind in other_decisions:
+            with self.subTest(decision=kind):
+                other_user, other_reason = ask_prompt(kind)
+                self.assertNotIn(shelf_hint, other_user)
+                self.assertNotIn("货架", other_reason)
+                self.assertNotIn("shelf_picks", other_reason)
+                self.assertNotIn("pick_shelf_garment", other_reason)
+
     def test_lost_submitting_job_recovers_to_unknown_pending_reconcile_without_repay(self):
         p = self.kernel.submit({
             "idempotency_key": "p_lost", "principal": "channel:elsa", "actor_id": "elsa",

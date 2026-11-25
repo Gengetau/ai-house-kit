@@ -22,10 +22,14 @@ from ai_house.chat_identity import member_speaker, owner_speaker  # noqa: E402
 from ai_house.daemon import HouseDaemon, JST  # noqa: E402
 from ai_house.plugin_api import PluginHostProxy  # noqa: E402
 from run_stage2_32h_live import verify_stage2_32h_invariants  # noqa: E402
+from test_m2_intents_adapter import fake_model  # noqa: E402
 
 
 class ReviewBatchFAcceptanceTests(unittest.TestCase):
     def test_verify_stage2_32h_invariants_negative_probes(self) -> None:
+        """Fails if the checker stops reporting any of the faults named in the probes: no sleep seen, an open (not
+        completed) onion errand, a leak in the plain 'group' channel, or a missing allergy memory; or if it reports
+        something on the clean baseline (positive control: the baseline must return an empty list)."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         t0 = dt.datetime(2026, 11, 21, 9, 0, tzinfo=JST).timestamp()
@@ -39,16 +43,16 @@ class ReviewBatchFAcceptanceTests(unittest.TestCase):
         )
         self.addCleanup(d.close)
 
-        # Seed allergy memo + open onion errand + evidence-completed errand baseline
-        d.intents.enqueue_chat(
-            "sora",
-            "记住我对虾仁过敏",
-            "记牢啦",
-            where="private",
-            intents=[{"text": "房主对虾仁过敏", "kind": "memo", "答应了的": ["sora"]}],
-            now=t0,
-        )
-        d.intents.enqueue_chat("sora", "今天顺便帮我买 2 个洋葱回来", "好，我去买", where="group", now=t0)
+        # Seed: the allergy as a standing memory, the onion errand found by the extraction (open until evidence)
+        d.memory.add("sora", "private", "房主对虾仁过敏，做菜别放虾", kind="fact", source="chat", now=t0)
+        ask = "今天顺便帮我买 2 个洋葱回来"
+        d.memory.observe("sora", "group", ask, channel="group", speaker="房主", speaker_role="owner",
+                         reply="好，我去买2个洋葱", now=t0)
+        op = {"op": "intent", "text": "苍空买2个洋葱", "kind": "promise", "for": ["房主"], "agreed": ["苍空"],
+              "scope": "world", "when": "vague", "quote": "今天顺便帮我买 2 个洋葱回来"}
+        d.memory.extract(force=True, now=t0 + 5, llm_fn=fake_model([op]))
+        onion = [r for r in d.intents.list_intents(actor="sora") if r["item"] == "onion"]
+        self.assertEqual([(r["state"], r["qty"]) for r in onion], [("open", 2)])
 
         # Probe A: open errand + saw_sleep=False MUST fail both #1 and #2!
         fails_a = verify_stage2_32h_invariants(d, saw_sleep=False)
@@ -59,9 +63,13 @@ class ReviewBatchFAcceptanceTests(unittest.TestCase):
         ev_at = t0 + 1800.0
         with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
             with wc:
+                stream = wc.execute("SELECT v FROM kernel_bind WHERE k='world'").fetchone()[0]
                 wc.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 1, ?, ?)",
-                    ("ev-buy-onion", ev_at, json.dumps({"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2, "at": ev_at})),
+                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, 1, ?, ?)",
+                    ("ev-buy-onion", stream, ev_at, json.dumps({
+                        "key": "ev-buy-onion", "kind": "purchased", "actor": "sora", "item": "onion", "qty": 2,
+                        "at": ev_at, "account": "sora", "action_id": "act-onion", "resource_id": "res-onion",
+                        "intent_ref": int(onion[0]["intent_id"]), "beneficiary": ["owner"]})),
                 )
         d.intents.sweep(ev_at + 10.0)
         self.assertEqual(verify_stage2_32h_invariants(d, saw_sleep=True), [])
@@ -77,13 +85,25 @@ class ReviewBatchFAcceptanceTests(unittest.TestCase):
         fails_b = verify_stage2_32h_invariants(d, saw_sleep=True)
         self.assertTrue(any("问题#4失败" in f and "group" in f for f in fails_b))
 
-        # Probe C: closed allergy memo MUST fail #2
+        # Probe C: a forgotten allergy memory MUST fail #2 (and nothing else changed: the leak was removed first)
         with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
             with wc:
                 wc.execute("DELETE FROM chat_messages WHERE channel='group'")
-                wc.execute("UPDATE house_intents SET state='completed' WHERE kind='memo'")
+        self.assertEqual(verify_stage2_32h_invariants(d, saw_sleep=True), [])  # positive control: clean again
+        for m in d.list_memories(actor="sora", scope="private", limit=50):
+            d.forget_memory(actor="sora", scope="private", mem_id=m["id"])
         fails_c = verify_stage2_32h_invariants(d, saw_sleep=True)
-        self.assertTrue(any("问题#2失败" in f for f in fails_c))
+        self.assertTrue(any("问题#2失败：未记录房主饮食过敏" in f for f in fails_c))
+
+        # Probe D: a completed errand whose evidence is not a purchase MUST fail #2
+        d.memory.add("sora", "private", "房主对虾仁过敏，做菜别放虾", kind="fact", source="chat", now=ev_at + 30)
+        self.assertEqual(verify_stage2_32h_invariants(d, saw_sleep=True), [])
+        with contextlib.closing(sqlite3.connect(d.world_db)) as wc:
+            with wc:
+                wc.execute("UPDATE intent_evidence SET body=? WHERE key='ev-buy-onion'",
+                           (json.dumps({"key": "ev-buy-onion", "kind": "activity", "actor": "sora"}),))
+        fails_d = verify_stage2_32h_invariants(d, saw_sleep=True)
+        self.assertTrue(any("问题#2失败：采购结单凭据无效" in f for f in fails_d))
 
     def test_real_dist_info_entry_points_tool_discovery_without_mocking_and_proxy_enforced(self) -> None:
         tmp = tempfile.TemporaryDirectory()

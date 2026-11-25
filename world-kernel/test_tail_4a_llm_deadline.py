@@ -187,7 +187,7 @@ class DeadlineTests(Base):
         d = self._daemon_agent_loop(r)
         t = time.monotonic()
         with self.assertRaises(Exception):
-            d._run_tool_loop("sys", "usr", [], lambda n, a: {}, [], actor_id="sora")
+            d._run_tool_loop("sys", "usr", [], lambda n, a: {}, actor_id="sora")
         el = time.monotonic() - t
         self.assertLessEqual(el, self.BUDGET * 3, f"_run_tool_loop took {el:.1f}s")  # unbounded would be 60s+
 
@@ -205,7 +205,7 @@ class DeadlineTests(Base):
         t = time.monotonic()
         with self.assertRaises(LLMAPIError) as cm:
             agent._run_tool_loop("sys", "usr", [{"name": "inspect_house", "description": "x", "parameters": {"type": "object", "properties": {}}}],
-                                 lambda n, a: {"ok": True}, [], actor_id="sora")
+                                 lambda n, a: {"ok": True}, actor_id="sora")
         el = time.monotonic() - t
         self.assertLessEqual(el, self.BUDGET + 2.5, f"slow tool loop took {el:.1f}s")  # unbounded: 7.2s
         self.assertEqual(cm.exception.status_code, 504)

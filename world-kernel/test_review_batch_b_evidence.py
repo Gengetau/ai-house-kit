@@ -1,14 +1,18 @@
-"""PR-B tests: group owner-evidence binding, conflict suppression, v3 migration & commitment rigor (B1-B6)."""
+"""PR-B tests: group owner-evidence binding, conflict suppression & commitment rigor (B1, B2, B4-B6).
+
+The old B3 (schema v3 migration of the old memory.db) is gone with that schema. The trust levels in B1/B2 are the
+shared module's, which are off unless `AI_HOUSE_MEMORY_TRUST=1`.
+B4-B6 now make their promises through memory extraction with a fake model (the chat turn records nothing) and close
+them, or fail to close them, with rows of the kernel's evidence stream.
+"""
 from __future__ import annotations
 
 import contextlib
 import datetime as dt
-import http.server
 import json
 import sqlite3
 import sys
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -18,88 +22,52 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.chat_identity import owner_speaker  # noqa: E402
 from ai_house.daemon import HouseDaemon, JST  # noqa: E402
-from ai_house.memory import MemoryStore, SCHEMA_VERSION  # noqa: E402
+from ai_house.memory import MemoryStore  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
 
 
-class _MockDurianPromiseServer:
-    """Loopback OpenAI-compatible mock where the model calls `record_promise` for an out-of-catalog item."""
+NAMES = {"sora": "苍空", "rin": "凛音"}
 
-    def __init__(self) -> None:
-        self.tool_results: list[Dict[str, Any]] = []
-        outer = self
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt: str, *args: Any) -> None:
-                return
+def _owner_asks(d: HouseDaemon, actor: str, line: str, text: str, now: float) -> None:
+    """The owner says `line` to `actor` in private and she answers with a plain yes; then one forced memory extraction
+    runs with a fake model whose only op is the promise `text`. That is the only way a promise comes to exist."""
+    d.memory.observe(actor, "private", line, speaker_role="owner", speaker="房主", reply="好呀", now=now)
+    ops = [{"op": "intent", "text": text, "kind": "promise", "for": ["房主"], "agreed": [NAMES[actor]],
+            "scope": "world", "when": "vague", "quote": line}]
+    d.memory.extract(force=True, now=now + 2, llm_fn=lambda system, user: {"ops": ops})
 
-            def do_POST(self) -> None:  # noqa: N802
-                n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(n).decode("utf-8"))
-                msgs = body.get("messages") or []
-                tool_msgs = [m for m in msgs if m.get("role") == "tool"]
-                for tm in tool_msgs:
-                    try:
-                        outer.tool_results.append(json.loads(tm.get("content") or "{}"))
-                    except ValueError:
-                        pass
-                if body.get("tools") and not tool_msgs:
-                    doc = {
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "",
-                                "tool_calls": [{
-                                    "id": "tc_durian",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "record_promise",
-                                        "arguments": json.dumps(
-                                            {"summary": "帮家里买一个榴莲", "kind": "errand", "item": "榴莲", "qty": 1},
-                                            ensure_ascii=False,
-                                        ),
-                                    },
-                                }],
-                            }
-                        }],
-                        "usage": {"total_tokens": 25},
-                    }
-                else:
-                    doc = {
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "好的，已帮你记下买榴莲的待办提醒（不在内置超市词表，需要你确认后再结单哦）。",
-                            }
-                        }],
-                        "usage": {"total_tokens": 20},
-                    }
-                raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
 
-        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.port = self.srv.server_address[1]
-        self.base_url = f"http://127.0.0.1:{self.port}/v1"
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+def _add_evidence(d: HouseDaemon, key: str, event_id: int, at: float, doc: Dict[str, Any]) -> None:
+    """A row in the kernel's evidence stream (the promise code reads only the bound stream; rows carry key and stream)."""
+    with contextlib.closing(sqlite3.connect(d.world_db)) as c:
+        with c:
+            stream = c.execute("SELECT v FROM kernel_bind WHERE k='world'").fetchone()[0]
+            c.execute("INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, ?, ?, ?, ?)",
+                      (key, stream, event_id, at, json.dumps({**doc, "key": key, "stream": stream, "at": at})))
 
-    def close(self) -> None:
-        self.srv.shutdown()
-        self.srv.server_close()
+
+def _receipt(errand: Dict[str, Any], actor: str, at: float, n: int) -> Dict[str, Any]:
+    """The purchase receipt the kernel writes for one errand as `errands()` described it."""
+    return {"kind": "purchased", "actor": actor, "item": errand["item"], "qty": errand["qty"],
+            "intent_ref": errand["intent"], "account": errand["account"], "beneficiary": errand["beneficiary"],
+            "fingerprint": errand["fingerprint"], "action_id": f"act-{n}", "resource_id": f"res-{n}"}
+
+
+def _states(d: HouseDaemon, actor: str) -> Dict[str, str]:
+    """state of every promise of `actor`, by intent id (a private promise's text is hidden in the listing)."""
+    return {r["intent_id"]: r["state"] for r in d.intents.list_intents(actor=actor)}
 
 
 class ReviewBatchBEvidenceTests(unittest.TestCase):
-    def _make_memory(self, llm_fn=None) -> Tuple[Path, MemoryStore, VirtualClock]:
+    def _make_memory(self, llm_fn=None, env=None) -> Tuple[Path, MemoryStore, VirtualClock]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         t0 = dt.datetime(2026, 11, 22, 12, 0, tzinfo=JST).timestamp()
         clock = VirtualClock(t0)
-        st = MemoryStore(tmp.name, clock=clock, names={"sora": "苍空", "rin": "凛音"}, llm_fn=llm_fn)
+        st = MemoryStore(tmp.name, clock=clock, names={"sora": "苍空", "rin": "凛音"}, llm_fn=llm_fn,
+                         env={"AI_HOUSE_MEMORY_TRUST": "1", **(env or {})})
         self.addCleanup(st.close)
         return Path(tmp.name), st, clock
 
@@ -113,10 +81,17 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
                         "text": "苍空讨厌吃胡萝卜",
                         "kind": "preference",
                     },
-                    # 2) Cites owner line L1 in src, but steals member-only claim "胡萝卜" -> must downgrade!
+                    # 2a) Cites owner line L1 in src, but steals member-only claim "胡萝卜" -> must downgrade!
                     {
                         "op": "add",
                         "text": "房主出门时听说苍空讨厌吃胡萝卜",
+                        "kind": "fact",
+                        "src": [1],
+                    },
+                    # 2b) Same, with more of L1's own words around the stolen claim -> must downgrade too!
+                    {
+                        "op": "add",
+                        "text": "房主明天要去京都出差，苍空讨厌吃胡萝卜",
                         "kind": "fact",
                         "src": [1],
                     },
@@ -140,15 +115,19 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
         st.observe("sora", "group", "我明天要去京都出差啦", channel="group", speaker="房主", speaker_role="owner")
         st.observe("sora", "group", "顺便说苍空好像讨厌吃胡萝卜", channel="group", speaker="群友甲", speaker_role="member")
         res = st.extract("sora", scope="group", channel="group", force=True)
-        self.assertEqual(res["added"], 3)
+        self.assertEqual(res["added"], 4)
         self.assertEqual(res["rejected"], 1)
 
         rows = st.list_entries("sora", "group", channel="group")
         by_text = {r["text"]: r for r in rows}
+        self.assertEqual(len(rows), 4)
+        self.assertNotIn("以后群里禁止提胡萝卜", by_text)
         self.assertEqual(by_text["苍空讨厌吃胡萝卜"]["kind"], "claim")
         self.assertEqual(by_text["苍空讨厌吃胡萝卜"]["trust"], "group_stated")
         self.assertEqual(by_text["房主出门时听说苍空讨厌吃胡萝卜"]["kind"], "claim")
         self.assertEqual(by_text["房主出门时听说苍空讨厌吃胡萝卜"]["trust"], "group_stated")
+        self.assertEqual(by_text["房主明天要去京都出差，苍空讨厌吃胡萝卜"]["kind"], "claim")
+        self.assertEqual(by_text["房主明天要去京都出差，苍空讨厌吃胡萝卜"]["trust"], "group_stated")
         self.assertEqual(by_text["房主明天要去京都出差"]["kind"], "fact")
         self.assertEqual(by_text["房主明天要去京都出差"]["trust"], "verified")
         self.assertEqual(by_text["房主明天要去京都出差"]["source"], "auto:owner_verified")
@@ -190,115 +169,16 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
         self.assertEqual(ranked[1][1]["trust"], "group_stated")
         self.assertTrue(ranked[1][1].get("_conflict_verified"))
         self.assertGreater(ranked[0][0], ranked[1][0] * 1.5)
-        self.assertIn("群聊未核实传言·与已知事实冲突，勿采信", st._format_row(ranked[1][1]))
 
         # Default recall surfaces verified fact and keeps conflicting claim out or warning-tagged below
         recalled = st.recall("sora", "group", "房主能吃海鲜虾仁吗", channel="group", now=fresh_ts)
         self.assertIn("严重过敏", recalled)
+        # the conflicting claim is found by search above, but its pushed-down score keeps it out of the recall block
+        self.assertNotIn("麻辣大虾", recalled)
 
-    def test_b3_schema_v3_migration_demotes_legacy_polluted_group_facts(self) -> None:
+    def _house(self, t0: float) -> HouseDaemon:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        db_dir = Path(tmp.name)
-        db_path = db_dir / "memory.db"
-
-        # Seed a legacy v2 store and manually insert polluted rows as pre-fix v2 would have
-        t0 = dt.datetime(2026, 11, 22, 12, 0, tzinfo=JST).timestamp()
-        with contextlib.closing(sqlite3.connect(db_path)) as c:
-            from ai_house.memory import BASE_INDEXES_SQL, BASE_TABLES_SQL
-
-            c.executescript(BASE_TABLES_SQL + BASE_INDEXES_SQL)
-            c.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?)", (t0,))
-            c.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)", (t0,))
-            c.execute(
-                "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                "VALUES('sora', 'group', 'group', 'fact', 'verified', '群友乱猜房主喜欢香菜', 'auto', 'active', ?, ?)",
-                (t0, t0),
-            )
-            c.execute(
-                "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                "VALUES('sora', 'group', 'group', 'fact', 'verified', '房主确认喜欢黑咖啡', 'owner_verified', 'active', ?, ?)",
-                (t0, t0),
-            )
-            c.execute(
-                "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                "VALUES('sora', 'world', 'world', 'diary', 'verified', '今天的日记内容很好', 'diary', 'active', ?, ?)",
-                (t0, t0),
-            )
-            c.commit()
-
-        st = MemoryStore(db_dir, clock=VirtualClock(t0 + 10))
-        self.addCleanup(st.close)
-        with contextlib.closing(sqlite3.connect(db_path)) as c:
-            c.row_factory = sqlite3.Row
-            max_ver = c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            self.assertEqual(max_ver, SCHEMA_VERSION)
-            rows = {r["text"]: dict(r) for r in c.execute("SELECT * FROM mem").fetchall()}
-        self.assertEqual(rows["群友乱猜房主喜欢香菜"]["kind"], "claim")
-        self.assertEqual(rows["群友乱猜房主喜欢香菜"]["trust"], "group_stated")
-        self.assertEqual(rows["房主确认喜欢黑咖啡"]["kind"], "fact")
-        self.assertEqual(rows["房主确认喜欢黑咖啡"]["trust"], "verified")
-        self.assertEqual(rows["今天的日记内容很好"]["kind"], "diary")
-        self.assertEqual(rows["今天的日记内容很好"]["trust"], "verified")
-
-    def test_b4_out_of_catalog_errand_stays_open_and_ignores_unrelated_purchases(self) -> None:
-        srv = _MockDurianPromiseServer()
-        self.addCleanup(srv.close)
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        t0 = dt.datetime(2026, 11, 22, 14, 0, tzinfo=JST).timestamp()
-        d = HouseDaemon(
-            tmp.name,
-            pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
-            env={
-                "AI_HOUSE_API_KEY": "mock-key",
-                "AI_HOUSE_BASE_URL": srv.base_url,
-                "AI_HOUSE_MODEL": "mock-model",
-            },
-            start_ts=t0,
-            virtual_clock=True,
-            allow_onboarding=False,
-        )
-        self.addCleanup(d.close)
-
-        res = d.converse("private:sora", "今天帮忙买一个榴莲回来吧", owner_speaker("房主"))
-        self.assertTrue(res["replies"])
-        self.assertTrue(srv.tool_results)
-        self.assertEqual(srv.tool_results[0].get("in_catalog"), False)
-        self.assertIn("不在内置超市词表", srv.tool_results[0].get("note", ""))
-
-        durian_rows = [r for r in d.intents.list_intents(actor="sora") if "榴莲" in r["summary"]]
-        self.assertEqual(len(durian_rows), 1)
-        self.assertEqual(durian_rows[0]["kind"], "errand")
-        self.assertFalse(durian_rows[0]["item"])
-        self.assertEqual(durian_rows[0]["raw_item"], "榴莲")
-        self.assertEqual(durian_rows[0]["state"], "open")
-
-        # Also test enqueue_chat fallback without tool calls
-        d.intents.enqueue_chat("sora", "明天记得顺路买两节电池", "好呀", where="group", now=t0 + 10)
-        battery_rows = [r for r in d.intents.list_intents(actor="sora") if "电池" in r["summary"]]
-        self.assertEqual(len(battery_rows), 1)
-        self.assertEqual(battery_rows[0]["raw_item"], "电池")
-        self.assertEqual(battery_rows[0]["state"], "open")
-
-        # Purchasing an unrelated catalog item (onion) MUST NOT close durian or battery!
-        at1 = d.clock.now() + 120
-        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
-            with c:
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 1, ?, ?)",
-                    ("purchased:onion:1", at1, json.dumps({"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2, "at": at1})),
-                )
-        d.intents.sweep(at1)
-
-        after = {r["intent_id"]: r for r in d.intents.list_intents(actor="sora")}
-        self.assertEqual(after[durian_rows[0]["intent_id"]]["state"], "open")
-        self.assertEqual(after[battery_rows[0]["intent_id"]]["state"], "open")
-
-    def test_b5_private_promises_never_merge_across_residents(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        t0 = dt.datetime(2026, 11, 22, 10, 0, tzinfo=JST).timestamp()
         d = HouseDaemon(
             tmp.name,
             pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
@@ -308,71 +188,101 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
             allow_onboarding=False,
         )
         self.addCleanup(d.close)
+        return d
 
-        d.intents.enqueue_chat("sora", "周末一起大扫除整理客厅吧", "好呀", where="private", now=t0)
-        d.intents.enqueue_chat("rin", "周末一起大扫除整理客厅吧", "嗯呐", where="private", now=t0)
+    def test_b4_out_of_catalog_errand_stays_open_and_ignores_unrelated_purchases(self) -> None:
+        """Fails if a promise to buy things the shop does not sell (a durian, batteries) is offered to the kernel as an
+        errand, or is closed by a purchase that belongs to another errand (an onion, or the egg errand's receipt), or
+        if the control breaks: the egg errand in the same house is listed as an errand and its own receipt does close
+        it. (Reminder rows for such items and the `record_promise` tool are gone, dropped items D4 and D2; the
+        "买不了" reply tail is tested in test_realrun_1_promises.)"""
+        t0 = dt.datetime(2026, 11, 22, 14, 0, tzinfo=JST).timestamp()
+        d = self._house(t0)
+        _owner_asks(d, "sora", "今天帮忙买一个榴莲回来吧", "苍空买一个榴莲", t0)
+        _owner_asks(d, "sora", "明天记得顺路买两节电池", "苍空买两节电池", t0 + 10)
+        _owner_asks(d, "sora", "顺便帮家里买2个鸡蛋", "苍空买2个鸡蛋", t0 + 20)
+        before = _states(d, "sora")
+        self.assertEqual(len(before), 3)
+        self.assertEqual(set(before.values()), {"open"})
+        errands = d.intents.errands("sora", t0 + 60)
+        self.assertEqual([(e["item"], e["qty"]) for e in errands], [("egg", 2)])  # only the egg is the kernel's to buy
+        egg = errands[0]
+
+        # Purchasing an unrelated catalog item (onion) MUST NOT close any of them
+        _add_evidence(d, "purchased:onion:1", 1, t0 + 120,
+                      {"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2})
+        d.intents.sweep(t0 + 130)
+        self.assertEqual(_states(d, "sora"), before)
+
+        # control: the egg errand's own receipt closes the egg and only the egg
+        _add_evidence(d, "purchased:egg:1", 2, t0 + 140, _receipt(egg, "sora", t0 + 140, 1))
+        d.intents.sweep(t0 + 150)
+        after = _states(d, "sora")
+        self.assertEqual(after[str(egg["intent"])], "completed")
+        self.assertEqual(sorted(v for k, v in after.items() if k != str(egg["intent"])), ["open", "open"])
+        self.assertEqual(d.intents.errands("sora", t0 + 160), [])
+
+    def test_b5_private_promises_never_merge_across_residents(self) -> None:
+        """Fails if the same owner request made to two residents in private ends up as one promise, if either
+        promise's party holds the other resident, or if a receipt for one resident's errand closes (or counts for)
+        the other's. Control: the receipt does close the resident it belongs to. (`plan_ref` merging is gone, dropped
+        item D1; the guarantee is now kept by the promise row being per resident.)"""
+        t0 = dt.datetime(2026, 11, 22, 10, 0, tzinfo=JST).timestamp()
+        d = self._house(t0)
+        _owner_asks(d, "sora", "顺便帮家里买2个鸡蛋", "苍空买2个鸡蛋", t0)
+        _owner_asks(d, "rin", "顺便帮家里买2个鸡蛋", "凛音买2个鸡蛋", t0 + 1)
 
         sora_rows = d.intents.list_intents(actor="sora")
         rin_rows = d.intents.list_intents(actor="rin")
         self.assertEqual(len(sora_rows), 1)
         self.assertEqual(len(rin_rows), 1)
-        self.assertNotEqual(sora_rows[0]["plan_ref"], rin_rows[0]["plan_ref"])
+        self.assertNotEqual(sora_rows[0]["intent_id"], rin_rows[0]["intent_id"])
         self.assertEqual(sora_rows[0]["party"], ["sora"])
         self.assertEqual(rin_rows[0]["party"], ["rin"])
+        self.assertEqual(sora_rows[0]["visibility"], "private")
+        sora_errand = d.intents.errands("sora", t0 + 60)[0]
+        rin_errand = d.intents.errands("rin", t0 + 60)[0]
+        self.assertEqual((sora_errand["account"], rin_errand["account"]), ("sora", "rin"))
 
-        # Completing sora's private promise via plan_finished leaves rin's open
-        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
-            with c:
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 11, ?, ?)",
-                    ("plan_finished:sora", t0 + 60, json.dumps({"kind": "plan_finished", "actor": "sora", "outcome": "done", "at": t0 + 60})),
-                )
-        d.intents.sweep(t0 + 60)
+        # Completing sora's private promise by her receipt leaves rin's open
+        _add_evidence(d, "purchased:egg:sora", 11, t0 + 60, _receipt(sora_errand, "sora", t0 + 60, 1))
+        d.intents.sweep(t0 + 70)
         self.assertEqual(d.intents.list_intents(actor="sora")[0]["state"], "completed")
         self.assertEqual(d.intents.list_intents(actor="rin")[0]["state"], "open")
+        self.assertEqual(len(d.intents.errands("rin", t0 + 80)), 1)
 
-    def test_b6_outing_departed_and_sleep_dialogue_never_false_close(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # and a receipt made out to rin's errand but carrying sora's name does not close hers either
+        stray = dict(_receipt(rin_errand, "sora", t0 + 90, 2))
+        _add_evidence(d, "purchased:egg:stray", 12, t0 + 90, stray)
+        d.intents.sweep(t0 + 100)
+        self.assertEqual(d.intents.list_intents(actor="rin")[0]["state"], "open")
+        _add_evidence(d, "purchased:egg:rin", 13, t0 + 110, _receipt(rin_errand, "rin", t0 + 110, 3))  # control
+        d.intents.sweep(t0 + 120)
+        self.assertEqual(d.intents.list_intents(actor="rin")[0]["state"], "completed")
+
+    def test_b6_wrong_place_departure_and_sleep_dialogue_never_false_close(self) -> None:
+        """Fails if a departure alone, an arrival at the wrong place, or a script line about sleeping closes a
+        promise, or if the promise to sleep early (words the kernel cannot verify) is closed by anything the kernel
+        writes, even a real sleep activity. Control in the same scenario: a real arrival at the library closes the
+        library promise. (Kind-based closing, the 'outing' / 'chat_promise' kinds and the fixed 24 h life are gone,
+        dropped items D1 and D6; the old case also expected the structured sleep activity to close the sleep
+        promise, which the shared rules do not do: words they cannot compile stay open until people say so or time
+        runs out.)"""
         t0 = dt.datetime(2026, 11, 22, 15, 0, tzinfo=JST).timestamp()
-        d = HouseDaemon(
-            tmp.name,
-            pack_dir=str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3"),
-            env={},
-            start_ts=t0,
-            virtual_clock=True,
-            allow_onboarding=False,
-        )
-        self.addCleanup(d.close)
-
-        d.intents.enqueue_chat(
-            "sora",
-            "下午去图书馆借书吧",
-            "好呀",
-            where="private",
-            intents=[{"text": "去图书馆借书", "kind": "outing", "答应了的": ["sora"]}],
-            now=t0,
-        )
-        d.intents.enqueue_chat(
-            "sora",
-            "今晚早点睡哦",
-            "嗯，今晚早点睡",
-            where="private",
-            intents=[{"text": "今晚早点睡", "kind": "chat_promise", "答应了的": ["sora"]}],
-            now=t0,
-        )
+        d = self._house(t0)
+        _owner_asks(d, "sora", "下午去图书馆吧", "苍空去图书馆", t0)
+        _owner_asks(d, "sora", "今晚早点睡哦", "苍空今晚早点睡", t0 + 10)
+        before = _states(d, "sora")
+        self.assertEqual(len(before), 2)
+        self.assertEqual(set(before.values()), {"open"})
 
         # 1) departed alone + arrived at supermarket (wrong place) + script dialogue mentioning "睡" must NOT close either!
+        _add_evidence(d, "departed:1", 20, t0 + 30, {"kind": "departed", "actor": "sora", "place": "place:library",
+                                                    "plan_id": "plan-lib"})
+        _add_evidence(d, "arrived:market", 21, t0 + 40, {"kind": "arrived", "actor": "sora", "place": "place:supermarket",
+                                                        "plan_id": "plan-lib"})
         with contextlib.closing(sqlite3.connect(d.world_db)) as c:
             with c:
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 20, ?, ?)",
-                    ("departed:1", t0 + 30, json.dumps({"kind": "departed", "actor": "sora", "place": "图书馆", "at": t0 + 30})),
-                )
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 21, ?, ?)",
-                    ("arrived:market", t0 + 40, json.dumps({"kind": "arrived", "actor": "sora", "place": "supermarket", "at": t0 + 40})),
-                )
                 cols = {r[1] for r in c.execute("PRAGMA table_info(script)").fetchall()}
                 if "created" in cols:
                     c.execute(
@@ -385,25 +295,18 @@ class ReviewBatchBEvidenceTests(unittest.TestCase):
                         (t0 + 50, json.dumps(["sora"]), "我现在还不困，先不想睡觉呢。"),
                     )
         d.intents.sweep(t0 + 60)
-        mid = {r["kind"]: r for r in d.intents.list_intents(actor="sora")}
-        self.assertEqual(mid["outing"]["state"], "open")
-        self.assertEqual(mid["chat_promise"]["state"], "open")
+        self.assertEqual(_states(d, "sora"), before)
 
-        # 2) Real arrived at library + structured sleep activity DO close them
-        with contextlib.closing(sqlite3.connect(d.world_db)) as c:
-            with c:
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 22, ?, ?)",
-                    ("arrived:lib", t0 + 120, json.dumps({"kind": "arrived", "actor": "sora", "place": "library", "at": t0 + 120})),
-                )
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', 23, ?, ?)",
-                    ("act:sleep", t0 + 180, json.dumps({"kind": "activity", "actor": "sora", "activity": "sleep", "at": t0 + 180})),
-                )
-        d.intents.sweep(t0 + 180)
-        done = {r["kind"]: r for r in d.intents.list_intents(actor="sora")}
-        self.assertEqual(done["outing"]["state"], "completed")
-        self.assertEqual(done["chat_promise"]["state"], "completed")
+        # 2) Real arrival at the library closes the library promise; a structured sleep activity closes nothing
+        _add_evidence(d, "arrived:lib", 22, t0 + 120, {"kind": "arrived", "actor": "sora", "place": "place:library",
+                                                       "plan_id": "plan-lib"})
+        _add_evidence(d, "act:sleep", 23, t0 + 180,
+                      {"kind": "activity", "actor": "sora", "activity": "sleep", "place": "room_sora", "outcome": "succeeded",
+                       "started_at": t0 + 100, "ended_at": t0 + 180, "plan_id": "plan-sleep"})
+        d.intents.sweep(t0 + 190)
+        done = _states(d, "sora")
+        lib_id, sleep_id = sorted(before, key=int)  # the promises were made in this order
+        self.assertEqual(done, {lib_id: "completed", sleep_id: "open"})
 
 
 if __name__ == "__main__":

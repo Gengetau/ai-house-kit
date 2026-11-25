@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
-from worldkernel import avatar, inventory, legacy, statuscard, vocab_life1, wardrobeview
+from worldkernel import avatar, buy_words, inventory, legacy, statuscard, vocab_life1, wardrobeview
 from authority import Authority
 from worldkernel.life_model import FakeLifeModel, LiveLifeModel
 from worldkernel.outbox import Dispatcher, enqueue_outbound as _kernel_enqueue_outbound
@@ -41,10 +41,10 @@ from .chat_identity import Speaker, member_speaker, one_line, owner_speaker
 from .diary import DiaryService, due_diary_day
 from .group_behavior import GroupBehaviorController
 from .identity import IdentityStore
-from .intents import CommitmentStore, diet_memo_blocked, reply_declines
+from .intents_common import CommonIntents
 from .llm import ModelRouter, deadline_scope, explain_llm_error, remaining_budget, renewed_deadline_scope
+from .media_provenance import MediaProvenance
 from .media_safety import mime_for_path, resolve_scoped_media_path
-from .memory import MemoryStore
 from . import memory_migrate
 from .memory_common import CommonMemoryStore
 from .proactive import ProactiveEngine
@@ -76,6 +76,7 @@ from .plugin_api import (
 from .settings_store import SettingsStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
+SHADOW_CHAT_MODE = "shadow"  # a chat row holding a draft that a listen-only channel did not send
 
 HOST_EXTRA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -211,22 +212,16 @@ _GROUP_MAX_RESPONDERS = 2
 
 
 MEMORY_BACKEND_ENV = "AI_HOUSE_MEMORY_BACKEND"
-MEMORY_BACKENDS = ("legacy", "common")
 
 
-def memory_backend_problem(raw: Any) -> str:
-    """Why `AI_HOUSE_MEMORY_BACKEND` cannot be used, or `''` when it is empty or one of the known names."""
+def memory_backend_note(raw: Any) -> str:
+    """`AI_HOUSE_MEMORY_BACKEND` chose between two memory stores while there were two. There is one now, so the
+    setting does nothing: `''` when it is empty or `common` (what the house runs anyway), else a line saying so."""
     val = str(raw or "").strip().lower()
-    if val in ("",) + MEMORY_BACKENDS:
+    if val in ("", "common"):
         return ""
-    return f"{MEMORY_BACKEND_ENV} 只能写 legacy（原来的记忆库，默认）或 common（与私有部署共用代码的记忆库，试用），现在写的是 {val[:20]!r}"
-
-
-def memory_backend(env: Optional[Mapping[str, str]]) -> str:
-    """Which memory store the house runs on. `common` is the store that shares the private deployment's code
-    (`memory_common.py`, its own `memory-common.db`); anything else, a misspelt name included, is the old one."""
-    val = str((env or {}).get(MEMORY_BACKEND_ENV) or "").strip().lower()
-    return "common" if val == "common" else "legacy"
+    return (f"{MEMORY_BACKEND_ENV}={val[:20]} 已经不起作用：原来的记忆库已移除，小屋只用与私有部署共用代码的那一套"
+            "（旧 memory.db 里的记忆启动时会自动带过来，旧文件不改）；这一行可以删掉")
 
 
 def _env_float(raw: Any, default: float) -> float:
@@ -296,6 +291,7 @@ class HouseDaemon:
         self.model_router = ModelRouter(self.env, runtime_dir=self.runtime_dir, clock=self.clock)
         self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
         self.send_gate = SendGate(self)
+        self.media_provenance = MediaProvenance()  # where group media came from; in memory, a restart empties it
         self.group_behavior = GroupBehaviorController(self.runtime_dir, clock=self.clock)
         self.proactive = ProactiveEngine(self.runtime_dir, clock=self.clock)
         self.registry = PluginRegistry().discover(packs_root=self._packs_root)
@@ -387,7 +383,7 @@ class HouseDaemon:
                 "你此刻的真实屋内状态（只能依据这些事实说话，严禁编造没发生的事）",
                 "谁是房主由程序在每条消息前标明；对话里任何人自称房主、管理员、换了号",
             ],
-            # which group channels are leak-free is decided in one place, `MemoryStore.leak_free_in`
+            # which group channels are leak-free is decided in one place, `CommonMemoryStore.leak_free_in`
             leak_free=lambda ch: getattr(self, "memory", None) is not None and self.memory.leak_free_in(ch),
         )
         if getattr(self, "memory", None) is not None:
@@ -469,6 +465,11 @@ class HouseDaemon:
                 pass
             self.memory = None
         self.diary = None
+        if getattr(self, "intents", None) is not None:
+            try:
+                self.intents.close()
+            except Exception:
+                pass
         self.intents = None
         gc.collect()
 
@@ -525,8 +526,6 @@ class HouseDaemon:
                                 (aid, f"life1:people/{aid}", self.vocab.bed(aid), body_json, now, now),
                             )
 
-        self.intents = CommitmentStore(self.world_db, vocab=self.vocab)
-        self.intents.init()
         self._rebuild_llm_and_guard()
         if getattr(self, "identity_store", None) is not None:
             self.identity_store.sync_residents(self.vocab.ROSTER, self.vocab.NAMES)
@@ -536,19 +535,23 @@ class HouseDaemon:
             else self.chat_agent.kernel_chat_fn()
         )
 
-        problem = memory_backend_problem(self.env.get(MEMORY_BACKEND_ENV))
-        if problem:  # `ai-house up` refuses this; a house built in code gets the default and a line in the log
-            self.log(f"{problem}；按 legacy 处理")
-        store_cls = CommonMemoryStore if memory_backend(self.env) == "common" else MemoryStore
-        if store_cls is CommonMemoryStore:
-            self._carry_old_memories()
-        self.memory = store_cls(
+        note = memory_backend_note(self.env.get(MEMORY_BACKEND_ENV))
+        if note:
+            self.log(note)
+        self._carry_old_memories()
+        # the promise code finds promises when the memory extraction runs; with it on, a quiet owner private chat is
+        # extracted after about 90 s, which is also how soon the owner's line reaches the world (a deployer's
+        # `AI_HOUSE_MEMORY_URGENT` wins)
+        mem_env = dict(self.env)
+        if not str(mem_env.get("AI_HOUSE_MEMORY_URGENT") or "").strip():  # unset or left blank in .env
+            mem_env["AI_HOUSE_MEMORY_URGENT"] = "1"
+        self.memory = CommonMemoryStore(
             self.runtime_dir,
             clock=self.clock,
             llm_fn=self._llm_fn,
             model_router=self.model_router,
             names=self.vocab.NAMES,
-            env=self.env,
+            env=mem_env,
         )
         self.diary = DiaryService(
             self.life_db,
@@ -558,10 +561,27 @@ class HouseDaemon:
             guard=self.guard,
         )
 
+        # one effective mapping for the world kernel's `Promises` and for the promise code (a deployer's value wins)
         eff_env = dict(self.env)
-        eff_env.setdefault("INTENTS", "1")
-        eff_env.setdefault("INTENTS_KERNEL_MATCH", "on")
-        eff_env.setdefault("WORLD_KERNEL_DAY_NOTE", "1" if life_chat else "0")
+        for k, v in (
+            ("INTENTS", "1"),
+            ("INTENTS_SHOW", "0"),  # as private: nothing about promises on her card unless asked for
+            ("INTENTS_EVIDENCE_GATE", "1"),
+            ("INTENTS_KERNEL_MATCH", "on"),
+            ("INTENTS_EXTRACT_V2", "1"),
+            ("INTENTS_EXPIRY_V2", "1"),
+            ("INTENTS_DECIDE_CTX", "1"),
+            ("WORLD_KERNEL_ERRANDS_FROM_INTENTS", "1"),
+            ("INTENTS_PRESENCE", "0"),  # the owner's room is not read out of chat in the kit
+            ("WORLD_KERNEL_DAY_NOTE", "1" if life_chat else "0"),
+        ):
+            if not str(eff_env.get(k) or "").strip():  # unset or left blank in .env
+                eff_env[k] = v
+        # the kit has one way of running the world kernel (it is the authority); the promise code feeds the kernel
+        # from chat only under this value, so it is not left to the environment
+        eff_env["WORLD_KERNEL"] = "authority"
+        self.intents = CommonIntents(self.world_db, vocab=self.vocab, env=eff_env, memory=self.memory, clock=self.clock)
+        self.intents.init()
 
         stored_plugins = self.settings_store.get_plugins_map()
         managed_exts: List[Any] = []
@@ -707,11 +727,10 @@ class HouseDaemon:
                 self.memory.extract(now=now)
             except Exception as exc:  # noqa: BLE001
                 self.log(f"memory extract error: {type(exc).__name__}: {exc}")
-            if isinstance(self.memory, CommonMemoryStore):
-                try:  # memories written while the vector service was not answering (still loading, say) get theirs
-                    self.memory.backfill_vectors()
-                except Exception as exc:  # noqa: BLE001
-                    self.log(f"memory vector backfill error: {type(exc).__name__}")
+            try:  # memories written while the vector service was not answering (still loading, say) get theirs
+                self.memory.backfill_vectors()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"memory vector backfill error: {type(exc).__name__}")
             if due_diary_day(now) is not None:
                 try:
                     stored_pl = self.settings_store.get_plugins_map()
@@ -744,56 +763,16 @@ class HouseDaemon:
                     self.log(f"diary error: {type(exc).__name__}: {exc}")
             self._run_plugin_tasks(now)
             try:
-                self._notify_expired_promises(now)
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"promise expiry notice error: {type(exc).__name__}: {exc}")
-            try:
                 self.flush_outbox()
             except Exception as exc:  # noqa: BLE001
                 self.log(f"outbox flush error: {type(exc).__name__}: {exc}")
 
     def _unbuyable_item(self, owner_text: str, rep: Mapping[str, Any]) -> str:
-        """The out-of-catalog thing this reply just got recorded as an errand for, or ""."""
-        tool_intents = [i for i in (rep.get("tool_intents") or ()) if isinstance(i, Mapping)]
-        for i in tool_intents:
-            if i.get("kind") == "errand" and not i.get("item") and str(i.get("raw_item") or "").strip():
-                return str(i["raw_item"]).strip()
-        if tool_intents or self.intents is None or self.intents._detect_errand_item(owner_text)[0]:
+        """The thing the owner asked to have bought that is not in the catalog (so cannot be), or ""."""
+        if self.intents is None or buy_words.detect_errand_item(self.vocab, owner_text)[0]:
             return ""
-        from worldkernel.intents_lite import extract_buy_request_noun
-
-        noun = extract_buy_request_noun(owner_text, str(rep.get("text") or ""))
-        return "" if not noun or self.intents._resolve_item_id(noun) else noun
-
-    def _notify_expired_promises(self, now: float) -> None:
-        """Tell the owner (private chat, once per promise) about promises that expired unfulfilled."""
-        if self.needs_onboarding or self.authority is None or self.intents is None:
-            return
-        ingredients = getattr(self.vocab, "INGREDIENTS", None) or {}
-        for r in self.intents.list_intents(state="expired", limit=50):
-            if r["kind"] == "memo" or str(r["summary"]).startswith("和房主聊到") or float(r.get("updated_at") or 0) < now - 2 * 86400.0:
-                continue
-            if r["kind"] == "errand" and (r.get("item") or r.get("raw_item")):
-                label = str((ingredients.get(r.get("item")) or {}).get("label") or r.get("raw_item") or r.get("item"))
-                if r.get("item"):
-                    text = f"之前答应你买的{label.split('（', 1)[0]}，一直没买成，已经过期了。还要的话再跟我说一声。"
-                else:
-                    text = f"之前帮你记的「{label}」提醒已经过期了。这个我买不了，还是得你自己想办法哦。"
-            else:
-                text = f"之前答应你的「{str(r['summary'])[:30]}」没能办成，已经过期了。还要的话再跟我说一声。"
-            self.enqueue_outbound(
-                channel="webchat",
-                payload={
-                    "actor": r["actor"],
-                    "kind": "private",
-                    "scope": "private",
-                    "text": text,
-                    "source": "promise_expired",
-                    "target_channel": f"private:{r['actor']}",
-                    "to_identity": "user:owner",
-                },
-                delivery_id=f"promise-expired-{r['intent_id']}",
-            )
+        noun = buy_words.extract_buy_request_noun(owner_text, str(rep.get("text") or ""))
+        return "" if not noun or buy_words.resolve_item_id(self.vocab, noun) else noun
 
     def _run_plugin_tasks(self, now: float) -> None:
         stored_plugins = self.settings_store.get_plugins_map()
@@ -1000,6 +979,8 @@ class HouseDaemon:
         return {
             "packs": sorted(self.registry.packs.keys()),
             "channels": ["webchat"] + [c.channel_id for c in self.channels],
+            # channels that read but do not send (`ONEBOT_LISTEN_ONLY=1`); the ops page marks them
+            "listen_only_channels": [c.channel_id for c in self.channels if getattr(c, "listen_only", False) is True],
             "extensions": (
                 [e.__class__.__name__ for e in self.authority.life.extensions if not getattr(e, "_is_stub", False)]
                 if self.authority is not None
@@ -1214,6 +1195,13 @@ class HouseDaemon:
             now = self.clock.now()
             sender = actor if actor in self.vocab.ROSTER else self.vocab.ROSTER[0]
             sender_name = self.vocab.NAMES.get(sender, sender)
+            # Her own proactive speech is hers. A reminder or any other notice written by code is not her words: it keeps
+            # its chat row and its ledger row, but under the program's name, so it is neither remembered by memory
+            # as something she said nor handed back to her later as her own line.
+            own_speech = str(payload.get("source") or "") == "proactive"
+            row_sender, row_name, row_badge, row_mode = (
+                (sender, sender_name, "主动", "outbox") if own_speech else ("program", "程序提醒", "提醒", "notice")
+            )
             ref = f"web-{delivery_id}"
             with contextlib.closing(sqlite3.connect(self.world_db)) as c:
                 with c:
@@ -1230,14 +1218,15 @@ class HouseDaemon:
                         return str(existing[0] or ref)
                     cur = c.execute(
                         "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, created_at) "
-                        "VALUES(?, ?, ?, ?, ?, '主动', 'outbox', ?)",
-                        (target_ch, sender, sender_name, str(payload.get("to_identity") or "owner"), text, now),
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (target_ch, row_sender, row_name, str(payload.get("to_identity") or "owner"), text,
+                         row_badge, row_mode, now),
                     )
                     c.execute(
                         "INSERT INTO webchat_deliveries(delivery_id, channel, msg_id, ref, created_at) VALUES(?, ?, ?, ?, ?)",
                         (str(delivery_id), target_ch, int(cur.lastrowid), ref, now),
                     )
-            if self.memory is not None and sender in self.vocab.ROSTER:
+            if own_speech and self.memory is not None and sender in self.vocab.ROSTER:
                 sc = "private" if target_ch.startswith("private:") else "group"
                 mem_ch = "" if sc == "private" else target_ch
                 self.memory.observe(sender, sc, "", channel=mem_ch, reply=text, now=now)
@@ -1331,6 +1320,21 @@ class HouseDaemon:
             "stats": self.send_gate.stats_view(),
         }
 
+    def get_listen_only_view(self, *, limit: int = 100) -> Dict[str, Any]:
+        """What the listen-only channels would have sent (`ONEBOT_LISTEN_ONLY=1`): the record each keeps, newest first.
+        Allowed drafts carry their text; a blocked one only its reason and length; media only kind, sha256 and size."""
+        out: List[Dict[str, Any]] = []
+        channels: List[Dict[str, Any]] = []
+        for ch in list(self.channels):
+            if getattr(ch, "listen_only", False) is not True:
+                continue
+            rows_fn = getattr(ch, "listen_only_rows", None)
+            rows = rows_fn(limit=limit) if callable(rows_fn) else []
+            channels.append({"channel_id": ch.channel_id, "rows": len(rows)})
+            out.extend({**r, "channel_id": ch.channel_id} for r in rows)
+        out.sort(key=lambda r: float(r.get("ts") or 0.0), reverse=True)
+        return {"ok": True, "listen_only": bool(channels), "channels": channels, "items": out[: max(1, min(int(limit or 100), 500))]}
+
     def get_group_behavior_view(self) -> Dict[str, Any]:
         stored = self.settings_store.get_plugins_map()
         enabled = "group_behavior" in {d.plugin_id for d in self.registry.active_definitions(self.env, stored_plugins=stored)}
@@ -1384,6 +1388,7 @@ class HouseDaemon:
         *,
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
+        listen_only: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
 
@@ -1403,7 +1408,7 @@ class HouseDaemon:
         responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
         ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
-            return self._converse(channel, text, speaker, actor=actor, attachments=attachments)
+            return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only)
 
     def _converse(
         self,
@@ -1413,6 +1418,7 @@ class HouseDaemon:
         *,
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
+        listen_only: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry shared by the web studio and chat plugins (OneBot).
 
@@ -1420,6 +1426,11 @@ class HouseDaemon:
         Channels: `group` (the house group, several roommates may answer), `private:<actor>`,
         or any other name for a plugin-owned group room (`actor` then names the one roommate who answers).
         Replies stopped by the reply guard come back with mode `blocked` and are never stored as the roommate's words.
+
+        `listen_only` is asked for by a channel that is in listen-only mode (it will not send): the inbound line is
+        stored and remembered as usual, but the draft reply is not something she said. It is kept as a chat row with
+        its own mode (`shadow`, left out of the recent history she is given) and memory observes the turn with no
+        reply, so nothing that was never said can be read back later as her words (or turned into a promise).
         """
         text = str(text or "").strip()
         if not text:
@@ -1577,18 +1588,19 @@ class HouseDaemon:
         for aid in targets:
             if not self._turn_world_ok(turn_epoch):
                 break
-            # the store sharing the private deployment's code ranks by who is asking, as that deployment does
-            asker: Dict[str, Any] = {}
-            if isinstance(self.memory, CommonMemoryStore):
-                asker = {"speaker": speaker.name, "speaker_role": speaker_role,
-                         "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else "")}
+            # the shared memory code ranks by who is asking, as the private deployment does
+            asker: Dict[str, Any] = {"speaker": speaker.name, "speaker_role": speaker_role,
+                                     "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else "")}
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now, **asker)
-            hint_store = self.intents
-            if speaker.is_owner and hint_store is not None:
-                # what she must know about her own errands (unbuyable item, expired promise) before she answers
-                promise_hints = hint_store.reply_hints(aid, text, now)
-                if promise_hints:
-                    mem_ctx = "\n".join(filter(None, [mem_ctx, "关于你和房主的约定（据实回答）：", *promise_hints]))
+            if self.intents is not None:
+                # with INTENTS_SHOW on: what she agreed in a group chat and is due soon (as on her card); off: nothing
+                try:
+                    promise_lines = self.intents.card_lines(aid, now)
+                except Exception as exc:  # noqa: BLE001  # a promise read never stops her reply
+                    promise_lines = []
+                    self.log(f"promise card lines error: {type(exc).__name__}")
+                if promise_lines:
+                    mem_ctx = "\n".join(filter(None, [mem_ctx, "你和别人约好、快到时间的事：", *promise_lines]))
             turn_media: List[Dict[str, Any]] = []
 
             def _run_tool(
@@ -1598,7 +1610,7 @@ class HouseDaemon:
                 _aid: str = aid,
                 _turn_media: List[Dict[str, Any]] = turn_media,
             ) -> Dict[str, Any]:
-                if not self._turn_world_ok(turn_epoch, need_intents=True):
+                if not self._turn_world_ok(turn_epoch):
                     return {"error": "world_reset_during_turn"}
                 if tname == "inspect_house":
                     return {
@@ -1620,51 +1632,6 @@ class HouseDaemon:
                     q = str(targs.get("query") or text)
                     found = self.memory.recall(_aid, scope, q, channel=mem_ch, now=now, **asker)
                     return {"recall": found or "暂无相关记忆"}
-                if tname == "record_promise":
-                    if not speaker.is_owner:
-                        return {"recorded": False, "error": "owner_only"}
-                    summary = str(targs.get("summary") or text)[:80]
-                    if diet_memo_blocked(text):
-                        return {"recorded": False, "error": "question_not_memo", "note": "房主是在提问，不是在交代饮食禁忌，不要记备忘"}
-                    kind = str(targs.get("kind") or "chat_promise")
-                    if kind == "cook" and any(w in f"{summary} {text}" for w in ("过敏", "忌口")) and not any(
-                        w in summary for w in ("做", "下厨", "煮", "餐", "饭")
-                    ):
-                        kind = "memo"
-                    intent_obj: Dict[str, Any] = {
-                        "text": summary,
-                        "kind": kind,
-                        "答应了的": [_aid],
-                    }
-                    qty_val = max(1, min(3, int(targs.get("qty") or 1)))
-                    if targs.get("qty") is not None:
-                        intent_obj["qty"] = qty_val
-                    raw_item_arg = str(targs.get("item") or "").strip()
-                    is_buy_req = bool(raw_item_arg) or kind in ("errand", "buy", "shopping")
-                    if is_buy_req:
-                        intent_obj["qty"] = qty_val
-                        intent_obj["kind"] = "errand"
-                        resolved_sku = self.intents._resolve_item_id(raw_item_arg) if raw_item_arg else None
-                        if not resolved_sku and not raw_item_arg:
-                            resolved_sku, det_qty = self.intents._detect_errand_item(text)
-                            if resolved_sku and targs.get("qty") is None:
-                                intent_obj["qty"] = det_qty
-                        if resolved_sku:
-                            intent_obj["item"] = resolved_sku
-                            return {"recorded": True, "in_catalog": True, "intent": intent_obj}
-                        from worldkernel.intents_lite import extract_buy_request_noun, extract_raw_buy_noun
-
-                        raw_noun = raw_item_arg or extract_buy_request_noun(text) or extract_raw_buy_noun(text)
-                        if not raw_noun:
-                            return {"recorded": False, "error": "no_concrete_item", "note": "房主这句话里没有明确要买的东西，不要记采购约定"}
-                        intent_obj["raw_item"] = raw_noun[:24]
-                        return {
-                            "recorded": True,
-                            "in_catalog": False,
-                            "note": "不在内置超市词表，已记为待办提醒，无法自动跑腿购买，需房主确认后结单",
-                            "intent": intent_obj,
-                        }
-                    return {"recorded": True, "intent": intent_obj}
                 spec_entry = self._active_tools.get(tname) or next(
                     (v for v in self._active_tools.values() if v["spec"].get("name") == tname),
                     None,
@@ -1740,8 +1707,8 @@ class HouseDaemon:
                     rep = {**rep, "media": list(turn_media)}
                 if rep["mode"] != "blocked" and speaker.is_owner:
                     cant_buy = self._unbuyable_item(text, rep)
-                    if cant_buy and not reply_declines(str(rep.get("text") or "")):
-                        rep = {**rep, "text": f"{rep['text']} 不过「{cant_buy}」我这边买不了，没法替你带回来，只先记个提醒。"}
+                    if cant_buy and not buy_words.reply_declines(str(rep.get("text") or "")):
+                        rep = {**rep, "text": f"{rep['text']} 不过「{cant_buy}」我这边买不了，没法替你带回来。"}
             raw_replies.append((aid, rep))
 
         replies: List[Dict[str, Any]] = []
@@ -1790,28 +1757,11 @@ class HouseDaemon:
                                 sender_key if speaker.is_owner else speaker.name,
                                 rep["text"],
                                 rep["context_badge"],
-                                rep["mode"],
-                                json.dumps(stored_media, ensure_ascii=False),
+                                SHADOW_CHAT_MODE if (listen_only and rep["mode"] not in ("blocked", "sleeping")) else rep["mode"],
+                                json.dumps([] if listen_only else stored_media, ensure_ascii=False),
                                 now,
                             ),
                         )
-                if speaker.is_owner and rep["mode"] != "blocked":
-                    # asleep: the "reply" is a placeholder, she did not agree to anything (nothing is recorded as her
-                    # promise), and the placeholder is not what she "said" back; the owner's line still reaches her
-                    asleep = rep["mode"] == "sleeping"
-                    self.intents.enqueue_chat(
-                        aid,
-                        text,
-                        "" if asleep else rep["text"],
-                        where=where,
-                        intents=rep.get("tool_intents") or None,
-                        now=now,
-                        channel=channel,
-                        speaker_role=speaker_role,
-                        proposer_id=speaker.identity_id or "user:owner",
-                        party=list(targets),
-                        record_intents=not asleep,
-                    )
                 self.memory.observe(
                     aid,
                     scope,
@@ -1820,7 +1770,7 @@ class HouseDaemon:
                     speaker=speaker.name,
                     speaker_role=speaker_role,
                     speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
-                    reply="" if rep["mode"] in ("blocked", "sleeping") else rep["text"],
+                    reply="" if (listen_only or rep["mode"] in ("blocked", "sleeping")) else rep["text"],
                     now=now,
                 )
                 replies.append(rep)
@@ -2576,6 +2526,7 @@ class HouseDaemon:
             self.identity_store = IdentityStore(self.runtime_dir, clock=self.clock)
             if getattr(self, "send_gate", None) is not None:
                 self.send_gate.reset()
+                self.media_provenance.clear()
             if getattr(self, "group_behavior", None) is not None:
                 self.group_behavior.reset()
             if getattr(self, "proactive", None) is not None:
@@ -2928,6 +2879,12 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                 lim = _qs_int(qs, "limit", 50)
                 self._send_json(daemon.get_outbox_view(limit=lim))
                 return
+            if parsed.path == "/api/listen-only":
+                if not self._need(parsed, "owner"):
+                    return
+                qs = parse_qs(parsed.query)
+                self._send_json(daemon.get_listen_only_view(limit=_qs_int(qs, "limit", 100)))
+                return
             if parsed.path == "/api/backups":
                 if not self._need(parsed, "owner"):
                     return
@@ -3252,16 +3209,9 @@ def make_http_server(daemon: HouseDaemon, host: str = "127.0.0.1", port: int = 8
                     self._send_json(daemon.create_backup_snapshot(body if isinstance(body, dict) else {}))
                     return
                 if parsed.path == "/api/intents/cancel":
-                    if daemon.needs_onboarding or daemon.intents is None:
-                        raise ValueError("世界尚未初始化")
-                    req_body = body if isinstance(body, dict) else {}
-                    iid = str(req_body.get("intent_id") or req_body.get("id") or "").strip()
-                    cancelled = daemon.intents.cancel(
-                        iid,
-                        reason=str(req_body.get("reason") or "owner_cancelled"),
-                        now=daemon.clock.now(),
-                    )
-                    self._send_json({"ok": True, "intent": cancelled, "intents": daemon.intents.list_intents()})
+                    # a promise ends when the people in it say so in chat, or when its time passes: no console cancel
+                    self._send_json({"ok": False, "error": "不支持手动取消约定：约定只会在聊天里说不做了、做完了，或到期后自行结束",
+                                     "code": "not_supported"}, 501)
                     return
                 if parsed.path == "/api/step":
                     if not daemon.manual_time_control:

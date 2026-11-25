@@ -157,6 +157,19 @@ def why(kind):
     return WHY.get(kind, WHY.get(kind.split(":", 1)[0], ""))
 
 
+# residents never picked from the public shelf in a real run; free time now points at it, but only
+# when she actually has shelf_picks to choose from, so an empty shelf never sends her to an asset id that isn't there
+SHELF_HINT = "也可以去公共货架（shelf_picks）挑一件喜欢的衣服或套装，用 pick_shelf_garment 收进自己衣柜，再换上。"
+
+
+def reason_words(kind, life):
+    """why(kind), plus the shelf hint on free time when this life view carries shelf_picks."""
+    words = why(kind)
+    if kind.split(":", 1)[0] == "free_time" and (life or {}).get("shelf_picks"):
+        words += SHELF_HINT
+    return words
+
+
 def life_format(me, life):
     room = V.bed(me)
     meal = bool(life.get("meal"))
@@ -243,8 +256,9 @@ class LiveLifeModel:
         seen['items_here'] = list(grouped.values())
         seen["life"] = life
         kind = ctx.get("decision") or ""
+        reason = reason_words(kind, life)
         user = (f"你现在的情况：\n{json.dumps(seen, ensure_ascii=False)}\n让你想一想的原因：{kind}"
-                + (f"——{why(kind)}" if why(kind) else "") + "\n\n" + life_format(me, life))
+                + (f"——{reason}" if reason else "") + "\n\n" + life_format(me, life))
         text, tokens = _invoke_chat(self.chat, system, user, me)
         steps, unusable = read_answer(text)
         out = {"steps": steps[:4], "latency": 0, "tokens": tokens}

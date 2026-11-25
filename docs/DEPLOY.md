@@ -115,7 +115,7 @@ journalctl -u ai-house -f
 
 `compose.yaml` 默认带一个 `embedding` 容器：CPU 上跑的小模型（`BAAI/bge-small-zh-v1.5`，由 `fastembed` 0.7.3 提供），不需要密钥，不发布端口，只有同一个 compose 里的小屋连得到。有了它，住客能按意思而不只是按字面想起事情，发到群里之前对“换个说法把私聊内容说出去”的检查也更严。
 
-- **现在只有新记忆库会用它**（`.env` 里写 `AI_HOUSE_MEMORY_BACKEND=common`，目前仍是试用）。默认的旧记忆库不读这个地址，行为不变：它的门槛不是对着这个模型调的，实测接上后会把不相关的记忆也带出来。
+- 小屋的记忆库会自动用它，不用配置。用 `ai-house doctor` 能看到记忆现在指向哪个向量服务；加 `--embed-ping` 会实际问它一次（只发一个固定的词），告诉你它是答复正常、模型还在加载，还是连不上。
 - 模型在第一次用到时才下载和加载：下载约 100MB，存在命名卷 `embedding-models` 里，之后不再联网。没用到时容器只占十几 MB 内存，加载后约 170MB（实测）。
 - 它没起来、还在加载或下载失败时，小屋照常运行，记忆按关键词回想；之后每次用到会再试，期间写下的记忆过后会补上向量。
 - 下载默认走 `huggingface.co`。连不上时在 `.env` 里写 `HF_ENDPOINT=<镜像地址>` 再 `docker compose up -d`。
@@ -136,7 +136,7 @@ python3 -m venv /opt/ai-house-embedding
 EMBEDDING_CACHE=/var/lib/ai-house/embedding-models /opt/ai-house-embedding/bin/python deploy/embedding/server.py
 ```
 
-它默认只听 `127.0.0.1:7998`。然后在小屋的环境里写 `AI_HOUSE_MEMORY_EMBED_URL_DEFAULT=http://127.0.0.1:7998`（用这个名字而不是 `AI_HOUSE_MEMORY_EMBED_URL`：前者只有新记忆库会读，而且不会把模型的 API Key 带给它）。要常驻的话照 1.2 的模板另写一个 systemd 单元。
+它默认只听 `127.0.0.1:7998`。然后在小屋的环境里写 `AI_HOUSE_MEMORY_EMBED_URL_DEFAULT=http://127.0.0.1:7998`（用这个名字而不是 `AI_HOUSE_MEMORY_EMBED_URL`：前者是给“自带的、不要钥匙的服务”用的，小屋不会把模型的 API Key 带给它）。要常驻的话照 1.2 的模板另写一个 systemd 单元。
 
 ## 2. 和 OneBot 协议端并排运行
 

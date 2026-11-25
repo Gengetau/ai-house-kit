@@ -21,9 +21,11 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
 
 from ai_house import diary as diary_mod  # noqa: E402
 from ai_house.diary import DiaryService  # noqa: E402
-from ai_house.memory import JST, MemoryStore  # noqa: E402
+from ai_house.memory import MemoryStore  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
 
+JST = dt.timezone(dt.timedelta(hours=9))
+TRUST_ENV = {"AI_HOUSE_MEMORY_TRUST": "1"}  # trust levels are off by default in the new store
 DAY1_9 = dt.datetime(2026, 11, 21, 9, 0, tzinfo=JST).timestamp()
 DAY2_20 = dt.datetime(2026, 11, 22, 20, 0, tzinfo=JST).timestamp()
 
@@ -60,7 +62,7 @@ class _MemBase(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------------------
 class DirectQuestionRecall(_MemBase):
     def setUp(self) -> None:
-        self.st = self.make()
+        self.st = self.make(env=TRUST_ENV)
         # mem#1 of the run: nell / private / about 房主 / fact / verified
         self.mid, _ = self.st.add(
             "nell", "private", "房主对花生过敏，生日是3月14日。", channel="private:nell", about=["房主"],
@@ -79,8 +81,12 @@ class DirectQuestionRecall(_MemBase):
             with self.subTest(q=q):
                 got = self.st.recall("nell", "private", q, channel="private:nell", now=DAY2_20)
                 self.assertNotIn("花生", got)
+        # positive control: the fact is there and a question about it does bring it in
+        self.assertIn("花生", self.st.recall("nell", "private", "你记得我对什么过敏吗？", channel="private:nell", now=DAY2_20))
 
     def test_group_scope_still_never_reads_private_memory(self) -> None:
+        # positive control: the same question in the private chat does bring the fact in
+        self.assertIn("花生", self.st.recall("nell", "private", ALLERGY_QUESTIONS[1], channel="private:nell", now=DAY2_20))
         for q in ALLERGY_QUESTIONS + ("早上好！有谁知道我对什么过敏、最近又有什么打算吗？",):
             with self.subTest(q=q):
                 for scope, ch in (("group", "group"), ("world", "")):
@@ -112,6 +118,8 @@ class UnknownThingProbe(_MemBase):
         self.assertEqual(empty, with_private)
         self.assertIn("不记得", with_private)
         self.assertNotIn("花生", with_private)
+        # positive control: the private row exists and is found from the private chat
+        self.assertIn("花生", st.recall("nell", "private", q, channel="private:nell", now=DAY2_20))
 
     def test_unrelated_private_memory_does_not_make_her_know(self) -> None:
         st = self.make()
@@ -120,6 +128,8 @@ class UnknownThingProbe(_MemBase):
         got = st.recall("yuki", "private", "由纪，你记得我对什么过敏吗？", channel="private:yuki", now=DAY2_20)
         self.assertIn("不记得", got)
         self.assertNotIn("花生", got)
+        # positive control: the unrelated row is there and a question that names it finds it
+        self.assertIn("咖啡店", st.recall("yuki", "private", "由纪，你记得我要开咖啡店的事吗？", channel="private:yuki", now=DAY2_20))
 
     def test_vague_reference_to_what_the_owner_told_her_finds_the_latest_private_note(self) -> None:
         """「我之前悄悄告诉你的那件事，你还记得吗」 names nothing to match on: she must still see what she was told."""
@@ -159,7 +169,7 @@ class PrivateSecretTrust(unittest.TestCase):
         clock = VirtualClock(dt.datetime(2026, 11, 21, 14, 0, tzinfo=JST).timestamp())
         op = {"op": "add", "kind": kind, "text": text, "src": [1]}
         st = MemoryStore(tmp.name, clock=clock, names={"yuki": "由纪"}, llm_fn=lambda _s, _u: {"ops": [op]},
-                         extract_every_s=60, extract_batch=10)
+                         extract_every_s=60, extract_batch=10, env=TRUST_ENV)
         self.addCleanup(st.close)
         st.observe("yuki", "private", self.LINE, speaker="房主", speaker_role="owner")
         res = st.extract("yuki", scope="private", force=True)
@@ -194,11 +204,12 @@ class PrivateSecretTrust(unittest.TestCase):
         clock = VirtualClock(dt.datetime(2026, 11, 21, 14, 0, tzinfo=JST).timestamp())
         op = {"op": "add", "kind": "event", "text": "房主计划在2026年10月辞职去开咖啡店", "src": [1]}
         st = MemoryStore(tmp.name, clock=clock, names={"yuki": "由纪"}, llm_fn=lambda _s, _u: {"ops": [op]},
-                         extract_every_s=60, extract_batch=10)
+                         extract_every_s=60, extract_batch=10, env=TRUST_ENV)
         self.addCleanup(st.close)
         st.observe("yuki", "private", "我打算12月辞职去开咖啡店", speaker="房主", speaker_role="owner")
-        st.extract("yuki", scope="private", force=True)
-        self.assertNotEqual(st.list_entries("yuki", "private")[0]["trust"], "verified")
+        res = st.extract("yuki", scope="private", force=True)
+        self.assertEqual(res["added"], 1)  # stored, but not as verified
+        self.assertEqual(st.list_entries("yuki", "private")[0]["trust"], "group_stated")
 
 
 # ---------------------------------------------------------------------------------------------------------------

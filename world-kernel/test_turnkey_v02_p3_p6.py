@@ -2,7 +2,7 @@
 - Authority eff_env isolation (Promises + DayNote without mutating os.environ)
 - RoommateChatAgent env isolation, primary->fallback failover, and bounded OpenAI tool loop
 - Lock-free converse() keeping /api/state non-blocking during stalled LLM calls
-- IntentsLite errand detection & evidence-backed completion
+- Promise (CommonIntents) errand found by memory extraction & evidence-backed completion
 - DiaryService evening personal diaries isolated from private DMs + memory recall
 - HTTP API endpoints (/api/diaries, /api/intents, /api/memories, /api/memories/forget) & token tiers
 """
@@ -32,6 +32,8 @@ from authority import Authority
 from worldkernel import legacy, vocab_life1
 from worldkernel.life_model import FakeLifeModel
 from worldkernel.store import VirtualClock
+
+from test_m2_intents_adapter import fake_model
 
 from ai_house.chat_identity import member_speaker, owner_speaker
 from ai_house.daemon import HouseDaemon, make_http_server
@@ -79,7 +81,6 @@ class _MockDualOpenAIServer:
                                 "tool_calls": [
                                     {"id": "tc_1", "type": "function", "function": {"name": "inspect_house", "arguments": "{}"}},
                                     {"id": "tc_2", "type": "function", "function": {"name": "search_memory", "arguments": json.dumps({"query": "秘密"})}},
-                                    {"id": "tc_3", "type": "function", "function": {"name": "record_promise", "arguments": json.dumps({"summary": "答应顺路买2个鸡蛋", "kind": "errand", "item": "egg", "qty": 2})}},
                                     {"id": "tc_4", "type": "function", "function": {"name": "pick_mood_sticker", "arguments": json.dumps({"mood": "开心"})}},
                                     {"id": "tc_5", "type": "function", "function": {"name": "roll_dice", "arguments": json.dumps({"sides": 6, "count": 1})}},
                                     {"id": "tc_6", "type": "function", "function": {"name": "browse_bookshelf", "arguments": "{}"}},
@@ -180,23 +181,28 @@ class P3P6UnitTests(unittest.TestCase):
         }
         d = HouseDaemon(runtime_dir=Path(tmp) / "rt_live", virtual_clock=True, env=env)
         self.addCleanup(d.close)
-        d.memory.add("nell", "private", "房主的私人银行卡密码提示（不能泄露）", kind="fact", source="chat")
+        # changed: the memory text is not password-like (the stricter secret filter refuses those)
+        d.memory.add("nell", "private", "房主的私人保险柜位置是个秘密（不能泄露）", kind="fact", source="chat")
         res = d.send_chat("private:nell", "帮我看看冰箱，顺便记住一会儿去买2个鸡蛋")
         rep = res["replies"][0]
         self.assertEqual(rep["mode"], "live_api")
         self.assertEqual(mock_srv.tool_rounds_seen, 1)
         self.assertTrue(any(p.startswith("/fail/") for p, _, _ in mock_srv.calls))
         self.assertTrue(any(p.startswith("/ok/") and a == "Bearer sk-fallback" for p, a, _ in mock_srv.calls))
-        intents = d.intents.list_intents(actor="nell")
-        self.assertTrue(any(it["item"] == "egg" and it["qty"] == 2 and it["state"] == "open" for it in intents))
-
-        # Member message in group cannot trigger record_promise to create an owner errand
-        before_cnt = len(d.intents.list_intents(actor="nell"))
+        # the tool loop offered the house tools, and `record_promise` is no longer one of them (promises are found by
+        # the memory extraction); the round-one request is the first one carrying `tools` on the fallback endpoint
+        offered = [
+            {t["function"]["name"] for t in b["tools"]}
+            for p, _, b in mock_srv.calls if p.startswith("/ok/") and b.get("tools")
+        ]
+        self.assertTrue(offered)
+        self.assertIn("inspect_house", offered[0])  # positive control: the tool list is the one read here
+        self.assertNotIn("record_promise", offered[0])
+        self.assertEqual(d.intents.list_intents(actor="nell"), [])  # the tool loop and the reply record nothing
+        # A member's group message runs its own tool round; its search_memory output never sees private memory
         member = member_speaker("群友路人", "qq:999")
         d.converse("group", "买点东西吧", member, actor="nell")
-        after_cnt = len(d.intents.list_intents(actor="nell"))
-        self.assertEqual(after_cnt, before_cnt)
-        # Group search_memory call never sees private memory in tool output
+        self.assertEqual(d.intents.list_intents(actor="nell"), [])
         tool_payloads = [
             m["content"]
             for _, _, b in mock_srv.calls
@@ -204,7 +210,9 @@ class P3P6UnitTests(unittest.TestCase):
             if m.get("role") == "tool" and m.get("tool_call_id") == "tc_2"
         ]
         self.assertTrue(tool_payloads)
-        self.assertNotIn("银行卡", tool_payloads[-1])
+        # positive control: the same memory is found by the same tool call in the private chat
+        self.assertIn("保险柜", tool_payloads[0])
+        self.assertNotIn("保险柜", tool_payloads[-1])
 
     def test_converse_does_not_block_get_state_while_llm_stalls(self):
         entered = threading.Event()
@@ -240,13 +248,23 @@ class P3P6UnitTests(unittest.TestCase):
         self.assertFalse(err_holder)
 
     def test_intents_errand_lifecycle_completes_on_evidence(self):
+        """Fails if: the chat turn records anything, the extraction does not make the errand (so the errand reader
+        and the listing see nothing), or the kernel's purchase receipt does not close it within a daytime."""
         tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(tmp_dir.cleanup)
         tmp = tmp_dir.name
         start = dt.datetime(2026, 11, 21, 13, 30, tzinfo=JST).timestamp()
         d = HouseDaemon(runtime_dir=Path(tmp) / "rt", virtual_clock=True, start_ts=start, env={})
         self.addCleanup(d.close)
-        d.send_chat("group", "奈尔，今天有空帮家里买2个鸡蛋好不好？")
+        ask = "奈尔，今天有空帮家里买2个鸡蛋好不好？"
+        # the owner asks in the group and she says yes; the turn alone records nothing, the extraction finds the
+        # promise (a scripted model stands in for the real one)
+        d.memory.observe("nell", "group", ask, channel="group", speaker="房主", speaker_role="owner",
+                         reply="好的，我今天去买2个鸡蛋", now=start)
+        self.assertEqual(d.intents.list_intents(actor="nell"), [])
+        op = {"op": "intent", "text": "奈尔买2个鸡蛋", "kind": "promise", "for": ["房主"], "agreed": ["奈尔"],
+              "scope": "world", "when": "vague", "quote": "奈尔，今天有空帮家里买2个鸡蛋好不好"}
+        d.memory.extract(force=True, now=start + 5, llm_fn=fake_model([op]))
         rows = [r for r in d.intents.list_intents(actor="nell") if r["item"] == "egg"]
         self.assertTrue(rows)
         self.assertEqual(rows[0]["state"], "open")
@@ -258,12 +276,16 @@ class P3P6UnitTests(unittest.TestCase):
         self.assertEqual(egg_errand["account"], "nell")
         self.assertIsInstance(egg_errand["beneficiary"], list)
         # Exercise live daytime Shopping/Outings pipeline (09:30-16:00 JST) without KeyError
-        d.fast_forward(30)
+        for _ in range(8):
+            d.fast_forward(30)
+            if d.intents.list_intents(actor="nell")[0]["state"] == "completed":
+                break
 
         done_rows = [r for r in d.intents.list_intents(actor="nell") if r["item"] == "egg"]
         self.assertEqual(done_rows[0]["state"], "completed")
         self.assertTrue(str(done_rows[0]["evidence_key"]).startswith("ai-house/"))
-        self.assertIsNotNone(done_rows[0]["completed_at"])
+        self.assertTrue(done_rows[0]["updated_at"] >= done_rows[0]["created_at"])
+        self.assertEqual(d.intents.errands("nell", d.clock.now()), [])
 
     def test_diary_service_evening_generation_isolation_and_recall(self):
         tmp_dir = tempfile.TemporaryDirectory()
@@ -273,6 +295,9 @@ class P3P6UnitTests(unittest.TestCase):
         d = HouseDaemon(runtime_dir=Path(tmp) / "rt", virtual_clock=True, start_ts=start, env={})
         self.addCleanup(d.close)
         d.send_chat("private:nell", "我的备用钥匙藏在庭院蓝花盆底下，千万别对别人提")
+        # changed: the private line only becomes a memory through extraction (scripted model); used as positive control below
+        d.memory.extract("nell", force=True, now=start + 60, llm_fn=lambda sys_p, usr_p: {"ops": [{
+            "op": "add", "text": "房主的备用钥匙藏在庭院蓝花盆底下，不想让别人知道", "about": ["房主"], "kind": "fact"}]})
         # Advance slightly through daytime so FakeLifeModel creates real daylog/script entries
         d.fast_forward(60)
         d.fast_forward(60)
@@ -288,8 +313,12 @@ class P3P6UnitTests(unittest.TestCase):
             self.assertNotIn("蓝花盆", item["text"])
             self.assertNotIn("备用钥匙", item["text"])
 
-        recalled = d.memory.recall("nell", "world", "昨晚日记写了什么", now=night_ts + 3600)
-        self.assertIn("日记", recalled)
+        # changed: recall matches on content words (no vector service), so the question must share them with the
+        # diary; "昨晚日记写了什么" shares only one bigram with it and finds nothing
+        recalled = d.memory.recall("nell", "world", "日记写了什么", now=night_ts + 3600)
+        self.assertIn("日记：早上", recalled)
+        # positive control for the isolation checks above: the private line itself IS recalled in the private chat
+        self.assertIn("蓝花盆", d.memory.recall("nell", "private", "备用钥匙藏在哪里", now=night_ts + 3600))
 
     def test_new_http_endpoints_and_token_tiers(self):
         tmp_dir = tempfile.TemporaryDirectory()
@@ -303,9 +332,22 @@ class P3P6UnitTests(unittest.TestCase):
             env={"AI_HOUSE_OWNER_TOKEN": OWNER, "AI_HOUSE_READ_TOKEN": READER},
         )
         self.addCleanup(d.close)
-        d.send_chat("private:nell", "记住今天帮买2个鸡蛋，还有我的秘密配方是两勺蜂蜜")
+        # a private promise (found by the extraction) and a group one, to see how the endpoint shows each
+        d.memory.observe("nell", "private", "记住今天帮买2个鸡蛋，还有我的秘密配方是两勺蜂蜜", speaker="房主",
+                         speaker_role="owner", reply="好的，我今天去买2个鸡蛋", now=start)
+        d.memory.observe("nell", "group", "奈尔，今天顺路帮买2瓶牛奶好不好", channel="group", speaker="房主",
+                         speaker_role="owner", reply="好的，我今天顺路去买2瓶牛奶", now=start + 1)
+        ops = [
+            {"op": "intent", "text": "奈尔买2个鸡蛋", "kind": "promise", "for": ["房主"], "agreed": ["奈尔"],
+             "scope": "world", "when": "vague", "quote": "记住今天帮买2个鸡蛋"},
+            {"op": "intent", "text": "奈尔买2瓶牛奶", "kind": "promise", "for": ["房主"], "agreed": ["奈尔"],
+             "scope": "world", "when": "vague", "quote": "奈尔，今天顺路帮买2瓶牛奶好不好"},
+        ]
+        d.memory.extract(force=True, now=start + 5, llm_fn=fake_model(ops))
         d.memory.add("nell", "private", "房主的秘密配方是两勺蜂蜜", kind="fact", source="chat", now=start)
-        d.memory.add("nell", "world", "今天去图书馆翻到了气象手记", kind="diary", source="diary", now=start)
+        # changed: a diary must be long enough
+        d.memory.add("nell", "world", "今天去图书馆翻到了一本气象手记，下午在窗边读了很久，晚上把有趣的几页抄在了本子上。",
+                     kind="diary", source="diary", now=start)
         d.step_once()
 
         srv = make_http_server(d, host="127.0.0.1", port=0)
@@ -340,7 +382,19 @@ class P3P6UnitTests(unittest.TestCase):
         self.assertEqual(st, 403)
         st, doc = req("GET", "/api/intents", token=OWNER)
         self.assertEqual(st, 200)
-        self.assertTrue(any(i["item"] == "egg" for i in doc["intents"]))
+        self.assertEqual(sorted(i["state"] for i in doc["intents"]), ["open", "open"])  # both promises are listed
+        # the group promise shows its text and item; the private-chat one shows only a placeholder (no item, no text)
+        self.assertTrue(any(i["item"] == "milk" and i["qty"] == 2 for i in doc["intents"]))
+        self.assertFalse(any(i["item"] == "egg" or "鸡蛋" in i["summary"] for i in doc["intents"]))
+        self.assertTrue(any(i["visibility"] == "private" and "私聊" in i["summary"] for i in doc["intents"]))
+        # cancelling is not supported (501) for the owner and not allowed for the read token (403); nothing changes
+        iid = doc["intents"][0]["intent_id"]
+        st, _ = req("POST", "/api/intents/cancel", {"intent_id": iid}, token=READER)
+        self.assertEqual(st, 403)
+        st, out = req("POST", "/api/intents/cancel", {"intent_id": iid}, token=OWNER)
+        self.assertEqual((st, out["ok"], out["code"]), (501, False, "not_supported"))
+        st, doc = req("GET", "/api/intents", token=OWNER)
+        self.assertEqual(sorted(i["state"] for i in doc["intents"]), ["open", "open"])
 
         st, doc = req("GET", "/api/memories?scope=world&actor=nell", token=READER)
         self.assertEqual(st, 200)
@@ -353,6 +407,7 @@ class P3P6UnitTests(unittest.TestCase):
         priv_mems = [m for m in doc["memories"] if "蜂蜜" in m["text"]]
         self.assertTrue(priv_mems)
         mid = priv_mems[0]["id"]
+        self.assertIn("蜂蜜", d.memory.recall("nell", "private", "蜂蜜", now=start + 10))  # positive control
 
         st, _ = req("POST", "/api/memories/forget", {"actor": "nell", "scope": "private", "id": mid}, token=READER)
         self.assertEqual(st, 403)

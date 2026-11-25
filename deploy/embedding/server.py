@@ -39,10 +39,21 @@ def load_model():
     time, and a hub that is unreachable or rate-limiting would keep a complete cache from loading); else fetch."""
     from fastembed import TextEmbedding
 
+    try:  # the library logs the cache miss below as an error; on a first run it is the expected case
+        from loguru import logger as lib_log
+    except Exception:  # noqa: BLE001
+        lib_log = None
+    if lib_log is not None:
+        lib_log.disable("fastembed")
     try:
         return TextEmbedding(model_name=MODEL_NAME, cache_dir=MODEL_CACHE, local_files_only=True)
     except Exception:  # noqa: BLE001 - not in the cache yet, or incomplete
-        return TextEmbedding(model_name=MODEL_NAME, cache_dir=MODEL_CACHE)
+        pass
+    finally:
+        if lib_log is not None:
+            lib_log.enable("fastembed")
+    print(f"embedding service: {MODEL_NAME} is not in the cache yet, fetching it (about 100 MB, once)", flush=True)
+    return TextEmbedding(model_name=MODEL_NAME, cache_dir=MODEL_CACHE)
 
 
 def _load():

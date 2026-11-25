@@ -1,11 +1,11 @@
 # 这个目录里的文件从哪来
 
-`memory.py`、`qq_identity.py` 是私有部署里的同名文件，搬过来时只做了两类处理：
+`memory.py`、`qq_identity.py`、`intents.py`（约定：意图与承诺）是私有部署里的同名文件，搬过来时只做了两类处理：
 
 1. **去私有化**（机械替换，不改逻辑）：真实号码换成同长度的假号，住客与房主的名字、昵称换成占位名，内部路径换成中性写法。
-2. **下面这张表里的改动**。除此之外逐行相同。`tools/drift_report.py` 可以随时量两边差了多少行（2026-11-24：`memory.py` 1957 行里 1805 行相同；公共文件现在 2502 行，多出来的主要是并入的可信度一段、没有向量时的关键词一段和含糊问句的兜底）。
+2. **下面这张表里的改动**。除此之外逐行相同。`tools/drift_report.py` 可以随时量两边差了多少行（2026-11-25，私有端的行数 / 其中逐行相同的：`memory.py` 1957 / 1802，公共文件 2524 行，多出来的主要是并入的可信度一段、没有向量时的关键词一段和含糊问句的兜底；`intents.py` 1161 / 1155；`qq_identity.py` 241 / 238）。
 
-`roster.py`、`loader.py`、`__init__.py` 是 kit 自己写的：私有部署的花名册是一张手写的表，kit 的住客来自人物包，所以这里是空表加一个造表的函数。
+`world_shim.py` 也是 kit 自己写的，见下面的专门一节。`roster.py`、`loader.py`、`__init__.py` 是 kit 自己写的：私有部署的花名册是一张手写的表，kit 的住客来自人物包，所以这里是空表加一个造表的函数。
 
 ## 相对私有部署的改动
 
@@ -38,8 +38,31 @@
 | `memory.py` | **行为**：从房主私聊里（工具 `update`/`forget`，和抽取器整理私聊时的 `update`/`forget`）：公共（`public`）记忆一条也改不了、忘不了；她自己的记忆哪一类都还能忘；只有她的私密（`private`）记忆能改写，改别的范围的会被拒绝（抽取器里算 rejected）。`_own_row()` 新增参数 `rewrite`。群里能改能忘的不变 | 维护者 2026-11-24 定（15.7 的 N1），和 kit 原来的记忆库一致。原来房主私聊里的话可以被写进群里读得到的记忆。**私有端换用后：私聊里整理记忆时，对群里记忆或公共记忆的 `update` 会被拒绝，原来是改写了** |
 | `memory.py` | **行为**：`recall()` 里问的是“你记得吗”这类问题（`_asks_if_remembered`），又什么都没召回（没有命中、也没有刚说的话）时，若问句没有实义词，或（在群里）问句自己说了是私下说的（`_PRIVATE_TALK_REF_RE`：私下、悄悄、告诉过你…），就给她最近 3 条她看得到的私密记忆（`_visible_sql` 里 `scope='private'`、非日记、非密钥样），群里再加最近 3 条还没整理的房主私聊原话（`recent_block(latest=True)`，只取私聊、不是她自己说的、不是纯提问、不到 4 字的不算；仍受 `MEMORY_RECENT` / 时间窗 / 影子开关管）；房主私聊里只有问句没有实义词时才兜底。点了具体话题又查不到的，仍是 `NO_MEMORY_NOTE`。开关 `MEMORY_VAGUE_FALLBACK`，默认 1。有没有向量都一样；有向量时分数不变 | 维护者 2026-11-24 定（N5），从 kit 原来的记忆库并入（`_recent_private`、`_pending_private(latest=True)`、`_PRIVATE_TALK_REF_RE`，d179278）。「我之前悄悄告诉你的那件事，你还记得吗」原来答“不记得”。**默认开，私有端换用后行为就是这样**；要保持原样设 `MEMORY_VAGUE_FALLBACK=0` |
 | `memory.py` | **行为**：群里召回末尾那句“标着·私密的是…”（`_private_note`）只在这次带出的内容里真有私密记忆（`scope='private'`）或私密的刚说原话时才加；原来只要开了“私聊记忆进群”、召回有内容就加。无开关 | 维护者 2026-11-24 定（N10），和 kit 原来的记忆库一致。**私有端换用后：群里召回没带出私密内容时不再有这句**（措辞上的变化） |
+| `memory.py` | `db()` 返回的连接在 `with db() as c:` 结束时除了提交（或回滚）还会关闭（`_Conn`）。原来 sqlite3 自己的 `with` 只提交不关，每次调用开一个连接，都留给垃圾回收去关 | 不改行为。Python 3.13 会为每个没关的连接报 `ResourceWarning`；长跑的进程里连接也不该靠垃圾回收。**私有端换用后无可见变化**（41 处 `with db()` 都只在块内用连接，逐一查过；私有端 113 个用例照过） |
+| `memory.py` | **行为**：`recent_block()` 给“房主私聊里刚说、还没整理成记忆”的那几行写的标签，在免查的群里改成「房主私聊·私密：这里是小屋自己的群，想提可以自然地提」；别处仍是「…你知道，但别在群里说出来」 | 维护者 2026-11-24 的口径（免查的群里可以自然地提）。原来这几行在哪个群都写“别说出来”，而同一个群里已整理的私密记忆（`_private_note`）却说可以提，两句话互相矛盾。私有端换用后免查群里这几行的标签会变 |
+| `memory.py` | **行为**：`leak()` 比字符对时，把回复再读一遍：两个中日韩文字之间夹着的空格、标点、下划线去掉后再比（`_UNSPACE_RE`）。原来「冬 至 要 在…」「冬.至.要.在…」这样隔开写的复述一对字符都对不上，两条规则都放行 | 缺陷修正（kit 原有的测试查出来的）。拉丁字母的词不拼接（拼起来几乎和什么都有重合）。只会多拦，不会少拦；私有端换用后同样生效 |
 | `qq_identity.py` | `import roster` 同上处理 | 同上 |
 | `qq_identity.py` | 房主的别名不再写在这个文件里，改为读花名册 `OWNER["aliases"]`（没有就只认「房主」「owner」） | 别名是数据，不是逻辑 |
+| `intents.py` | 开头两行 `import world as W` / `import qq_identity as ID` 改成：在包里 `from . import world_shim as W, qq_identity as ID`，否则照旧 | 同一个文件两边都能用；私有端的 `world` 是它自己那个大模块，kit 里同名的那几样在 `world_shim.py` |
+| `intents.py` | **行为**：新增开关 `INTENTS_PRESENCE`（模块导入时读，和 `INTENTS_SHOW` 一样，默认 `1`；模块里的变量叫 `PRESENCE_ON`，因为 `PRESENCE` 这个名字原文件已经用作建表语句）。关着时 `queue_world` 不再调用 `presence_from_chat`，`presence_from_chat` 自己也直接返回 `None`：不从聊天里推房主在哪个房间，也不往房主化身的队列里写东西；`owner_chat_queue` 照常写 | 维护者 2026-11-24 定（「从聊天里判断房主在哪」做成开关）。**默认开，私有端换用后行为不变**；kit 的守护进程以后自己决定开不开 |
+| `intents.py` | 除上面两条外逐行相同。注意 `_rules()`（找 `promise_rules` 和词表）按私有部署的目录去找旁边的 `world-kernel`，在 kit 的包里找不到这个目录：用的时候要么 `worldkernel` 已在 `sys.path` 上，要么适配层把 `_rules` 换成自己的（带上按包绑定的 `promise_rules.bound(vocab)`）。这里没改 | 不改共享文件；换法留给适配层 |
+
+## `world_shim.py`：私有部署的 `world` 里，约定用到的那几样
+
+`intents.py` 在私有部署里 `import world as W`，那是一个几千行、负责住客一天生活的模块，kit 用自己的内核，不带它。约定只用到其中很少几样：开库（`db`）、谁是谁（`actor_of`、`_key`、`ACTORS`、`CONSUMER_ACTOR`）、日界和时区（`jst`、`_day_start`、`JST`）、清洗与隐私判断（`_clean`、`_private`）、事件日志（`_event`）、住客互相联系那个功能的两个帮手（`_together`、`_add_contact`），再加几个常量和钩子（`DB_PATH`、`HOME_CHAT`、`DM_AUDIENCE`、`INTENTS`）。函数的内容取自私有文件里的同名函数，和它们的差别只有：
+
+| 改动 | 原因 |
+|---|---|
+| `db()` 不设日志模式（私有端设了）；`with db() as c:` 结束时除提交或回滚外还关闭连接（和 `memory.py` 的 `_Conn` 一样） | kit 的 `world.db` 的日志模式归内核定，约定不去改；连接不靠垃圾回收去关 |
+| 没有默认的“小屋群”：`HOME_CHAT` 默认为空，由调用方设（`group:<n>`） | 私有端写死一个群号；kit 的小屋可以有几个群，也可以没有 |
+| `_together` 没有房间表（`LOCATIONS` 为空），所以永远算“不在一起”；`_add_contact` 照旧写 `contacts` 表。**`nudge`（到期了却不在一起时去联系她）在 kit 里不能用**，没有接线 | kit 没有“住客互相联系”这个功能，也没有私有端那张房间表 |
+| `init()` 只建约定要写的两张表（`events`、`contacts`），私有端 `world` 的其余表不在这里 | 其余的属于 kit 没有的功能 |
+
+和 `memory.py` 一样，每个小屋一份：用 `loader.load()` 载入一份副本（现在同时载入 `qq_identity`、`world_shim`、`memory`、`intents` 四个，用 `loader.part(memory, "intents")` 取），再设 `DB_PATH`、`HOME_CHAT`。`loader.load()` 不会替你打开 `memory.INTENTS`。
+
+## `promise_rules.py`（world-kernel）的改动
+
+kit 里的 `worldkernel/promise_rules.py` 原来把“谁能许诺”（`BOTS`）和要剥掉的名字写死成默认那六个人，换成别的包（比如 `indie-studio-3`）就永远判不出完成。新增 `bound(vocab)`：返回一个带 `compile_terms` / `judge` 的对象，人物和名字取自传入的词表。模块级的 `compile_terms` / `judge` 行为不变。这不是私有端的文件，登记在这里是因为 `intents.py` 靠它判完成。
 
 ## 一起搬来的测试
 
@@ -53,6 +76,14 @@
   - `test_memory_recent.py`：`test_pending_leak_permissions_allowlist_and_private_chat_are_unchanged` 里“统一记忆关”“私聊记忆进群关”两种情况从“不查”改为“查”。
 - 这些行为改动另有 kit 自己写的用例：`world-kernel/test_m1_common_changes.py`、`world-kernel/test_m1_common_extras.py`（并入的四样）。
 - **私有端换用本目录的文件时**，上面这四个用例要一起换；它自己的那份在新代码下会失败。
+
+## 约定的测试
+
+`intents-conformance-tests/`：私有部署 4 个约定测试文件共 75 个用例，加上私有端 `test_world.py` 里它们要用的那一小段（`WorldBase`、`at`、`answer`）。71 个通过，4 个跳过：
+`ShownTests` 里的 `test_card_shows_due_soon_only_when_on`、`test_world_scene_with_both_completes_it`、`test_world_alone_cannot_complete_a_joint_one`、`test_due_and_apart_reaches_her_only_when_free` 要私有部署的世界引擎（`card`、`advance`、`llm`、`outreach`），kit 没有；该目录的 `world.py` 给这四个名字的是会抛 `SkipTest` 的占位，跳过信息写明原因。别的用例都没有跳过，也没有标成预期失败。
+
+- **改了一处**：`test_intents_kernel191.py` 里 `test_qingkong_park_requires_arrival_and_actual_joint_activity` 的地名换成了 kit 目录里同一个公园的名字（“南琉璃公园”，`minami_park`）。这是去私有化留下的差别，其余文件与去私有化后的原件逐字相同。
+- 私有端换用这里的文件时，按它自己的目录写这个地名。
 
 ## 约定
 

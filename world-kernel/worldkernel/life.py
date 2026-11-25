@@ -400,9 +400,10 @@ class Life:
             else:
                 shaped = self._stop_for_meal(a, args)
             return self._with_snack(a, shaped or args) or shaped
-        if step.get("action_type") == "invite" and self.s._in_tx is None:
+        atype = self.k.V.CATALOG["aliases"].get(step.get("action_type"), step.get("action_type"))
+        if atype in ("invite", "move") and self.s._in_tx is None:
             for hook in self.k.before_submit:
-                hook({"action_type": "invite", "actor_id": a, "args": step.get("args")})
+                hook({"action_type": atype, "actor_id": a, "origin": "model", "args": step.get("args")})
             return
         if step.get("action_type") != "sleep":
             return

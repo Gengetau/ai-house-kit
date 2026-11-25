@@ -1,7 +1,9 @@
-"""M1: the switch that puts the house on the memory store sharing the private deployment's code.
+"""M1: the house runs on the memory store that shares the private deployment's code (`CommonMemoryStore`, its own
+`memory-common.db`), and a house that ran on the earlier store keeps what she remembered.
 
-`AI_HOUSE_MEMORY_BACKEND=common` -> `CommonMemoryStore` (its own `memory-common.db`); unset, empty or `legacy` -> the
-old `MemoryStore`, as before. A whole house is run here with a scripted model: no network, made-up names.
+`AI_HOUSE_MEMORY_BACKEND` chose between the two stores while there were two; it does nothing now. A whole house is
+run here with a scripted model: no network, made-up names. Old-format `memory.db` files are written by the frozen
+copy of the earlier store kept for that purpose (`legacy_memory_store.py`).
 """
 from __future__ import annotations
 
@@ -22,15 +24,10 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
 
 from ai_house import cli  # noqa: E402
 from ai_house.chat_identity import owner_speaker  # noqa: E402
-from ai_house.daemon import (  # noqa: E402
-    JST,
-    MEMORY_BACKEND_ENV,
-    HouseDaemon,
-    memory_backend,
-    memory_backend_problem,
-)
-from ai_house.memory import MemoryStore  # noqa: E402
+from ai_house import memory as memory_mod  # noqa: E402
+from ai_house.daemon import JST, MEMORY_BACKEND_ENV, HouseDaemon, memory_backend_note  # noqa: E402
 from ai_house.memory_common import CommonMemoryStore  # noqa: E402
+from legacy_memory_store import MemoryStore as OldMemoryStore  # noqa: E402
 
 PACK = str(ROOT / "src" / "ai_house" / "bundled_packs" / "indie-studio-3")
 T0 = dt.datetime(2026, 11, 22, 12, 0, tzinfo=JST).timestamp()
@@ -70,49 +67,59 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-class SwitchTests(unittest.TestCase):
-    def test_reading_the_switch(self):
-        for raw, want in ((None, "legacy"), ("", "legacy"), ("legacy", "legacy"), (" Common ", "common"),
-                          ("common", "common"), ("new", "legacy"), ("1", "legacy")):
-            self.assertEqual(memory_backend({} if raw is None else {MEMORY_BACKEND_ENV: raw}), want, raw)
-        for ok in ("", "legacy", "common", " COMMON "):
-            self.assertEqual(memory_backend_problem(ok), "", ok)
-        for bad in ("new", "1", "on", "comon"):
-            self.assertIn(MEMORY_BACKEND_ENV, memory_backend_problem(bad), bad)
+class TheOldSwitchTests(unittest.TestCase):
+    """`AI_HOUSE_MEMORY_BACKEND` is still accepted so a `.env` that has it keeps working; it changes nothing."""
 
-    def test_the_house_runs_on_the_old_store_unless_told(self):
-        for backend in (None, "", "legacy"):
-            d, rt, _ = house(self, backend)
-            self.assertIs(type(d.memory), MemoryStore, backend)
-            self.assertFalse((rt / "memory-common.db").exists())
+    def test_only_a_value_that_asked_for_something_else_is_remarked_on(self):
+        for quiet in (None, "", "common", " Common "):
+            self.assertEqual(memory_backend_note(quiet), "", quiet)
+        for said in ("legacy", "new", "comon", "1"):
+            self.assertIn(MEMORY_BACKEND_ENV, memory_backend_note(said), said)
 
-    def test_common_puts_it_on_the_new_store_and_leaves_the_old_file_alone(self):
-        d, rt, _ = house(self, "common")
-        self.assertIs(type(d.memory), CommonMemoryStore)
-        self.assertTrue((rt / "memory-common.db").exists())
-        self.assertFalse((rt / "memory.db").exists())
+    def test_the_house_runs_on_the_one_store_whatever_it_says(self):
+        for backend in (None, "", "common", "legacy", "comon"):
+            d, rt, said = house(self, backend)
+            self.assertIs(type(d.memory), CommonMemoryStore, backend)
+            self.assertTrue((rt / "memory-common.db").exists(), backend)
+            self.assertFalse((rt / "memory.db").exists(), backend)
+            self.assertEqual(MEMORY_BACKEND_ENV in said, backend in ("legacy", "comon"), backend)
 
-    def test_a_misspelt_name_built_in_code_falls_back_and_says_so(self):
-        d, _, said = house(self, "comon")
-        self.assertIs(type(d.memory), MemoryStore)
-        self.assertIn(MEMORY_BACKEND_ENV, said)
+    def test_the_name_callers_have_always_imported_is_that_store(self):
+        self.assertIs(memory_mod.MemoryStore, CommonMemoryStore)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        st = memory_mod.configure(tmp.name, env={})
+        self.addCleanup(memory_mod.reset_default_store)
+        self.assertIs(type(st), CommonMemoryStore)
+        memory_mod.reset_default_store()
+        with self.assertRaises(RuntimeError):
+            memory_mod.recall("sora", "private", "x")
 
-    def test_up_refuses_a_misspelt_name(self):
+    def test_doctor_says_the_setting_does_nothing_and_does_not_fail_on_it(self):
+        import json
         import os
         from unittest.mock import patch
 
-        err = io.StringIO()
-        args = type("A", (), {"env_file": None, "host": None, "port": None, "data_dir": None})()
-        with patch.dict(os.environ, {MEMORY_BACKEND_ENV: "comon"}), patch.object(cli, "_load_dotenv", lambda p: None), \
-                contextlib.redirect_stderr(err):
-            self.assertEqual(cli.cmd_up(args), 2)
-        self.assertIn(MEMORY_BACKEND_ENV, err.getvalue())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env_file = Path(tmp.name) / ".env"
+        seen = {}
+        for value in ("legacy", "common"):
+            env_file.write_text(f"{MEMORY_BACKEND_ENV}={value}\n", encoding="utf-8")
+            out = io.StringIO()
+            with patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(out):
+                os.environ.pop(MEMORY_BACKEND_ENV, None)
+                cli.main(["doctor", "--env-file", str(env_file), "--data-dir", str(Path(tmp.name) / "rt"), "--json"])
+            seen[value] = {c["name"]: c for c in json.loads(out.getvalue())["checks"]}
+        self.assertTrue(seen["legacy"]["memory_backend"]["ok"])
+        self.assertIn(MEMORY_BACKEND_ENV, seen["legacy"]["memory_backend"]["detail"])
+        self.assertNotIn("memory_backend", seen["common"])
 
 
 class HouseOnTheNewStore(unittest.TestCase):
     def setUp(self):
         self.model = Model()
-        self.d, self.rt, _ = house(self, "common", self.model)
+        self.d, self.rt, _ = house(self, None, self.model)
 
     def say(self, channel, text):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -162,14 +169,21 @@ class HouseOnTheNewStore(unittest.TestCase):
 
 
 class AHouseThatRanOnTheOldStore(unittest.TestCase):
-    """Switching to the new store keeps what she remembers: the start carries the old file's memories over."""
+    """A house that ran on the earlier store keeps what she remembers: the start carries the old file's memories over."""
 
     FACT = "房主对花生过敏，吃了会起疹子"
 
     def old_house(self, rt=None):
-        d, rt, _ = house(self, None, rt=rt)
-        d.memory.add("sora", "private", self.FACT, now=d.clock.now())
-        d.close()
+        """A house folder as the earlier version left it: everything but a `memory-common.db`, and a `memory.db`
+        written by the earlier store itself. With `rt`, only the `memory.db` is written into that folder."""
+        if rt is None:
+            d, rt, _ = house(self)
+            d.close()
+            for left in rt.glob("memory-common.db*"):
+                left.unlink()
+        old = OldMemoryStore(rt, names={"sora": "Sora", "rin": "Rin"}, env={})
+        old.add("sora", "private", self.FACT, now=T0)
+        old.close()
         return rt
 
     def texts(self, d, actor="sora"):
@@ -179,7 +193,7 @@ class AHouseThatRanOnTheOldStore(unittest.TestCase):
         rt = self.old_house()
         before = sha(rt / "memory.db")
         model = Model()
-        d, _, said = house(self, "common", model, rt=rt)
+        d, _, said = house(self, None, model, rt=rt)
         self.assertIn("花生过敏", self.texts(d))
         self.assertNotIn("花生", self.texts(d, "rin"))  # still hers alone
         self.assertEqual(sha(rt / "memory.db"), before)  # the old file is only read
@@ -191,11 +205,11 @@ class AHouseThatRanOnTheOldStore(unittest.TestCase):
 
     def test_a_second_start_adds_nothing_and_what_was_removed_stays_removed(self):
         rt = self.old_house()
-        d, _, _ = house(self, "common", rt=rt)
+        d, _, _ = house(self, None, rt=rt)
         mid = next(r["id"] for r in d.list_memories(actor="sora", scope="private") if "花生" in r["text"])
         d.forget_memory(actor="sora", scope="private", mem_id=mid)
         d.close()
-        d, _, said = house(self, "common", rt=rt)
+        d, _, said = house(self, None, rt=rt)
         self.assertNotIn("花生", self.texts(d))
         self.assertNotIn("搬进新库", said)
         self.assertEqual(sorted(rt.glob("memory-common.db.bak-*")), [])
@@ -206,23 +220,16 @@ class AHouseThatRanOnTheOldStore(unittest.TestCase):
         rt = Path(tmp.name) / "rt"
         rt.mkdir()
         (rt / "memory.db").write_bytes(b"this is not a database " * 64)
-        d, _, said = house(self, "common", rt=rt)
+        d, _, said = house(self, None, rt=rt)
         self.assertIs(type(d.memory), CommonMemoryStore)
         self.assertIn("旧记忆库", said)
         self.assertEqual(self.texts(d), "")
 
-    def test_the_old_store_does_not_look_at_any_of_this(self):
-        rt = self.old_house()
-        d, _, said = house(self, None, rt=rt)
-        self.assertIs(type(d.memory), MemoryStore)
-        self.assertFalse((rt / "memory-common.db").exists())
-        self.assertNotIn("搬进新库", said)
-
     def test_a_reset_removes_the_copies_the_carrying_over_kept(self):
-        d, rt, _ = house(self, "common")  # the new file exists first, so carrying over keeps a copy of it
+        d, rt, _ = house(self)  # the new file exists first, so carrying over keeps a copy of it
         d.close()
         self.old_house(rt)
-        d, _, _ = house(self, "common", rt=rt)
+        d, _, _ = house(self, None, rt=rt)
         self.assertIn("花生过敏", self.texts(d))
         self.assertEqual(len(list(rt.glob("memory-common.db.bak-*"))), 1)
         with contextlib.redirect_stdout(io.StringIO()):

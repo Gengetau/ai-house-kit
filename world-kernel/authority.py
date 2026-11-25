@@ -50,6 +50,7 @@ class Authority:
                     eff_env.get("CITY_BRIDGE_URL", "http://127.0.0.1:17654/city/bridge/v1"),
                     eff_env["CITY_BRIDGE_KEY"],
                 ),
+                weather_source=eff_env.get("WORLD_KERNEL_WEATHER_SOURCE", "open-meteo"),
             )
         self.life = Life(self.store, model=model or LiveLifeModel(chat, selves),
                          weather=city_weather,
@@ -58,7 +59,8 @@ class Authority:
                          extensions=[outings.install, avatar.install(world_db), chatlink.install(world_db)]
                          + ([browsing] if browsing else []) + list(extra_extensions),
                          vocab=vocab)
-        self.city_bridge = city_bridge.install_from_env(self.life, chat=chat, selves=selves, env=eff_env)
+        self.city_bridge = city_bridge.install_from_env(self.life, chat=chat, selves=selves, env=eff_env,
+                                                        weather_provider=city_weather)
         if self.city_bridge is not None:
             self.life.extensions.append(self.city_bridge)
         self.proj = Projector(self.life, world_db)
@@ -69,8 +71,11 @@ class Authority:
                 try:
                     import intents as intents_mod
                 except ImportError:
-                    from worldkernel.intents_lite import IntentsLite
-                    intents_mod = IntentsLite(world_db, vocab=getattr(self.life, "V", vocab))
+                    # the promise code of the kit (shared module, adapted); this object is the authority, so the
+                    # chat feed to the kernel is on
+                    from ai_house.intents_common import CommonIntents
+                    intents_env = {**eff_env, "WORLD_KERNEL": "authority"}
+                    intents_mod = CommonIntents(world_db, vocab=getattr(self.life, "V", vocab), env=intents_env)
             intents_mod.init()
             self.promises = promises.Promises(self.life, world_db, self.proj, intents_mod, env=eff_env)
             self.life.promise_source = self.promises

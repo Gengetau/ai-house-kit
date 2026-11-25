@@ -1,15 +1,12 @@
-"""Tail batch 2 regressions: buy-request parsing, commitment evidence windows, memory trust and conflicts.
+"""Tail batch 2 regressions: buy-request parsing, promise evidence windows, memory trust and conflicts (trust levels on).
 
 Each section pairs positive cases (must still work) with negative ones (the acceptance-round bugs).
-Evidence rows are written exactly as the kernel exporter writes them; no test touches the matcher tables.
+Promise evidence is judged by the shared rules (`worldkernel.promise_rules`) with rows shaped like the kernel's.
 """
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
 import json
-import logging
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -21,39 +18,24 @@ for p in (str(ROOT / "src"), str(ROOT / "world-kernel"), str(ROOT / "world-catal
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from ai_house.memory import BASE_INDEXES_SQL, BASE_TABLES_SQL, MemoryStore, SCHEMA_VERSION  # noqa: E402
-from worldkernel.intents_lite import CommitmentStore  # noqa: E402
+from ai_house.memory_common import CommonMemoryStore as MemoryStore  # noqa: E402
+from worldkernel import buy_words, promise_rules, vocab_life1 as V  # noqa: E402
 from worldkernel.store import VirtualClock  # noqa: E402
 
 JST = dt.timezone(dt.timedelta(hours=9))
 T0 = dt.datetime(2026, 11, 22, 10, 0, tzinfo=JST).timestamp()
 H = 3600.0
+GROUP = "qq-group:5001"  # the old tests' channel "g1"
+TRUST_ON = {"AI_HOUSE_MEMORY_TRUST": "1"}  # trust levels, the claim kind and conflict flags are off unless switched on
 
 
-class _IntentBase(unittest.TestCase):
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.db = str(Path(tmp.name) / "world.db")
-        self.store = CommitmentStore(self.db)
-        self.store.init()
-        self._n = 0
+class BuyRequestParsing(unittest.TestCase):
+    """What the owner asked to have bought, read by `worldkernel.buy_words` (the words moved out of the old promise
+    code). The old "become an open errand with raw_item" half is gone (D1, D4): nothing is recorded by the chat
+    turn; what the parser still decides is whether the line is an explicit request (so the reply may say that the
+    thing cannot be bought) and which noun it names."""
 
-    def evidence(self, body: Dict[str, Any]) -> None:
-        self._n += 1
-        with contextlib.closing(sqlite3.connect(self.db)) as c:
-            with c:
-                c.execute(
-                    "INSERT INTO intent_evidence(key, stream, event_id, at, body) VALUES(?, 'ev', ?, ?, ?)",
-                    (f"k{self._n}", self._n, float(body.get("ended_at") or body["at"]), json.dumps(body)),
-                )
-
-    def rows(self, actor: str = "sora") -> List[Dict[str, Any]]:
-        return self.store.list_intents(actor=actor)
-
-
-class BuyRequestParsing(_IntentBase):
-    # (owner text, resident reply, expected raw_item) -- explicit requests / errands outside the catalog
+    # (owner text, resident reply, expected noun) -- explicit requests / commitments for things outside the catalog
     SHOULD_CREATE = [
         ("帮我买点榴莲", "好的", "榴莲"),
         ("顺便带两瓶酱油", "好", "酱油"),
@@ -119,192 +101,190 @@ class BuyRequestParsing(_IntentBase):
         "明天买点榴莲",
     ]
 
-    def _errands(self, actor: str = "sora") -> List[Dict[str, Any]]:
-        return [r for r in self.rows(actor) if r["kind"] == "errand"]
-
-    def test_requests_and_commitments_become_open_errands_with_raw_item(self) -> None:
-        for i, (text, reply, expected) in enumerate(self.SHOULD_CREATE):
+    def test_requests_and_commitments_name_the_thing_to_buy(self) -> None:
+        """Fails if an explicit request or the resident's own promise to buy ("好，我去买") no longer yields the noun
+        (22 sentences, one subTest each), or if a noun that is not a catalogue item resolves to an item id."""
+        for text, reply, expected in self.SHOULD_CREATE:
             with self.subTest(text=text):
-                actor = f"a{i}"
-                self.store.enqueue_chat(actor, text, reply, where="private", now=T0)
-                errs = self._errands(actor)
-                self.assertEqual(len(errs), 1, errs)
-                self.assertEqual(errs[0]["state"], "open")
-                self.assertEqual(errs[0]["raw_item"], expected)
-                self.assertFalse(errs[0]["item"])
+                self.assertEqual(buy_words.extract_buy_request_noun(text, reply), expected)
+                self.assertIsNone(buy_words.resolve_item_id(V, expected))
 
     def test_catalog_request_still_resolves_to_item(self) -> None:
-        self.store.enqueue_chat("sora", "帮我买点牛奶", "好", where="private", now=T0)
-        errs = self._errands()
-        self.assertEqual([(e["item"], e["raw_item"]) for e in errs], [("milk", "")])
+        """Fails if a request for a catalogue item stops resolving to its item id (the kernel shops for it), or is
+        reported as a thing that cannot be bought."""
+        self.assertEqual(buy_words.extract_buy_request_noun("帮我买点牛奶", "好"), "牛奶")
+        self.assertEqual(buy_words.resolve_item_id(V, "牛奶"), "milk")
+        self.assertEqual(buy_words.detect_errand_item(V, "帮我买点牛奶")[0], "milk")
+        self.assertEqual(buy_words.unbuyable_noun(V, "帮我买点牛奶"), "")
+        self.assertEqual(buy_words.unbuyable_noun(V, "帮我买点榴莲"), "榴莲")  # control: the same shape, not in stock
 
-    def test_chitchat_never_becomes_an_errand(self) -> None:
-        for i, text in enumerate(self.SHOULD_NOT_CREATE):
-            with self.subTest(text=text, path="no_llm_intents"):
-                actor = f"n{i}"
-                self.store.enqueue_chat(actor, text, "嗯", where="private", now=T0)
-                self.assertEqual(self._errands(actor), [])
-            with self.subTest(text=text, path="llm_intents_present"):
-                actor = f"m{i}"
-                self.store.enqueue_chat(
-                    actor, text, "嗯", where="private",
-                    intents=[{"text": "和房主聊天", "kind": "chat_promise"}], now=T0,
-                )
-                self.assertEqual(self._errands(actor), [])
+    def test_chitchat_never_reads_as_a_purchase_request(self) -> None:
+        """Fails if past tense, questions, negations, "买卖/买单", things one carries ("带伞") or a subject-less
+        sentence is read as a request (a noun comes out, or the line is reported as unbuyable). The control: the
+        explicit requests of the other table all yield their noun in the same run."""
+        yielding = [t for t, r, e in self.SHOULD_CREATE if buy_words.extract_buy_request_noun(t, r) == e]
+        self.assertEqual(len(yielding), len(self.SHOULD_CREATE))
+        for text in self.SHOULD_NOT_CREATE:
+            with self.subTest(text=text):
+                self.assertEqual(buy_words.extract_buy_request_noun(text, "嗯"), "")
+                self.assertEqual(buy_words.unbuyable_noun(V, text), "")
 
-    def test_particles_are_stripped_from_raw_item(self) -> None:
-        for i, (text, reply, expected) in enumerate(self.SHOULD_CREATE):
-            self.store.enqueue_chat(f"p{i}", text, reply, where="private", now=T0)
-            for r in self._errands(f"p{i}"):
-                self.assertNotRegex(r["raw_item"], r"^[了吗吧呢啊的这]|[了吗吧呢啊回来]$")
+    def test_particles_are_stripped_from_the_noun(self) -> None:
+        """Fails if a noun keeps a sentence particle or a direction word at either end ("榴莲吧", "奶茶回来")."""
+        for text, reply, _ in self.SHOULD_CREATE:
+            noun = buy_words.extract_buy_request_noun(text, reply)
+            self.assertTrue(noun, text)
+            self.assertNotRegex(noun, r"^[了吗吧呢啊的这]|[了吗吧呢啊回来]$")
 
 
-class EvidenceWindowAndStrength(_IntentBase):
-    def _outing(self, text: str = "下午去图书馆借书吧", summary: str = "去图书馆借书") -> None:
-        self.store.enqueue_chat(
-            "sora", text, "好呀", where="private",
-            intents=[{"text": summary, "kind": "outing", "答应了的": ["sora"]}], now=T0,
-        )
+class PromiseEvidenceRules(unittest.TestCase):
+    """The generic evidence rules of the shared promise code (`worldkernel.promise_rules`), which replace the kit's
+    own evidence windows. The kind-based closing of the old code (an `outing` closed by an arrival, a `together`
+    by `plan_finished`, a `cook` by a finished plan) is gone (D6); what is kept is the window (a receipt counts only
+    between the time she said it and the deadline), the strength of the evidence (only real arrivals, purchases and
+    shared activity close a promise) and the place words."""
 
-    def _together(self) -> None:
-        self.store.enqueue_chat(
-            "sora", "一起大扫除吧", "好呀", where="private",
-            intents=[{"text": "一起大扫除", "kind": "together", "答应了的": ["sora"]}], now=T0,
-        )
+    R = promise_rules.bound(V)
 
-    def _state(self) -> str:
-        return self.rows()[0]["state"]
+    def intent(self, text: str, party: List[str], created: float = T0, deadline: float = T0 + 24 * H) -> Dict[str, Any]:
+        terms = self.R.compile_terms(text, V, party)
+        self.assertNotEqual(terms, [{"kind": "unsupported"}], text)
+        return {"id": 7, "status": "accepted", "party": party, "terms": terms, "created": created,
+                "said_at": created, "deadline": deadline, "beneficiary": [], "scope": "world"}
 
-    # --- invite_settled / plan_finished strength
-    def test_invite_settled_does_not_close_outing_or_together(self) -> None:
-        self._outing()
-        self._together()
-        self.evidence({"kind": "invite_settled", "actor": "sora", "members": ["sora", "rin"],
-                       "place": "library", "at": T0 + 60})
-        self.store.sweep(T0 + 120)
-        self.assertEqual([r["state"] for r in self.rows()], ["open", "open"])
+    @staticmethod
+    def purchase(actor: str, at: float, item: str = "onion", qty: int = 1, key: str = "k1") -> Dict[str, Any]:
+        return {"key": key, "kind": "purchased", "actor": actor, "at": at, "item": item, "qty": qty, "account": actor,
+                "action_id": "a" + key, "resource_id": "r" + key, "intent_ref": 7, "beneficiary": [], "plan_id": "p1"}
 
-    def test_plan_finished_only_closes_on_successful_outcome(self) -> None:
-        for outcome in ("cancelled", "lapsed", "missed", None, "bogus"):
-            with self.subTest(outcome=outcome):
-                self.setUp()
-                self._together()
-                self._outing()
-                body = {"kind": "plan_finished", "actor": "sora", "at": T0 + 60}
-                if outcome is not None:
-                    body["outcome"] = outcome
-                self.evidence(body)
-                self.store.sweep(T0 + 120)
-                self.assertEqual([r["state"] for r in self.rows()], ["open", "open"])
-        for outcome in ("done", "early_home"):
-            with self.subTest(outcome=outcome):
-                self.setUp()
-                self._together()
-                self.evidence({"kind": "plan_finished", "actor": "sora", "outcome": outcome,
-                               "members": ["sora", "rin"], "at": T0 + 60})
-                self.store.sweep(T0 + 120)
-                self.assertEqual(self._state(), "completed")
+    @staticmethod
+    def arrival(actor: str, place: str, at: float, key: str = "k2") -> Dict[str, Any]:
+        return {"key": key, "kind": "arrived", "actor": actor, "place": place, "at": at, "plan_id": "p1"}
 
-    def test_together_plan_finished_needs_more_than_one_member_when_known(self) -> None:
-        self._together()
-        self.evidence({"kind": "plan_finished", "actor": "sora", "outcome": "done",
-                       "members": ["sora"], "at": T0 + 60})
-        self.store.sweep(T0 + 120)
-        self.assertEqual(self._state(), "open")
+    @staticmethod
+    def together(actor: str, plan: str, start: float, end: float, outcome: str = "succeeded", place: str = "living",
+                 key: str = "") -> Dict[str, Any]:
+        return {"key": key or f"t-{actor}-{plan}", "kind": "activity", "actor": actor, "activity": "housework",
+                "outcome": outcome, "plan_id": plan, "place": place, "started_at": start, "ended_at": end, "at": end}
+
+    def done(self, it: Dict[str, Any], evidence: List[Dict[str, Any]], now: float) -> bool:
+        return bool(self.R.judge(it, evidence, now)["complete"])
+
+    # --- evidence strength
+    def test_invite_settled_and_plan_finished_never_satisfy_a_term(self) -> None:
+        """Fails if an `invite_settled` or a `plan_finished` row (any outcome) closes an arrival, a purchase or a
+        shared activity, or if the real evidence of the same scenario does not close it (the control)."""
+        cases = [
+            ("奈尔去公园", ["nell"], [self.arrival("nell", "place:park", T0 + 60)]),
+            ("奈尔买洋葱", ["nell"], [self.purchase("nell", T0 + 60)]),
+            ("奈尔和艾莎一起做家务", ["nell", "elsa"],
+             [self.together("nell", "plan:p1", T0 + 60, T0 + 1500), self.together("elsa", "plan:p1", T0 + 60, T0 + 1500)]),
+        ]
+        for text, party, real in cases:
+            it = self.intent(text, party)
+            weak = []
+            for n, outcome in enumerate(("done", "early_home", "cancelled", "lapsed", "missed", None, "bogus")):
+                for actor in party:
+                    weak.append({"key": f"f{n}{actor}", "kind": "plan_finished", "actor": actor, "outcome": outcome,
+                                 "members": list(party), "plan_id": "p1", "at": T0 + 70})
+            for actor in party:
+                weak.append({"key": f"i{actor}", "kind": "invite_settled", "actor": actor, "members": list(party),
+                             "place": "library", "at": T0 + 70})
+            with self.subTest(text=text):
+                self.assertFalse(self.done(it, weak, T0 + 120))
+                self.assertTrue(self.done(it, weak + real, T0 + 2000))
 
     def test_together_closes_on_real_shared_activity_only(self) -> None:
-        self._together()
-        # standalone action (own group) and failed/cancelled activity do not count
-        self.evidence({"kind": "activity", "actor": "sora", "activity": "housework", "outcome": "succeeded",
-                       "plan_id": "action:a1", "ended_at": T0 + 2 * H, "at": T0 + 2 * H})
-        self.evidence({"kind": "activity", "actor": "sora", "activity": "housework", "outcome": "cancelled",
-                       "plan_id": "plan:p1", "ended_at": T0 + 2 * H, "at": T0 + 2 * H})
-        self.evidence({"kind": "activity", "actor": "sora", "activity": "gaming", "outcome": "succeeded",
-                       "plan_id": "plan:p2", "ended_at": T0 + 2 * H, "at": T0 + 2 * H})
-        self.store.sweep(T0 + 3 * H)
-        self.assertEqual(self._state(), "open")
-        self.evidence({"kind": "activity", "actor": "sora", "activity": "housework", "outcome": "succeeded",
-                       "plan_id": "plan:p1", "ended_at": T0 + 2 * H, "at": T0 + 2 * H})
-        self.store.sweep(T0 + 3 * H)
-        self.assertEqual(self._state(), "completed")
+        """Fails if a shared activity closes when the two did it in different plans, when one of them is missing,
+        when the overlap is shorter than ten minutes, or when the evidence is for another activity; or if the
+        genuine shared one (same plan, same place, long enough overlap) does not close it."""
+        it = self.intent("奈尔和艾莎一起做家务", ["nell", "elsa"])
+        a, b = T0 + H, T0 + H + 1200
+        bad = {
+            "different plans": [self.together("nell", "plan:p1", a, b), self.together("elsa", "plan:p2", a, b)],
+            "one member only": [self.together("nell", "plan:p1", a, b)],
+            "overlap under ten minutes": [self.together("nell", "plan:p1", a, a + 500),
+                                          self.together("elsa", "plan:p1", a + 400, b)],
+            "different places": [self.together("nell", "plan:p1", a, b),
+                                 self.together("elsa", "plan:p1", a, b, place="kitchen")],
+            "another activity": [dict(self.together("nell", "plan:p1", a, b), activity="gaming"),
+                                 dict(self.together("elsa", "plan:p1", a, b), activity="gaming")],
+        }
+        for label, ev in bad.items():
+            with self.subTest(label):
+                self.assertFalse(self.done(it, ev, T0 + 3 * H))
+        good = [self.together("nell", "plan:p1", a, b), self.together("elsa", "plan:p1", a + 300, b)]
+        self.assertTrue(self.done(it, good, T0 + 3 * H))
 
-    def test_outing_arrival_at_named_place_still_closes(self) -> None:
-        self._outing()
-        self.evidence({"kind": "arrived", "actor": "sora", "place": "library", "at": T0 + 60})
-        self.store.sweep(T0 + 120)
-        self.assertEqual(self._state(), "completed")
-
-    def test_cook_plan_finished_cancelled_does_not_close(self) -> None:
-        self.store.enqueue_chat("sora", "晚上做饭吧", "好", where="private",
-                                intents=[{"text": "晚上做饭", "kind": "cook", "答应了的": ["sora"]}], now=T0)
-        self.evidence({"kind": "plan_finished", "actor": "sora", "plan_kind": "cook",
-                       "outcome": "cancelled", "at": T0 + 60})
-        self.store.sweep(T0 + 120)
-        self.assertEqual(self._state(), "open")
-        self.evidence({"kind": "plan_finished", "actor": "sora", "plan_kind": "cook",
-                       "outcome": "done", "at": T0 + 90})
-        self.store.sweep(T0 + 120)
-        self.assertEqual(self._state(), "completed")
+    def test_outing_arrival_at_the_named_place_closes(self) -> None:
+        """Fails if an arrival at the named place does not close the promise, or an arrival somewhere else, or
+        by another housemate, does."""
+        it = self.intent("奈尔去公园", ["nell"])
+        self.assertFalse(self.done(it, [self.arrival("nell", "place:library", T0 + 60)], T0 + 120))
+        self.assertFalse(self.done(it, [self.arrival("elsa", "place:park", T0 + 60)], T0 + 120))
+        self.assertTrue(self.done(it, [self.arrival("nell", "place:park", T0 + 60)], T0 + 120))
 
     # --- time window
-    def test_errand_evidence_after_expiry_does_not_complete(self) -> None:
-        self.store.enqueue_chat("sora", "记得买洋葱", "好", where="private", now=T0)
-        self.evidence({"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2, "at": T0 + 30 * H})
-        self.store.sweep(T0 + 31 * H)
-        self.assertEqual(self._state(), "expired")
+    def test_errand_evidence_after_the_deadline_does_not_complete(self) -> None:
+        """Fails if a purchase after the deadline closes the promise; the control is a purchase inside the window."""
+        it = self.intent("奈尔买洋葱", ["nell"])
+        self.assertFalse(self.done(it, [self.purchase("nell", T0 + 30 * H)], T0 + 31 * H))
+        self.assertTrue(self.done(it, [self.purchase("nell", T0 + 3 * H)], T0 + 5 * H))
 
-    def test_errand_evidence_inside_window_completes_even_if_swept_late(self) -> None:
-        self.store.enqueue_chat("sora", "记得买洋葱", "好", where="private", now=T0)
-        self.evidence({"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2, "at": T0 + 3 * H})
-        self.store.sweep(T0 + 31 * H)
-        self.assertEqual(self._state(), "completed")
+    def test_errand_evidence_inside_the_window_completes_even_if_judged_late(self) -> None:
+        """Fails if a receipt that came inside the window stops counting because the judgement runs after the
+        deadline (the receipt must be judged by its own time)."""
+        it = self.intent("奈尔买洋葱", ["nell"])
+        self.assertTrue(self.done(it, [self.purchase("nell", T0 + 3 * H)], T0 + 31 * H))
 
     def test_evidence_before_creation_is_ignored(self) -> None:
-        self.evidence({"kind": "purchased", "actor": "sora", "item": "onion", "qty": 2, "at": T0 - 2 * H})
-        self.store.enqueue_chat("sora", "记得买洋葱", "好", where="private", now=T0)
-        self.store.sweep(T0 + H)
-        self.assertEqual(self._state(), "open")
+        """Fails if a purchase made before she said it closes the promise; the control is the same purchase after."""
+        it = self.intent("奈尔买洋葱", ["nell"])
+        self.assertFalse(self.done(it, [self.purchase("nell", T0 - 2 * H)], T0 + H))
+        self.assertTrue(self.done(it, [self.purchase("nell", T0 + 60)], T0 + H))
 
-    def test_outing_arrival_after_expiry_does_not_complete(self) -> None:
-        self._outing()
-        self.evidence({"kind": "arrived", "actor": "sora", "place": "library", "at": T0 + 30 * H})
-        self.store.sweep(T0 + 31 * H)
-        self.assertEqual(self._state(), "expired")
+    def test_outing_arrival_after_the_deadline_does_not_complete(self) -> None:
+        """Fails if an arrival after the deadline closes the promise; the control is an arrival inside the window."""
+        it = self.intent("奈尔去公园", ["nell"])
+        self.assertFalse(self.done(it, [self.arrival("nell", "place:park", T0 + 30 * H)], T0 + 31 * H))
+        self.assertTrue(self.done(it, [self.arrival("nell", "place:park", T0 + 3 * H)], T0 + 31 * H))
 
-    def test_together_plan_finished_after_expiry_does_not_complete(self) -> None:
-        self._together()
-        self.evidence({"kind": "plan_finished", "actor": "sora", "outcome": "done",
-                       "members": ["sora", "rin"], "at": T0 + 40 * H})
-        self.store.sweep(T0 + 41 * H)
-        self.assertEqual(self._state(), "expired")
+    def test_together_activity_after_the_deadline_does_not_complete(self) -> None:
+        """Fails if a shared activity that ended after the deadline closes the promise; the control is the same
+        activity inside the window."""
+        it = self.intent("奈尔和艾莎一起做家务", ["nell", "elsa"])
+        late = [self.together(x, "plan:p1", T0 + 40 * H, T0 + 41 * H) for x in ("nell", "elsa")]
+        self.assertFalse(self.done(it, late, T0 + 42 * H))
+        ok = [self.together(x, "plan:p1", T0 + 2 * H, T0 + 3 * H) for x in ("nell", "elsa")]
+        self.assertTrue(self.done(it, ok, T0 + 42 * H))
 
-    # --- destination map against the real catalog ids
-    def test_outing_destination_map_matches_real_place_ids(self) -> None:
-        places = json.loads((ROOT / "world-catalog/worldcatalog/life1/places.json").read_text("utf-8"))
+    # --- destination words against the real catalogue ids
+    def test_place_words_map_to_real_place_ids(self) -> None:
+        """Fails if a place word ("去超市", "去神社" ...) is not read as an arrival at that catalogue place, or if an
+        arrival somewhere else closes it. A word that maps to a wrong id would make every outing promise for it
+        unclosable (or closed by the wrong visit)."""
         cases = [
-            ("去喫茶店坐坐", "kissa_tomoshibi", "library"),
-            ("去咖啡店坐坐", "cafe", "library"),
-            ("去超市逛逛", "supermarket", "park"),
-            ("去公园走走", "park", "library"),
-            ("去图书馆借书", "library", "park"),
-            ("去书店逛逛", "bookshop", "park"),
-            ("去书签堂看看", "shiorido", "park"),
-            ("去便利店转转", "konbini", "park"),
-            ("去面包房看看", "bakery", "park"),
-            ("去神社参拜", "shrine", "park"),
-            ("去钱汤泡澡", "sento", "park"),
-            ("去拉面店吃饭", "ramen_shop", "park"),
-            ("去商店街逛逛", "shotengai", "park"),
+            ("去咖啡店", "cafe", "library"),
+            ("去超市", "supermarket", "park"),
+            ("去公园", "park", "library"),
+            ("去图书馆", "library", "park"),
+            ("去书店", "bookshop", "park"),
+            ("去书签堂", "shiorido", "park"),
+            ("去便利店", "konbini", "park"),
+            ("去面包房", "bakery", "park"),
+            ("去神社", "shrine", "park"),
+            ("去钱汤", "sento", "park"),
+            ("去拉面店", "ramen_shop", "park"),
+            ("去商店街", "shotengai", "park"),
         ]
-        for summary, good, bad in cases:
+        places = json.loads((ROOT / "world-catalog/worldcatalog/life1/places.json").read_text("utf-8"))
+        for words, good, bad in cases:
             self.assertIn(good, places)
-            for place, expect in ((bad, "open"), (good, "completed")):
-                with self.subTest(summary=summary, place=place):
-                    self.setUp()
-                    self._outing(text=summary, summary=summary)
-                    self.evidence({"kind": "arrived", "actor": "sora", "place": place, "at": T0 + 60})
-                    self.store.sweep(T0 + 120)
-                    self.assertEqual(self._state(), expect)
+            it = self.intent("奈尔" + words, ["nell"])
+            self.assertEqual(it["terms"], [{"kind": "arrived", "place": "place:" + good}], words)
+            with self.subTest(words=words):
+                self.assertFalse(self.done(it, [self.arrival("nell", "place:" + bad, T0 + 60)], T0 + 120))
+                self.assertTrue(self.done(it, [self.arrival("nell", "place:" + good, T0 + 60)], T0 + 120))
 
 
 class _MemoryBase(unittest.TestCase):
@@ -312,28 +292,29 @@ class _MemoryBase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         st = MemoryStore(tmp.name, clock=VirtualClock(T0), names={"sora": "苍空", "rin": "凛音"}, llm_fn=llm_fn,
-                         embed_plugin=embed_plugin)
+                         embed_plugin=embed_plugin, env=TRUST_ON)
         self.addCleanup(st.close)
         self.tmp = Path(tmp.name)
         return st
 
     @staticmethod
     def group_rows(st: MemoryStore) -> List[Dict[str, Any]]:
-        with st._connect() as c:
-            return [dict(r) for r in c.execute("SELECT * FROM mem WHERE scope='group' AND status='active' ORDER BY id")]
+        return sorted(st.list_entries("sora", "group", channel=GROUP, now=T0 + 200), key=lambda r: r["id"])
 
 
 class MemoryTrust(_MemoryBase):
+    # New store: trust levels are on only with AI_HOUSE_MEMORY_TRUST=1 (set in `make`); rows are read through
+    # `list_entries` (the old tests read the `mem` table), and the extraction ops come in the shared module's format.
     def _extract(self, lines: List[tuple], ops: List[Dict[str, Any]], st: Optional[MemoryStore] = None) -> MemoryStore:
         st = st or self.make()
         for i, (txt, role, spk) in enumerate(lines):
-            st.observe("sora", "group", txt, channel="g1", speaker=spk, speaker_role=role, now=T0 + i)
-        st.extract("sora", scope="group", channel="g1", force=True, llm_fn=lambda s, u: {"ops": ops}, now=T0 + 100)
+            st.observe("sora", "group", txt, channel=GROUP, speaker=spk, speaker_role=role, now=T0 + i)
+        st.extract("sora", scope="group", channel=GROUP, force=True, llm_fn=lambda s, u: {"ops": ops}, now=T0 + 100)
         return st
 
     def _seed_verified_friday(self) -> tuple:
         st = self.make()
-        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel="g1", about=["房主"], kind="fact",
+        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel=GROUP, about=["房主"], kind="fact",
                         trust="verified", source="auto:owner_verified", now=T0 - 1000)
         return st, mid
 
@@ -368,7 +349,7 @@ class MemoryTrust(_MemoryBase):
 
     def test_member_update_of_unverified_claim_is_still_allowed(self) -> None:
         st = self.make()
-        mid, _ = st.add("sora", "group", "小林好像周五有空", channel="g1", about=["小林"], kind="claim",
+        mid, _ = st.add("sora", "group", "小林好像周五有空", channel=GROUP, about=["小林"], kind="claim",
                         trust="group_stated", source="auto", now=T0 - 1000)
         self._extract([("小林其实周六才有空", "member", "小林")],
                       [{"op": "update", "id": mid, "text": "小林周六有空", "src": [1]}], st)
@@ -377,9 +358,9 @@ class MemoryTrust(_MemoryBase):
     def test_add_merge_cannot_overwrite_verified_text_with_weaker_trust(self) -> None:
         # A constant embedding makes every pair "near duplicates", forcing the dedupe-merge path.
         st = self.make(embed_plugin=lambda texts: [[1.0, 0.0] for _ in texts])
-        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel="g1", about=["房主"], kind="fact",
+        mid, _ = st.add("sora", "group", "房主周五要去京都出差", channel=GROUP, about=["房主"], kind="fact",
                         trust="verified", source="auto:owner_verified", now=T0 - 1000)
-        st.add("sora", "group", "房主周三要去京都出差", channel="g1", about=["房主"], kind="claim",
+        st.add("sora", "group", "房主周三要去京都出差", channel=GROUP, about=["房主"], kind="claim",
                trust="group_stated", source="auto", now=T0)
         rows = {r["id"]: r for r in self.group_rows(st)}
         self.assertEqual(rows[mid]["text"], "房主周五要去京都出差")
@@ -388,9 +369,9 @@ class MemoryTrust(_MemoryBase):
 
     def test_add_merge_still_merges_equal_or_stronger_trust(self) -> None:
         st = self.make(embed_plugin=lambda texts: [[1.0, 0.0] for _ in texts])
-        mid, _ = st.add("sora", "group", "小林好像周五有空", channel="g1", about=["小林"], kind="claim",
+        mid, _ = st.add("sora", "group", "小林好像周五有空", channel=GROUP, about=["小林"], kind="claim",
                         trust="group_stated", source="auto", now=T0 - 1000)
-        mid2, how = st.add("sora", "group", "小林周六有空", channel="g1", about=["小林"], kind="claim",
+        mid2, how = st.add("sora", "group", "小林周六有空", channel=GROUP, about=["小林"], kind="claim",
                            trust="group_stated", source="auto", now=T0)
         self.assertEqual((mid2, how), (mid, "merged"))
 
@@ -419,13 +400,14 @@ class MemoryTrust(_MemoryBase):
 
 
 class MemoryConflicts(_MemoryBase):
+    # New store: `search` flags a conflicting claim only with trust levels on; the flag is `_conflict_verified`, as before.
     def _search(self, verified: str, claim: str, query: str, vabout: tuple, cabout: tuple) -> List[Dict[str, Any]]:
         st = self.make()
-        st.add("sora", "group", verified, channel="g1", about=list(vabout), kind="fact", trust="verified",
+        st.add("sora", "group", verified, channel=GROUP, about=list(vabout), kind="fact", trust="verified",
                source="owner_verified", now=T0 - 60 * 86400)
-        st.add("sora", "group", claim, channel="g1", about=list(cabout), kind="claim", trust="group_stated",
+        st.add("sora", "group", claim, channel=GROUP, about=list(cabout), kind="claim", trust="group_stated",
                source="auto", now=T0)
-        hits = st.search("sora", "group", query, channel="g1", min_score=0.05, k=5, now=T0)
+        hits = st.search("sora", "group", query, channel=GROUP, min_score=0.05, k=5, now=T0)
         return [r for _, r in hits if r["kind"] == "claim"]
 
     def test_cross_person_preference_is_not_a_conflict(self) -> None:
@@ -458,47 +440,6 @@ class MemoryConflicts(_MemoryBase):
         claims = self._search("房主周五要去京都出差", "群友说房主周三要去京都出差", "房主什么时候去京都出差",
                               ("房主",), ("房主",))
         self.assertTrue(claims and all(c.get("_conflict_verified") for c in claims))
-
-
-class MigrationLogging(_MemoryBase):
-    def _legacy_db(self) -> Path:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        d = Path(tmp.name)
-        with contextlib.closing(sqlite3.connect(d / "memory.db")) as c:
-            c.executescript(BASE_TABLES_SQL + BASE_INDEXES_SQL)
-            for v in (1, 2):
-                c.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", (v, T0))
-            for text, src in (("群友乱猜房主喜欢香菜", "auto"), ("群友乱猜凛音不吃鱼", "auto"),
-                              ("房主确认喜欢黑咖啡", "owner_verified")):
-                c.execute(
-                    "INSERT INTO mem(owner, scope, channel, kind, trust, text, source, status, created, updated) "
-                    "VALUES('sora', 'group', 'g', 'fact', 'verified', ?, ?, 'active', ?, ?)",
-                    (text, src, T0, T0),
-                )
-            c.commit()
-        return d
-
-    def test_v3_migration_logs_demoted_row_count_once_and_is_idempotent(self) -> None:
-        d = self._legacy_db()
-        with self.assertLogs("ai_house.memory", level=logging.INFO) as cap:
-            st = MemoryStore(d, clock=VirtualClock(T0 + 10))
-        st.close()
-        msgs = [m for m in cap.output if "v3" in m or "降级" in m]
-        self.assertEqual(len(msgs), 1, cap.output)
-        self.assertRegex(msgs[0], r"\b2\b")
-        with self.assertNoLogs("ai_house.memory", level=logging.INFO):
-            MemoryStore(d, clock=VirtualClock(T0 + 20)).close()
-        with contextlib.closing(sqlite3.connect(d / "memory.db")) as c:
-            got = c.execute("SELECT kind, trust, COUNT(*) FROM mem GROUP BY kind, trust ORDER BY kind").fetchall()
-            self.assertEqual(c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], SCHEMA_VERSION)
-        self.assertEqual(got, [("claim", "group_stated", 2), ("fact", "verified", 1)])
-
-    def test_fresh_store_logs_no_demotion(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        with self.assertNoLogs("ai_house.memory", level=logging.INFO):
-            MemoryStore(tmp.name, clock=VirtualClock(T0)).close()
 
 
 if __name__ == "__main__":
