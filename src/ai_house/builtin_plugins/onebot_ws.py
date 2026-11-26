@@ -103,7 +103,7 @@ class OneBotConfig:
     retry_backoff_s: float = 0.15
     listen_only: bool = False  # ONEBOT_LISTEN_ONLY=1: read everything, write nothing (env only, never from stored config)
     listen_only_observe: bool = False  # ONEBOT_LISTEN_ONLY_OBSERVE=1: read the account's own sent replies back (env only)
-    observe_window_s: float = 120.0  # how long after the incoming message to look for the real reply
+    observe_window_s: float = 600.0  # how long after the incoming message to look for the real reply (a busy bot can take minutes)
     observe_poll_s: float = 10.0
     observe_max_msgs: int = 5  # bubbles collected for one reply
     observe_history_count: int = 20  # `count` asked of the history action
@@ -331,6 +331,8 @@ class OneBotChannel(ChannelPlugin):
             retry_backoff_s=_num(eff, "ONEBOT_RETRY_BACKOFF_S", 0.15, 0.01, 10.0),
             listen_only=listen_on,
             listen_only_observe=parse_listen_only_observe(eff.get("ONEBOT_LISTEN_ONLY_OBSERVE"), listen_on),
+            observe_window_s=_num(eff, "ONEBOT_LISTEN_ONLY_OBSERVE_WINDOW_S", 600.0, 30.0, 3600.0),
+            observe_poll_s=_num(eff, "ONEBOT_LISTEN_ONLY_OBSERVE_POLL_S", 10.0, 2.0, 120.0),
         )
         return cls(cfg)
 

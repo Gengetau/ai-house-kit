@@ -148,6 +148,21 @@ class SwitchTests(unittest.TestCase):
             with self.assertRaises(ChannelConfigError, msg=bad):
                 parse_listen_only_observe(bad, True)
 
+    def test_2b_the_wait_is_long_enough_for_a_slow_bot_and_can_be_set(self) -> None:
+        """Seen on a real account: the other program answered 176 s after the owner's line, past a 120 s wait.
+        Fails if the default wait is under 10 minutes, or the two settings are not read or not range-checked."""
+        base = {**self.ENV, "ONEBOT_LISTEN_ONLY": "1", "ONEBOT_LISTEN_ONLY_OBSERVE": "1"}
+        on = OneBotChannel.from_env(base)
+        self.assertGreaterEqual(on.cfg.observe_window_s, 600.0)
+        self.assertEqual(on.cfg.observe_poll_s, 10.0)
+        set_ = OneBotChannel.from_env({**base, "ONEBOT_LISTEN_ONLY_OBSERVE_WINDOW_S": "900",
+                                       "ONEBOT_LISTEN_ONLY_OBSERVE_POLL_S": "20"})
+        self.assertEqual((set_.cfg.observe_window_s, set_.cfg.observe_poll_s), (900.0, 20.0))
+        for key, bad in (("ONEBOT_LISTEN_ONLY_OBSERVE_WINDOW_S", "10"), ("ONEBOT_LISTEN_ONLY_OBSERVE_WINDOW_S", "abc"),
+                         ("ONEBOT_LISTEN_ONLY_OBSERVE_POLL_S", "0.5"), ("ONEBOT_LISTEN_ONLY_OBSERVE_POLL_S", "999")):
+            with self.assertRaises(ChannelConfigError, msg=(key, bad)):
+                OneBotChannel.from_env({**base, key: bad})
+
     def test_2_observe_without_listen_only_fails_and_the_default_is_off(self) -> None:
         for lo in ("", "0"):
             with self.assertRaises(ChannelConfigError) as cm:
