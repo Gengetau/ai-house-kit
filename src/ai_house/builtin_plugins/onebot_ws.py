@@ -921,6 +921,9 @@ class OneBotChannel(ChannelPlugin):
                         self._spool.ack(spool_ids, state="skipped", reason="listen_only_unsupported_host")
                     return self._ignore("listen_only_unsupported_host")
                 converse_kw["listen_only"] = True
+                if self.observing and self._host_accepts("observe_pending"):
+                    # the inbound line waits for the real reply, so memory gets the two together (see the host)
+                    converse_kw["observe_pending"] = True
             res = self._host.converse(channel, text, speaker, **converse_kw)
             sent = 0
             drafted_before = self.stats["listen_only"]
@@ -976,9 +979,11 @@ class OneBotChannel(ChannelPlugin):
     ) -> None:
         if not hasattr(self._host, "record_observed_reply"):
             self._log("observe: the host cannot take an observed reply; skipped")
+            self._release_observe(channel)
             return
         if not self._observe_slots.acquire(blocking=False):
             self._log("observe: too many replies being waited for; skipped")
+            self._release_observe(channel)
             return
 
         def run() -> None:
@@ -987,6 +992,7 @@ class OneBotChannel(ChannelPlugin):
             except Exception as exc:  # noqa: BLE001 - never log message text
                 self._bump("observe_failed")
                 self._log(f"observe failed: {type(exc).__name__}")
+                self._release_observe(channel)
             finally:
                 self._observe_slots.release()
 
@@ -1010,16 +1016,19 @@ class OneBotChannel(ChannelPlugin):
 
         if not self_id:
             self._log("observe: the account's own id is not known yet; skipped")
+            self._release_observe(channel)
             note("observe_error:no_self_id")
             return
         found, err = self._wait_for_own_reply(kind, target, t0, self_id)
         if err:
             self._bump("observe_failed")
             self._log(f"observe: history read failed ({err}); no reply recorded")
+            self._release_observe(channel)
             note(f"observe_error:{err}")
             return
         if not found:
             self._bump("observe_miss")
+            self._release_observe(channel)
             note("observe_none")
             return
         text = "\n".join(found)[:2000]
@@ -1029,6 +1038,16 @@ class OneBotChannel(ChannelPlugin):
         else:
             self._bump("observe_failed")
             note("observe_error:host_refused")
+
+    def _release_observe(self, channel: str) -> None:
+        """No real reply will be handed over for this turn: the host stops holding its inbound line back."""
+        fn = getattr(self._host, "release_observed_turn", None)
+        if fn is None:
+            return
+        try:
+            fn(channel)
+        except Exception as exc:  # noqa: BLE001 - never log message text
+            self._log(f"observe: release failed: {type(exc).__name__}")
 
     def _wait_for_own_reply(self, kind: str, target: str, t0: float, self_id: str) -> Tuple[List[str], str]:
         """(bubbles, "") when found, ([], "") when nothing came in the window, ([], error code) when a read failed.

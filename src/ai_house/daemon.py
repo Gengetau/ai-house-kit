@@ -78,6 +78,9 @@ from .settings_store import SettingsStore
 JST = dt.timezone(dt.timedelta(hours=9))
 SHADOW_CHAT_MODE = "shadow"  # a chat row holding a draft that a listen-only channel did not send
 OBSERVED_CHAT_MODE = "observed"  # a chat row holding a reply that another program really sent from the QQ account
+# A listen-only turn whose real reply is being waited for keeps the inbound line out of memory until that reply is read
+# back (or the wait ends), so extraction sees the line and her answer together. Lines held longer than this go in alone.
+OBSERVE_HOLD_MAX_S = 3900.0  # past the longest observe window (3600 s)
 
 
 def _house_time_line(now: float) -> str:
@@ -303,6 +306,8 @@ class HouseDaemon:
         self._packs_root = Path(packs_root) if packs_root else None
         self.env_file = Path(env_file) if env_file else None
         self._lock = threading.RLock()
+        # channel -> inbound lines of listen-only turns kept out of memory while their real reply is waited for
+        self._observe_held: Dict[str, List[Dict[str, Any]]] = {}
         self._async_job_lock = threading.Lock()
         self._outbox_send_lock = threading.Lock()
         self._stop = threading.Event()
@@ -1465,6 +1470,7 @@ class HouseDaemon:
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
         listen_only: bool = False,
+        observe_pending: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
 
@@ -1484,7 +1490,8 @@ class HouseDaemon:
         responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
         ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
-            return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only)
+            return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only,
+                                  observe_pending=observe_pending)
 
     def record_observed_reply(
         self,
@@ -1507,6 +1514,7 @@ class HouseDaemon:
             if self.needs_onboarding or self.authority is None or self.memory is None:
                 return False
             if aid not in self.vocab.ROSTER:
+                self._release_held(str(channel or ""), self.clock.now())
                 return False
             now = self.clock.now()
             with contextlib.closing(sqlite3.connect(self.world_db)) as c:
@@ -1517,7 +1525,8 @@ class HouseDaemon:
                         (channel, aid, self.vocab.NAMES.get(aid, aid), "owner" if speaker.is_owner else speaker.name,
                          text, OBSERVED_CHAT_MODE, now),
                     )
-            # an empty inbound text: the owner's line is already in memory, only her line is added
+            # the turn's inbound lines first (held while the reply was waited for), then her line: one batch for extraction
+            self._release_held(channel, now)
             self.memory.observe(
                 aid,
                 "private" if is_private else "group",
@@ -1532,6 +1541,52 @@ class HouseDaemon:
         self._broadcast("chat", {"channel": "group" if channel == "group" else "private", "replies": 1})
         return True
 
+    def release_observed_turn(self, channel: str) -> int:
+        """No real reply will come for the listen-only turns of `channel` that were held (none in the window, a failed
+        read, observing skipped): their inbound lines go into memory on their own. -> lines released."""
+        with self._lock:
+            return self._release_held(str(channel or ""), self.clock.now())
+
+    def _observe_inbound(
+        self, held: bool, channel: str, aid: str, scope: str, text: str, *, mem_ch: str, speaker: Speaker,
+        speaker_role: str, now: float,
+    ) -> None:
+        """Memory gets the inbound line of a listen-only turn with no reply (the draft was not said); with `held` it
+        waits for the real reply instead (see `_converse`). Caller holds `self._lock`."""
+        kw = {
+            "actor": aid, "scope": scope, "text": text, "channel": mem_ch, "speaker": speaker.name,
+            "speaker_role": speaker_role,
+            "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else ""), "now": now,
+        }
+        self._release_stale_held(now)
+        if held:
+            self._observe_held.setdefault(str(channel or ""), []).append(kw)
+            return
+        self._observe_one(kw)
+
+    def _observe_one(self, kw: Mapping[str, Any]) -> None:
+        if self.memory is None:
+            return
+        kw = dict(kw)
+        self.memory.observe(kw.pop("actor"), kw.pop("scope"), kw.pop("text"), reply="", **kw)
+
+    def _release_held(self, channel: str, now: float) -> int:
+        """Caller holds `self._lock`. Held lines of `channel` (and any held too long elsewhere) go into memory, oldest first."""
+        rows = self._observe_held.pop(channel, [])
+        for kw in rows:
+            self._observe_one(kw)
+        return len(rows) + self._release_stale_held(now)
+
+    def _release_stale_held(self, now: float) -> int:
+        n = 0
+        for ch in list(self._observe_held):
+            rows = self._observe_held[ch]
+            if rows and now - float(rows[0]["now"]) > OBSERVE_HOLD_MAX_S:
+                for kw in self._observe_held.pop(ch):
+                    self._observe_one(kw)
+                    n += 1
+        return n
+
     def _converse(
         self,
         channel: str,
@@ -1541,6 +1596,7 @@ class HouseDaemon:
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
         listen_only: bool = False,
+        observe_pending: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry shared by the web studio and chat plugins (OneBot).
 
@@ -1553,6 +1609,11 @@ class HouseDaemon:
         stored and remembered as usual, but the draft reply is not something she said. It is kept as a chat row with
         its own mode (`shadow`, left out of the recent history she is given) and memory observes the turn with no
         reply, so nothing that was never said can be read back later as her words (or turned into a promise).
+
+        `observe_pending` (with `listen_only`): the channel will read back what the account really sent for this turn
+        and hand it to `record_observed_reply`. The inbound line is then held out of memory until that reply comes (or
+        `release_observed_turn` says none will), so the line and her answer reach extraction together: the real reply
+        can take minutes, and an extraction in between would see the request with no answer (no promise is made).
         """
         text = str(text or "").strip()
         if not text:
@@ -1869,16 +1930,10 @@ class HouseDaemon:
                     "messages": [],
                 }
             for aid, rep in raw_replies:
+                held = listen_only and observe_pending
                 if rep["mode"] == "quiet":
-                    self.memory.observe(
-                        aid,
-                        scope,
-                        text,
-                        channel=mem_ch,
-                        speaker=speaker.name,
-                        speaker_role=speaker_role,
-                        speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
-                        reply="",
+                    self._observe_inbound(
+                        held, channel, aid, scope, text, mem_ch=mem_ch, speaker=speaker, speaker_role=speaker_role,
                         now=now,
                     )
                     continue
@@ -1909,17 +1964,23 @@ class HouseDaemon:
                                 now,
                             ),
                         )
-                self.memory.observe(
-                    aid,
-                    scope,
-                    text,
-                    channel=mem_ch,
-                    speaker=speaker.name,
-                    speaker_role=speaker_role,
-                    speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
-                    reply="" if (listen_only or rep["mode"] in ("blocked", "sleeping")) else rep["text"],
-                    now=now,
-                )
+                if listen_only:
+                    self._observe_inbound(
+                        held, channel, aid, scope, text, mem_ch=mem_ch, speaker=speaker, speaker_role=speaker_role,
+                        now=now,
+                    )
+                else:
+                    self.memory.observe(
+                        aid,
+                        scope,
+                        text,
+                        channel=mem_ch,
+                        speaker=speaker.name,
+                        speaker_role=speaker_role,
+                        speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
+                        reply="" if rep["mode"] in ("blocked", "sleeping") else rep["text"],
+                        now=now,
+                    )
                 replies.append(rep)
 
             # The reply may have used up this turn's deadline; the world step is not part of "generate the reply", so
@@ -2601,6 +2662,7 @@ class HouseDaemon:
     def reset_house(self) -> Dict[str, Any]:
         with self._async_job_lock, self._lock:
             self._reset_epoch += 1
+            self._observe_held.clear()  # lines of the old house never reach the new one
             self._teardown_world()
             if getattr(self, "agent_runtime", None) is not None:
                 self.agent_runtime.forget_all()  # those residents are gone; their conversations go with them

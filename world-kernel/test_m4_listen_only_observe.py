@@ -11,6 +11,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -408,6 +409,44 @@ class ObserveTests(_ObserveBase):
         self.d.record_observed_reply("private:sora", HER_REAL, owner_speaker("房主"))
         self.assertEqual([r["mode"] for r in self.chat("private:sora")], ["observed"])
 
+    def test_17b_the_inbound_line_waits_for_the_real_reply_and_keeps_its_own_time(self) -> None:
+        t = time.time()
+        ch = self.channel()
+        came = threading.Event()
+        self.hist_for("private", lambda n: [_msg("s1", SELF, t + 2, _seg(HER_REAL))] if came.is_set() else [])
+        self.assertEqual(ch.handle_event(_dm("m-held", t, "明天想吃什么")), "listen_only")
+        time.sleep(0.3)  # several polls: still waiting
+        self.assertEqual(self.observe.call_args_list, [])  # memory has not got the line yet
+        came.set()
+        self.assertEqual(self.wait_record(ch)["verdict"], "observed:1")
+        calls = self.observe.call_args_list
+        self.assertEqual([(c.args[2], c.kwargs["reply"]) for c in calls], [("明天想吃什么", ""), ("", HER_REAL)])
+        self.assertLessEqual(calls[0].kwargs["now"], calls[1].kwargs["now"])  # the line keeps the time it was said
+
+    def test_17c_held_lines_are_let_go_when_no_reply_will_come(self) -> None:
+        sp = owner_speaker("房主")
+        self.d.converse("private:sora", "第一句", sp, listen_only=True, observe_pending=True)
+        self.d.converse("private:sora", "第二句", sp, listen_only=True, observe_pending=True)
+        self.assertEqual(self.observe.call_args_list, [])
+        self.assertEqual(self.d.release_observed_turn("private:sora"), 2)
+        self.assertEqual([(c.args[2], c.kwargs["reply"]) for c in self.observe.call_args_list], [("第一句", ""), ("第二句", "")])
+        self.assertEqual(self.d.release_observed_turn("private:sora"), 0)  # nothing twice
+        # without observe_pending (observe off, or a live channel) the line goes in at once, as before
+        self.d.converse("private:sora", "第三句", sp, listen_only=True)
+        self.assertEqual(self.observe.call_args_list[-1].args[2], "第三句")
+
+    def test_17d_a_line_held_too_long_goes_in_alone_and_a_reset_drops_held_lines(self) -> None:
+        import ai_house.daemon as dmod
+        sp = owner_speaker("房主")
+        self.d.converse("private:sora", "很久以前", sp, listen_only=True, observe_pending=True)
+        with patch.object(dmod, "OBSERVE_HOLD_MAX_S", -1.0):  # every held line is now too old
+            self.d.converse("group", "别处的一句", sp, listen_only=True, observe_pending=True)
+        self.assertIn("很久以前", [c.args[2] for c in self.observe.call_args_list])
+        self.d._observe_held["private:sora"] = [{"actor": "sora", "scope": "private", "text": "x", "channel": "",
+                                                 "speaker": "房主", "speaker_role": "owner", "speaker_id": "", "now": 0.0}]
+        self.d.reset_house()
+        self.assertEqual(self.d._observe_held, {})
+
 
 # ======================================================================================================================
 class PromiseEndToEnd(unittest.TestCase):
@@ -428,20 +467,24 @@ class PromiseEndToEnd(unittest.TestCase):
         reply.start()
         self.addCleanup(reply.stop)
 
-    def run_turn(self, history: Any) -> OneBotChannel:
+    def run_turn(self, history: Any, *, wait: bool = True, window_s: float = 1.0) -> OneBotChannel:
         t = time.time()
         self.srv.script["get_friend_msg_history"] = lambda params, n: history(t)
         cfg = OneBotConfig(url=self.srv.url, owners=frozenset({"8001"}), groups=frozenset(), actor="nell", min_interval_s=0.0,
                            send_retries=0, send_timeout_s=3.0, listen_only=True, listen_only_observe=True,
-                           observe_window_s=1.0, observe_poll_s=0.1)
+                           observe_window_s=window_s, observe_poll_s=0.1)
         ch = OneBotChannel(cfg)
         ch.start(self.d)
         self.addCleanup(ch.stop)
         self.assertTrue(_wait_until(lambda: ch._ws is not None, 5.0))
         self.assertEqual(ch.handle_event(_dm("m-promise", t, OWNER_ASK)), "listen_only")
+        if wait:
+            self.wait_observed(ch)
+        return ch
+
+    def wait_observed(self, ch: OneBotChannel) -> None:
         self.assertTrue(_wait_until(lambda: any(r["path"] == "observe" for r in ch.listen_only_rows(200)), 8.0))
         self.assertEqual(self.srv.sends(), [])  # QQ received zero send actions
-        return ch
 
     def statuses(self) -> List[str]:
         op = {"op": "intent", "text": "奈尔答应房主：明天帮房主买一盒红茶回来", "kind": "promise", "for": ["房主"],
@@ -461,6 +504,19 @@ class PromiseEndToEnd(unittest.TestCase):
     def test_19_without_an_observed_reply_nothing_is_accepted_as_before(self) -> None:
         self.run_turn(lambda t: [])
         self.assertNotIn("accepted", self.statuses())
+
+    def test_20_an_extraction_while_the_real_reply_is_still_coming_does_not_lose_the_promise(self) -> None:
+        # 2026-11-26 parallel run: the other program answered about two minutes after the owner; memory had already
+        # extracted the owner's request alone (owner_quiet, 90 s) and then her answer alone: no promise. The request now
+        # waits for the answer, so whatever extraction runs in between, the two are read together.
+        came = threading.Event()
+        ch = self.run_turn(lambda t: [_msg("s1", SELF, t + 1, _seg(HER_REAL))] if came.is_set() else [],
+                           wait=False, window_s=8.0)
+        self.assertEqual(self.statuses(), [])  # an extraction during the wait: nothing to read yet, nothing lost
+        came.set()
+        self.wait_observed(ch)
+        self.assertEqual(self.statuses(), ["accepted"])
+        self.assertEqual(ch.stats["observed"], 1)
 
 
 if __name__ == "__main__":
