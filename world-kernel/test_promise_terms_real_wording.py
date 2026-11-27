@@ -153,5 +153,100 @@ class OtherPack(Base, unittest.TestCase):
             self.assertEqual(r.compile_terms(text, V, PARTY, b), P.compile_terms(text, V, PARTY, b), text)
 
 
+class WhenAdverbials:
+    """`出门时` and the like say only when; they are dropped like 下次. Anything else around them still blocks."""
+    name, party = "奈尔", PARTY
+
+    def c(self, text, beneficiary=["owner"]):
+        return self.compile(text.replace("奈尔", self.name), self.party, beneficiary)
+
+    def test_going_out_is_a_when_word(self):
+        self.assertEqual(self.c("奈尔答应房主：11月21日出门时顺路买一盒红茶带回来"), TEA)
+        self.assertEqual(self.c("奈尔答应房主：11月23日出门时帮买六个鸡蛋"),
+                         [{"kind": "purchased", "item": "egg", "qty": 6}])
+        for when in ("出门的时候", "出去的时候", "出去时", "出门", "等下", "等会儿", "等会", "待会儿", "待会", "一会儿"):
+            self.assertEqual(self.c("奈尔答应房主：" + when + "顺路买一盒红茶带回来"), TEA, when)
+
+    def test_what_the_when_word_must_not_turn_into_an_errand(self):
+        for text in ("奈尔答应房主：下次出门先去找红茶，买到马上告诉房主", "奈尔答应房主：出门前把红茶喝完",
+                     "奈尔答应房主：出门时不买红茶", "奈尔答应房主：出门时顺路做咖喱"):
+            self.assertEqual(self.c(text), UNSUPPORTED, text)
+
+    def test_day_after_the_day_after_tomorrow_is_a_date_note(self):
+        a = self.compile("和房主11月25日（大后天）一起去公园散步", self.party_pair)
+        self.assertEqual(a, self.compile("和房主11月25日一起去公园散步", self.party_pair))
+        self.assertEqual(self.c("奈尔答应房主：11月24日（后天）帮房主带一瓶可乐回来"), errand("cola", 1))
+
+
+class WhenAdverbialsDefault(WhenAdverbials, Base, unittest.TestCase):
+    rules, vocab = P, V
+    party_pair = ["nell", "owner"]
+
+
+class WhenAdverbialsBound(WhenAdverbials, Base, unittest.TestCase):
+    name, party = "苍空", ["sora"]
+    party_pair = ["sora", "owner"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vocab = V.load_pack(PACK)
+        cls.rules = P.bound(cls.vocab)
+
+
+class BareBring:
+    """Made for the owner, `带<item>` with no `回来` is the same errand as `带<item>回来`; otherwise nothing changes."""
+    name, party = "奈尔", PARTY
+
+    def c(self, text, beneficiary=["owner"]):
+        return self.compile(text.replace("奈尔", self.name), self.party, beneficiary)
+
+    def test_bare_bring_for_the_owner_is_an_errand(self):
+        """Fails if `带一包薯片` / `带两盒牛奶` for the owner stays unsupported, or loses an event or the count."""
+        self.assertEqual(self.c("奈尔答应房主下次出门顺路带一包薯片"), errand("chips", 1))
+        self.assertEqual(self.c("奈尔答应房主：明天带两盒牛奶"), errand("milk", 2))
+        self.assertEqual(self.c("奈尔答应房主：带一包薯片给他。"), errand("chips", 1))
+
+    def test_without_the_owner_as_beneficiary_it_stays_unsupported(self):
+        """Fails if the bare form is read as an errand when nobody says it is for the owner."""
+        for b in ([], None, ["nell"], ["owner", "nell"]):
+            self.assertEqual(self.c("奈尔答应房主：明天带两盒牛奶", b), UNSUPPORTED, b)
+            self.assertEqual(self.c("奈尔答应房主下次出门顺路带一包薯片", b), UNSUPPORTED, b)
+
+    def test_not_an_ingredient_or_not_an_errand_stays_unsupported(self):
+        """Fails if anything but an ingredient, or a trip somewhere, turns into a purchase."""
+        for text in ("奈尔答应房主：带伞", "奈尔答应房主：带他去公园", "奈尔答应房主：带一包薯片去公园",
+                     "奈尔答应房主：带一包薯片和伞", "奈尔答应房主：不带薯片"):
+            for b in (["owner"], None):
+                got = self.c(text, b)
+                self.assertEqual(got, UNSUPPORTED, text)
+                self.assertFalse([x for x in got if x["kind"] == "purchased"], text)
+
+
+    def test_bracket_note_saying_it_is_for_the_owner(self):
+        """Seen in a real run: the summary ended in （替房主买）, and the second 买 in it left the errand unsupported.
+        Fails if such a note still blocks it, or if a note that says anything else stops blocking."""
+        self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（替房主买）"), TEA)
+        self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（帮他买的）"), TEA)
+        self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（给房主）"), TEA)
+        for b in ([], None):
+            self.assertEqual(self.c("奈尔出门时顺便买一盒红茶带回来（替房主买）", b), UNSUPPORTED, b)
+        for text in ("奈尔出门时顺便买一盒红茶带回来（替房主买两盒）", "奈尔出门时顺便买一盒红茶带回来（不用替房主买）",
+                     "奈尔出门时顺便买一盒红茶带回来（替房主买伞）"):
+            self.assertEqual(self.c(text), UNSUPPORTED, text)
+
+
+class BareBringDefault(BareBring, Base, unittest.TestCase):
+    rules, vocab = P, V
+
+
+class BareBringBound(BareBring, Base, unittest.TestCase):
+    name, party = "苍空", ["sora"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vocab = V.load_pack(PACK)
+        cls.rules = P.bound(cls.vocab)
+
+
 if __name__ == "__main__":
     unittest.main()

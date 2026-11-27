@@ -77,6 +77,17 @@ from .settings_store import SettingsStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
 SHADOW_CHAT_MODE = "shadow"  # a chat row holding a draft that a listen-only channel did not send
+OBSERVED_CHAT_MODE = "observed"  # a chat row holding a reply that another program really sent from the QQ account
+# A listen-only turn whose real reply is being waited for keeps the inbound line out of memory until that reply is read
+# back (or the wait ends), so extraction sees the line and her answer together. Lines held longer than this go in alone.
+OBSERVE_HOLD_MAX_S = 3900.0  # past the longest observe window (3600 s)
+
+
+def _house_time_line(now: float) -> str:
+    d = dt.datetime.fromtimestamp(float(now), JST)
+    return (f"小屋现在的时间：{d.year}年{d.month}月{d.day}日 星期{'一二三四五六日'[d.weekday()]} {d:%H:%M}（日本时间）。"
+            "说“今天、明天、后天”都按这个日期算，不要用别处看到的日期。")
+
 
 HOST_EXTRA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -159,16 +170,38 @@ class OffsetWallClock:
             pass
 
 
+VIRTUAL_CLOCK_FILE = "virtual_clock.json"
+
+
 def _latest_house_time(life_db: str | Path) -> float:
-    """Latest time the house reached according to the persisted event log (0.0 when there is none)."""
-    if not Path(life_db).is_file():
-        return 0.0
+    """Latest time the house is known to have reached (0.0 when there is nothing).
+
+    Three places remember it, and the newest wins: the kernel event log (`life1.db`), the house's own events and
+    stored chat lines (`world.db`, next to it), and `virtual_clock.json`, which a virtual-clock house writes every time
+    it moves the clock (steps through a quiet stretch leave no event, so the log alone is not enough).
+    """
+    life = Path(life_db)
+    best = 0.0
+    probes = [
+        (life, "SELECT MAX(MAX(recorded_at), MAX(occurred_at)) FROM events"),
+        (life.with_name("world.db"), "SELECT MAX(created_at) FROM chat_messages"),
+        (life.with_name("world.db"), "SELECT MAX(ts) FROM events"),
+    ]
+    for fp, sql in probes:
+        if not fp.is_file():
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{fp.as_posix()}?mode=ro", uri=True)) as c:
+                row = c.execute(sql).fetchone()
+            best = max(best, float(row[0] or 0.0))
+        except (sqlite3.Error, TypeError, ValueError):
+            continue
     try:
-        with contextlib.closing(sqlite3.connect(f"file:{Path(life_db).as_posix()}?mode=ro", uri=True)) as c:
-            row = c.execute("SELECT MAX(MAX(recorded_at), MAX(occurred_at)) FROM events").fetchone()
-        return float(row[0] or 0.0)
-    except (sqlite3.Error, TypeError, ValueError):
-        return 0.0
+        doc = json.loads((life.parent / VIRTUAL_CLOCK_FILE).read_text(encoding="utf-8"))
+        best = max(best, float(doc.get("now") or 0.0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return best
 
 
 class DaemonLockError(RuntimeError):
@@ -273,6 +306,8 @@ class HouseDaemon:
         self._packs_root = Path(packs_root) if packs_root else None
         self.env_file = Path(env_file) if env_file else None
         self._lock = threading.RLock()
+        # channel -> inbound lines of listen-only turns kept out of memory while their real reply is waited for
+        self._observe_held: Dict[str, List[Dict[str, Any]]] = {}
         self._async_job_lock = threading.Lock()
         self._outbox_send_lock = threading.Lock()
         self._stop = threading.Event()
@@ -723,6 +758,7 @@ class HouseDaemon:
                 pass
         if hasattr(self, "_lock"):
             with self._lock:
+                self._persist_virtual_time()
                 self._teardown_world()
         else:
             self._teardown_world()
@@ -755,6 +791,11 @@ class HouseDaemon:
                 self.memory.backfill_vectors()
             except Exception as exc:  # noqa: BLE001
                 self.log(f"memory vector backfill error: {type(exc).__name__}")
+            if self.intents is not None:
+                try:  # a promise the kernel just closed becomes a memory of hers (once)
+                    self.intents.record_completions(now)
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"promise completion memory error: {type(exc).__name__}: {exc}")
             if due_diary_day(now) is not None:
                 try:
                     stored_pl = self.settings_store.get_plugins_map()
@@ -793,9 +834,12 @@ class HouseDaemon:
 
     def _unbuyable_item(self, owner_text: str, rep: Mapping[str, Any]) -> str:
         """The thing the owner asked to have bought that is not in the catalog (so cannot be), or ""."""
+        return self._unbuyable_from(owner_text, str(rep.get("text") or ""))
+
+    def _unbuyable_from(self, owner_text: str, reply_text: str = "") -> str:
         if self.intents is None or buy_words.detect_errand_item(self.vocab, owner_text)[0]:
             return ""
-        noun = buy_words.extract_buy_request_noun(owner_text, str(rep.get("text") or ""))
+        noun = buy_words.extract_buy_request_noun(owner_text, reply_text)
         return "" if not noun or buy_words.resolve_item_id(self.vocab, noun) else noun
 
     def _run_plugin_tasks(self, now: float) -> None:
@@ -831,6 +875,18 @@ class HouseDaemon:
                     if err not in self._plugin_runtime_errors:
                         self._plugin_runtime_errors.append(err)
                 self.log(f"plugin task {defn.plugin_id}.{task.task_id} skipped: {err['error']}")
+
+    def _persist_virtual_time(self) -> None:
+        """A virtual-clock house writes down how far it has got, so a restart continues from there (best effort)."""
+        if not self._virtual_clock or self.needs_onboarding or self.authority is None:
+            return  # a reset house starts over: nothing to remember
+        try:
+            fp = self.runtime_dir / VIRTUAL_CLOCK_FILE
+            tmp = fp.with_name(fp.name + ".tmp")
+            tmp.write_text(json.dumps({"now": float(self.clock.now())}), encoding="utf-8")
+            os.replace(tmp, fp)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
 
     def step_once(self) -> Dict[str, Any]:
         with self._lock:
@@ -870,6 +926,7 @@ class HouseDaemon:
             for _ in range(minutes):
                 self.clock.advance(60)
                 self.authority.step()
+            self._persist_virtual_time()
         self._run_post_step_jobs()
         snap = self.get_state()
         self._broadcast("state", {"now": snap["now_jst"], "fast_forwarded_min": minutes})
@@ -1413,6 +1470,7 @@ class HouseDaemon:
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
         listen_only: bool = False,
+        observe_pending: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry (see `_converse`), bounded by a total LLM time ceiling.
 
@@ -1432,7 +1490,102 @@ class HouseDaemon:
         responders = _GROUP_MAX_RESPONDERS if str(channel or "group").strip().lower() == "group" else 1
         ceiling = _env_budget(self.env.get("AI_HOUSE_CONVERSE_BUDGET_S"), budget * responders)
         with deadline_scope(max(1.0, min(ceiling, 600.0))):
-            return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only)
+            return self._converse(channel, text, speaker, actor=actor, attachments=attachments, listen_only=listen_only,
+                                  observe_pending=observe_pending)
+
+    def record_observed_reply(
+        self,
+        channel: str,
+        text: str,
+        speaker: Speaker,
+        *,
+        actor: Optional[str] = None,
+    ) -> bool:
+        """A listen-only channel with observe on read back what the account really sent for a turn it only drafted.
+        That is what she said: it is stored as her chat row (mode `observed`, shown to her like any reply) and memory
+        gets it as her line (the owner's line was observed with the turn), so extraction and the promise chain see an
+        answer. False when nothing was stored (empty text, no such room or roommate, world gone)."""
+        text = str(text or "").strip()[:2000]
+        if not text:
+            return False
+        is_private = str(channel or "").startswith("private:")
+        aid = channel.split(":", 1)[1] if is_private else str(actor or "")
+        with self._lock:
+            if self.needs_onboarding or self.authority is None or self.memory is None:
+                return False
+            if aid not in self.vocab.ROSTER:
+                self._release_held(str(channel or ""), self.clock.now())
+                return False
+            now = self.clock.now()
+            with contextlib.closing(sqlite3.connect(self.world_db)) as c:
+                with c:
+                    c.execute(
+                        "INSERT INTO chat_messages(channel, sender, sender_name, actor_target, text, badge, mode, media_json, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, '', ?, '[]', ?)",
+                        (channel, aid, self.vocab.NAMES.get(aid, aid), "owner" if speaker.is_owner else speaker.name,
+                         text, OBSERVED_CHAT_MODE, now),
+                    )
+            # the turn's inbound lines first (held while the reply was waited for), then her line: one batch for extraction
+            self._release_held(channel, now)
+            self.memory.observe(
+                aid,
+                "private" if is_private else "group",
+                "",
+                channel="" if is_private else channel,
+                speaker=speaker.name,
+                speaker_role="owner" if speaker.is_owner else "member",
+                speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
+                reply=text,
+                now=now,
+            )
+        self._broadcast("chat", {"channel": "group" if channel == "group" else "private", "replies": 1})
+        return True
+
+    def release_observed_turn(self, channel: str) -> int:
+        """No real reply will come for the listen-only turns of `channel` that were held (none in the window, a failed
+        read, observing skipped): their inbound lines go into memory on their own. -> lines released."""
+        with self._lock:
+            return self._release_held(str(channel or ""), self.clock.now())
+
+    def _observe_inbound(
+        self, held: bool, channel: str, aid: str, scope: str, text: str, *, mem_ch: str, speaker: Speaker,
+        speaker_role: str, now: float,
+    ) -> None:
+        """Memory gets the inbound line of a listen-only turn with no reply (the draft was not said); with `held` it
+        waits for the real reply instead (see `_converse`). Caller holds `self._lock`."""
+        kw = {
+            "actor": aid, "scope": scope, "text": text, "channel": mem_ch, "speaker": speaker.name,
+            "speaker_role": speaker_role,
+            "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else ""), "now": now,
+        }
+        self._release_stale_held(now)
+        if held:
+            self._observe_held.setdefault(str(channel or ""), []).append(kw)
+            return
+        self._observe_one(kw)
+
+    def _observe_one(self, kw: Mapping[str, Any]) -> None:
+        if self.memory is None:
+            return
+        kw = dict(kw)
+        self.memory.observe(kw.pop("actor"), kw.pop("scope"), kw.pop("text"), reply="", **kw)
+
+    def _release_held(self, channel: str, now: float) -> int:
+        """Caller holds `self._lock`. Held lines of `channel` (and any held too long elsewhere) go into memory, oldest first."""
+        rows = self._observe_held.pop(channel, [])
+        for kw in rows:
+            self._observe_one(kw)
+        return len(rows) + self._release_stale_held(now)
+
+    def _release_stale_held(self, now: float) -> int:
+        n = 0
+        for ch in list(self._observe_held):
+            rows = self._observe_held[ch]
+            if rows and now - float(rows[0]["now"]) > OBSERVE_HOLD_MAX_S:
+                for kw in self._observe_held.pop(ch):
+                    self._observe_one(kw)
+                    n += 1
+        return n
 
     def _converse(
         self,
@@ -1443,6 +1596,7 @@ class HouseDaemon:
         actor: Optional[str] = None,
         attachments: Optional[Mapping[str, Any]] = None,
         listen_only: bool = False,
+        observe_pending: bool = False,
     ) -> Dict[str, Any]:
         """The one conversation entry shared by the web studio and chat plugins (OneBot).
 
@@ -1455,6 +1609,11 @@ class HouseDaemon:
         stored and remembered as usual, but the draft reply is not something she said. It is kept as a chat row with
         its own mode (`shadow`, left out of the recent history she is given) and memory observes the turn with no
         reply, so nothing that was never said can be read back later as her words (or turned into a promise).
+
+        `observe_pending` (with `listen_only`): the channel will read back what the account really sent for this turn
+        and hand it to `record_observed_reply`. The inbound line is then held out of memory until that reply comes (or
+        `release_observed_turn` says none will), so the line and her answer reach extraction together: the real reply
+        can take minutes, and an extraction in between would see the request with no answer (no promise is made).
         """
         text = str(text or "").strip()
         if not text:
@@ -1616,6 +1775,8 @@ class HouseDaemon:
             asker: Dict[str, Any] = {"speaker": speaker.name, "speaker_role": speaker_role,
                                      "speaker_id": speaker.identity_id or ("user:owner" if speaker.is_owner else "")}
             mem_ctx = self.memory.recall(aid, scope, text, channel=mem_ch, now=now, **asker)
+            # first line of every turn, both brains: the house's own date (the engine's clock may differ)
+            mem_ctx = "\n".join(filter(None, [_house_time_line(now), mem_ctx]))
             if self.intents is not None:
                 # with INTENTS_SHOW on: what she agreed in a group chat and is due soon (as on her card); off: nothing
                 try:
@@ -1628,6 +1789,26 @@ class HouseDaemon:
             today = self._today_lines(aid, now, is_private)
             if today:
                 mem_ctx = "\n".join(filter(None, [mem_ctx, "你今天已经做过的事（屋里的记录，按时间）：", *today]))
+            if self.intents is not None and (is_private or self.intents.show):
+                # her agreed, unfinished promises with the day already worked out (she must not do date arithmetic);
+                # a group turn gets them only with INTENTS_SHOW=1, like the card lines above
+                try:
+                    open_promises = self.intents.open_lines(aid, now, is_private)
+                except Exception as exc:  # noqa: BLE001  # a promise read never stops her reply
+                    open_promises = []
+                    self.log(f"open promises error: {type(exc).__name__}")
+                if open_promises:
+                    mem_ctx = "\n".join(filter(None, [mem_ctx, "你答应了、还没办的事（屋里的记录）：", *open_promises]))
+            if speaker.is_owner:
+                # told before she replies; the "买不了" tail after her reply stays as the fallback
+                try:
+                    cant_buy = self._unbuyable_from(text)
+                except Exception as exc:  # noqa: BLE001  # a hint never stops her reply
+                    cant_buy = ""
+                    self.log(f"unbuyable hint error: {type(exc).__name__}")
+                if cant_buy:
+                    mem_ctx = "\n".join(filter(None, [mem_ctx, f"房主这句话里要买的「{cant_buy}」，附近的店里买不到（小屋的清单里没有）。"
+                                                      "照实告诉他买不了，不要答应去买；清单里有相近的东西可以问他要不要换。"]))
             turn_media: List[Dict[str, Any]] = []
 
             def _run_tool(
@@ -1749,16 +1930,10 @@ class HouseDaemon:
                     "messages": [],
                 }
             for aid, rep in raw_replies:
+                held = listen_only and observe_pending
                 if rep["mode"] == "quiet":
-                    self.memory.observe(
-                        aid,
-                        scope,
-                        text,
-                        channel=mem_ch,
-                        speaker=speaker.name,
-                        speaker_role=speaker_role,
-                        speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
-                        reply="",
+                    self._observe_inbound(
+                        held, channel, aid, scope, text, mem_ch=mem_ch, speaker=speaker, speaker_role=speaker_role,
                         now=now,
                     )
                     continue
@@ -1789,17 +1964,23 @@ class HouseDaemon:
                                 now,
                             ),
                         )
-                self.memory.observe(
-                    aid,
-                    scope,
-                    text,
-                    channel=mem_ch,
-                    speaker=speaker.name,
-                    speaker_role=speaker_role,
-                    speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
-                    reply="" if (listen_only or rep["mode"] in ("blocked", "sleeping")) else rep["text"],
-                    now=now,
-                )
+                if listen_only:
+                    self._observe_inbound(
+                        held, channel, aid, scope, text, mem_ch=mem_ch, speaker=speaker, speaker_role=speaker_role,
+                        now=now,
+                    )
+                else:
+                    self.memory.observe(
+                        aid,
+                        scope,
+                        text,
+                        channel=mem_ch,
+                        speaker=speaker.name,
+                        speaker_role=speaker_role,
+                        speaker_id=speaker.identity_id or ("user:owner" if speaker.is_owner else ""),
+                        reply="" if rep["mode"] in ("blocked", "sleeping") else rep["text"],
+                        now=now,
+                    )
                 replies.append(rep)
 
             # The reply may have used up this turn's deadline; the world step is not part of "generate the reply", so
@@ -2481,6 +2662,7 @@ class HouseDaemon:
     def reset_house(self) -> Dict[str, Any]:
         with self._async_job_lock, self._lock:
             self._reset_epoch += 1
+            self._observe_held.clear()  # lines of the old house never reach the new one
             self._teardown_world()
             if getattr(self, "agent_runtime", None) is not None:
                 self.agent_runtime.forget_all()  # those residents are gone; their conversations go with them
@@ -2517,6 +2699,7 @@ class HouseDaemon:
                 self.runtime_dir / "channel_spool.db-wal",
                 self.runtime_dir / "channel_spool.db-shm",
                 self.runtime_dir / "clock_offset.json",
+                self.runtime_dir / VIRTUAL_CLOCK_FILE,
                 self.runtime_dir / "house_setup.json",
                 self.runtime_dir / "proactive_state.json",
                 self.runtime_dir / "group_behavior.json",

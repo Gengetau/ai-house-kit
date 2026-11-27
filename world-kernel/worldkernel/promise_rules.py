@@ -16,7 +16,7 @@ TOGETHER_S = 600
 _NOT_A_NAME = re.compile(r"自己|忙|大家|别人|我们|你们|她们|他们|一起|顺便|顺路")
 _ALIAS = re.compile(r"(?P<verb>替|帮|给)(?P<name>[^\s，。！？,.!?：:（）()买带]{1,4}?)(?=买|带)")
 # Time words that may stand alone inside a note in brackets, such as （11月21日）or (周六 下午3点).
-_DATE = r"(?:\d{4}年)?\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d|今天|明天|后天|今晚|明晚|当天|下午|上午|晚上|早上|周末|" \
+_DATE = r"(?:\d{4}年)?\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d|今天|明天|大后天|后天|今晚|明晚|当天|下午|上午|晚上|早上|周末|" \
         r"(?:周|星期)[一二三四五六日天]|[一二三四五六七八九十\d]+点半?|\d{1,2}[:：]\d\d"
 _DATE_NOTE = re.compile(r"[（(]\s*(?:" + _DATE + r")(?:[\s,，、]*(?:" + _DATE + r"))*\s*[）)]")
 
@@ -39,14 +39,18 @@ def _compile_terms(text, vocab, party, names, beneficiary=None):
     for name in names:
         t = t.replace(name, "")
     t = _DATE_NOTE.sub("", t)
-    t = re.sub(r"(?:\d{4}年)?\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d(?: \d\d:\d\d)?|今天|明天|后天|今晚|明晚|当天|下午|上午|"
-               r"晚上|早上|周末|(?:周|星期)[一二三四五六日天]|[一二三四五六七八九十\d]+点(?:半)?|下次|改天|有空时", "", t)
+    t = re.sub(r"(?:\d{4}年)?\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d(?: \d\d:\d\d)?|今天|明天|大后天|后天|今晚|明晚|当天|下午|上午|"
+               r"晚上|早上|周末|(?:周|星期)[一二三四五六日天]|[一二三四五六七八九十\d]+点(?:半)?|下次|改天|有空时|"
+               r"出门的时候|出门时|出门|出去的时候|出去时|等下|等会儿|等会|待会儿|待会|一会儿", "", t)
     if beneficiary is not None and list(beneficiary) == ["owner"]:
         alias = _ALIAS.search(t)
         if alias and not _NOT_A_NAME.search(alias.group("name")):
             t = t[:alias.start("name")] + t[alias.end("name"):]
     # A pronoun right after 帮/替/给/答应 is the person it is done for; anywhere else it stays residue.
     t = re.sub(r"(帮|替|给|答应)[他你]", r"\1", t)
+    # Made for the owner, a note in brackets that only says so, such as （替房主买）, adds nothing.
+    if beneficiary is not None and list(beneficiary) == ["owner"]:
+        t = re.sub(r"[（(]\s*(?:替|帮|给)(?:买|带)?的?\s*[）)]", "", t)
     t = re.sub(r"我们|我|她|打算|准备|答应|约好|说好|帮|替|给|要|会|再|顺便|顺路|去一趟|一下|吧|呢", "", t)
     terms = []
     handoff = bool(re.search(r"交给|送给|一起吃|拿给", str(text)))
@@ -59,6 +63,10 @@ def _compile_terms(text, vocab, party, names, beneficiary=None):
     # `带<item>回来` without 买: bringing a shop item home means buying it (the judge still needs both events).
     # The words in between stay in the text, so anything that is not an ingredient is residue.
     bring = None if brought or re.search(r"买到?|采购|补买", t) else re.search(r"带(?P<what>[^带]+?)回(?:来|家)", t)
+    # Made for the owner, a bare `带<item>` at the end of the clause is the same errand.
+    if bring is None and not brought and beneficiary is not None and list(beneficiary) == ["owner"] \
+            and not re.search(r"买到?|采购|补买", t):
+        bring = re.search(r"带(?P<what>[^带去到在，。！？,.!?：:\s]+?)(?:过?来)?[，。！？,.!?\s]*$", t)
     if bring:
         brought = True
         t = t[:bring.start()] + bring.group("what") + t[bring.end():]

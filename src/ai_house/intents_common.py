@@ -16,6 +16,12 @@ What it does
   the house's pack (`bound(vocab)`).
 - `init()`: carries an existing `world.db` over (see there), then lets the shared module make its tables.
 - pass-through: `sweep`, `kernel_context`, `errands`, `request_reopen`, `card_lines`, `listing`.
+- `record_completions()`: the memory side of a finished promise. The kernel closes a promise (`intents.status` becomes
+  `completed`) and writes nothing to memory, so from the next day recall would only say she had promised. Each
+  completed row gets ONE memory of hers, in the audience the promise was made in (a private promise: her private chat
+  with the owner; a group promise: that group). Done once per row: the kit-owned table `kit_intent_done_memos` in
+  `world.db` holds a marker per (id, created); the shared `intents` table is not touched. A house that already has
+  completed rows when the table is first made marks them without writing (no flood of old news).
 - `list_intents`: `listing()` in the row shape the web page reads.
 
 Names. The shared `_party_key` knows the owner as "房主", "owner" and the aliases of the roster; the roster made here
@@ -57,6 +63,50 @@ _JST = _dt.timezone(_dt.timedelta(hours=9))
 # the owner asks for something anew in the batch (so a repeated item is a real second errand, never a restatement)
 _NEW_REQUEST = re.compile(r"再|又|另外|还要|还想|还得|多买|多带|第二|两次|重新")
 _OWNER_NAME_BAD = re.compile(r"\(你\)|（你）|·头衔.*$")
+# A bracketed note that only says a relative day ("（后天）"). It goes stale the next day, so it is cut from a promise's
+# text when the text also has an absolute date.
+_REL_DAY_NOTE = re.compile(r"[（(]\s*(?:原话说?|即|也就是)?\s*[“\"「]?\s*(?:今天|明天|后天|大后天|昨天|前天|今晚|明晚)"
+                           r"\s*[”\"」]?\s*[）)]")
+_ABS_DATE = re.compile(r"\d{1,2}月\d{1,2}[日号]|\d{4}-\d\d-\d\d")
+
+
+def strip_stale_day_notes(text: Any) -> Any:
+    """Remove a bracketed relative-day note from a promise text when an absolute date is still in it."""
+    if not isinstance(text, str):
+        return text
+    rest = _REL_DAY_NOTE.sub("", text)
+    return rest if rest != text and _ABS_DATE.search(rest) else text
+
+
+# "the next time I go out" wording: that time is the next shopping trip, not a condition to wait for
+_OUTING_WORDS = re.compile(r"下次出门|下回出门|出门时|出门的时候|出去时|出去的时候|下次去超市|下次路过超市|下次")
+# a real condition in the text: with any of these an "after" promise stays as the model wrote it
+_REAL_CONDITION = re.compile(r"等|之后|以后|如果|要是|假如|只要|一旦|再说|有空|发工资|回来后|之前|才")
+
+
+def _outing_after_to_vague(op: dict) -> dict:
+    """An undated "after" intent whose only condition is an outing phrase becomes "vague", so the next trip runs it."""
+    text = op.get("text")
+    if (op.get("when") == "after" and not op.get("due") and isinstance(text, str)
+            and _OUTING_WORDS.search(text) and not _REAL_CONDITION.search(text)):
+        return dict(op, when="vague")
+    return op
+
+
+def _clean_ops(ops: Any) -> Any:
+    """Copy of `ops` where each intent op's text has no stale day note and an outing-only "after" is "vague"; other ops
+    and the caller's dicts stay as they are."""
+    if not isinstance(ops, (list, tuple)):
+        return ops
+    out = []
+    for op in ops:
+        if isinstance(op, dict) and op.get("op") == "intent" and isinstance(op.get("text"), str):
+            text = strip_stale_day_notes(op["text"])
+            if text != op["text"]:
+                op = dict(op, text=text)
+            op = _outing_after_to_vague(op)
+        out.append(op)
+    return out
 
 
 class _OsProxy:
@@ -170,6 +220,10 @@ class CommonIntents:
             try:
                 now = k.get("now", a[0] if a else None)
                 try:
+                    ops = _clean_ops(ops)
+                except Exception:  # noqa: BLE001  # on doubt the texts stay as the model wrote them
+                    pass
+                try:
                     kept, dropped = self._without_restated(i, consumer, chat, private, ops, lines, now)
                 except Exception:  # noqa: BLE001  # this guard never holds the memories back: on doubt nothing is dropped
                     kept, dropped = ops, 0
@@ -275,6 +329,44 @@ class CommonIntents:
                 break
         return [text for _, text in sorted(out)]
 
+    def open_lines(self, actor: str, now: Optional[float] = None, private: bool = False, n: int = 5) -> List[str]:
+        """Promises of hers that are agreed and not done, with the day already worked out by the house (JST), so she
+        never does the date arithmetic herself. Dated ones by start, then undated. Same visibility rule as
+        `done_today_lines`; off with INTENTS=0; never raises on a read error."""
+        if not self._i.ON:
+            return []
+        t = float(now) if now is not None else float(self._ambient_now())
+        try:
+            with self._conn() as c:
+                found = c.execute("select * from intents where status='accepted' order by id").fetchall()
+        except sqlite3.Error:
+            return []
+        today = _dt.datetime.fromtimestamp(t, _JST).replace(hour=0, minute=0, second=0, microsecond=0)
+        dated: List[tuple] = []
+        undated: List[str] = []
+        for r in found:
+            if actor not in json.loads(r["party"]):
+                continue
+            if r["visibility"] == "private" and not (private and r["actor"] == actor):
+                continue
+            who = "答应房主的" if "owner" in json.loads(r["beneficiary"] or "[]") else "约好的"
+            head = f"{who}「{r['text']}」还没办，"
+            if r["due_from"] is None:
+                undated.append(head + "没有约具体哪天")
+                continue
+            if r["due_to"] is not None and float(r["due_to"]) < t - 86400:
+                continue
+            lo = _dt.datetime.fromtimestamp(float(r["due_from"]), _JST)
+            days = (lo.date() - today.date()).days
+            rel = ("昨天，已经过了" if days == -1 else "今天" if days == 0 else "明天" if days == 1 else "后天" if days == 2
+                   else "大后天" if days == 3 else f"{days}天后" if days > 3 else f"{-days}天前，已经过了")
+            at = ""
+            if r["due_to"] is not None and float(r["due_to"]) - float(r["due_from"]) < 86400:  # an exact time: `_when`
+                at = " " + _dt.datetime.fromtimestamp(float(r["due_from"]) + 3600, _JST).strftime("%H:%M")
+            dated.append((float(r["due_from"]), head + f"约在{lo.month}月{lo.day}日{at}（{rel}）"))
+        dated.sort(key=lambda x: x[0])
+        return ([text for _, text in dated] + undated)[:max(0, n)]
+
     @property
     def intents_module(self) -> Any:
         return self._i
@@ -332,7 +424,76 @@ class CommonIntents:
                         c.execute("alter table owner_chat_queue rename column created_at to created")
             self._w.init()
             self._i.init()
+            self._init_done_memos()
             self._carry_memos()
+
+    def _init_done_memos(self) -> None:
+        """The marker table of `record_completions`. Made once; the first time it is made, whatever is already completed
+        is marked as seen (those were finished before the house wrote such memories)."""
+        with self._conn() as c:
+            fresh = not c.execute("select 1 from sqlite_master where type='table' and name='kit_intent_done_memos'").fetchone()
+            c.execute("create table if not exists kit_intent_done_memos(intent_id integer not null, created real not null,"
+                      " written_at real not null, outcome text not null, primary key(intent_id, created))")
+            if fresh and c.execute("select 1 from sqlite_master where type='table' and name='intents'").fetchone():
+                c.execute("insert or ignore into kit_intent_done_memos select id, created, ?, 'before' from intents "
+                          "where status='completed'", (self._ambient_now(),))
+
+    def record_completions(self, now: Optional[float] = None) -> int:
+        """Write one memory for each promise that is completed and has none yet. -> rows written. Never raises.
+
+        Same audience as the promise: private -> `private` scope (her private chat with the owner, so recall keeps
+        every rule that already covers private memories); group -> the group the promise was made in (the web group
+        when its refs name none, as for a promise the kernel made among housemates). Kind `event`, never merged into an
+        older row. The time in the text is the completion time on the house clock (`updated`), in JST. A write that
+        fails for another reason than a refusal is left unmarked and tried again on the next call. INTENTS=0: nothing."""
+        mem = self._memory
+        if mem is None or not self.world_db or not self._i.ON:
+            return 0
+        try:
+            with self._conn() as c:
+                pending = c.execute(
+                    "select * from intents where status='completed' and not exists (select 1 from kit_intent_done_memos m "
+                    "where m.intent_id=intents.id and m.created=intents.created) order by updated, id").fetchall()
+        except sqlite3.Error as exc:
+            log.warning("promise completions not read: %s", type(exc).__name__)
+            return 0
+        wrote = 0
+        for r in pending:
+            try:
+                outcome = self._write_completion(mem, r)
+            except Exception as exc:  # noqa: BLE001  # memory trouble must never reach the step loop; tried again later
+                log.warning("promise completion memory not written (intent %s): %s: %s", r["id"], type(exc).__name__, exc)
+                continue
+            try:
+                with self._conn() as c:
+                    c.execute("insert or ignore into kit_intent_done_memos values (?,?,?,?)",
+                              (r["id"], r["created"], self._ambient_now() if now is None else float(now), outcome))
+            except sqlite3.Error as exc:
+                log.warning("promise completion marker not written (intent %s): %s", r["id"], type(exc).__name__)
+                continue
+            wrote += outcome == "written"
+        return wrote
+
+    def _write_completion(self, mem: Any, r: sqlite3.Row) -> str:
+        actor = str(r["actor"])
+        done_at = float(r["updated"])
+        t = _dt.datetime.fromtimestamp(done_at, _JST)
+        name = str((getattr(mem, "names", None) or {}).get(actor) or actor)
+        owner_asked = "owner" in json.loads(r["beneficiary"] or "[]")
+        text = f"{t.month}月{t.day}日 {t:%H:%M} {name}把{'答应房主的' if owner_asked else '约好的'}事办完了：{r['text']}"
+        if r["visibility"] == "private":
+            scope, channel = "private", ""
+        else:
+            scope = "group"
+            chats = [str(f["chat"]) for f in json.loads(r["refs"]) if isinstance(f, dict) and str(f.get("chat", "")).startswith("group:")]
+            channel = mem._channel_of_chat(chats[0], actor) if chats else "group"
+        try:
+            mem.add(actor, scope, text, channel=channel, about="房主" if owner_asked else "", kind="event",
+                    source="promise_done", merge=False, now=done_at)
+        except ValueError as exc:  # refused by the store (a name no longer living here, text it will not keep): not retried
+            log.info("promise completion memory refused (intent %s): %s", r["id"], exc)
+            return "refused"
+        return "written"
 
     def _carry_memos(self) -> None:
         if self._memory is None:
